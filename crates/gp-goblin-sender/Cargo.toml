@@ -1,0 +1,24 @@
+[package]
+name = "gp-goblin-sender"
+description = "Milestone-2 gate helper: builds and finalizes slatepacks with Goblin's actual wallet stack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Test-only tool, never deployed. It is the SENDER half of the slatepack
+# round-trip gate in gp-wallet/tests/goblin_roundtrip.rs, kept in its own
+# binary because Goblin's fork (heed / lmdb-master-sys) and upstream
+# grin-wallet (lmdb-zero / liblmdb-sys) bundle two incompatible LMDB C
+# libraries that collide when linked into one executable.
+
+[dependencies]
+# Goblin's actual wallet stack (grin-wallet fork + vendored grin node
+# crates), as renamed path dependencies. Requires the goblin checkout as a
+# sibling of the GoblinPay directory.
+goblin_libwallet = { package = "grin_wallet_libwallet", path = "../../../goblin/wallet/libwallet" }
+goblin_impls = { package = "grin_wallet_impls", path = "../../../goblin/wallet/impls" }
+goblin_core = { package = "grin_core", path = "../../../goblin/node/core" }
+goblin_keychain = { package = "grin_keychain", path = "../../../goblin/node/keychain" }
+goblin_util = { package = "grin_util", path = "../../../goblin/node/util" }
+rand = "0.6"
+serde_json = { workspace = true }

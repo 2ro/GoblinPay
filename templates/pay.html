@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+{% if is_open %}<meta http-equiv="refresh" content="10">{% endif %}
+<title>Pay with Goblin (GRIN)</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<main class="checkout">
+  <h1>Pay with Goblin</h1>
+  <p class="amount">{{ info.amount_display }}</p>
+
+  {% if is_paid %}
+    <p class="status paid">Paid &#10003;</p>
+    <p class="hint">This invoice has been settled. You can close this page.</p>
+  {% else if is_expired %}
+    <p class="status expired">This invoice has expired.</p>
+  {% else %}
+    <p class="status open">Waiting for payment&#8230;</p>
+    <div class="qr">{{ info.qr_svg|safe }}</div>
+    <p class="hint">Scan with your Goblin Wallet, or copy the address below.</p>
+
+    <label for="nprofile">Payment address (nprofile)</label>
+    <textarea id="nprofile" class="copybox" rows="3" readonly>{{ info.nprofile }}</textarea>
+
+    <details class="manual">
+      <summary>Can&#39;t scan? Pay manually with a slatepack</summary>
+      {% if wallet_available %}
+      <ol>
+        <li>In your wallet, send {{ info.amount_display }} using the manual / slatepack option.</li>
+        <li>Paste the generated <strong>S1</strong> slatepack below and submit.</li>
+        <li>Copy the <strong>response</strong> slatepack we return, back into your wallet to finalize and post.</li>
+      </ol>
+      <form method="post" action="/pay/{{ info.token }}/slatepack">
+        <label for="s1">Your slatepack (S1)</label>
+        <textarea id="s1" name="slatepack" rows="6" required
+          placeholder="BEGINSLATEPACK. &#8230; ENDSLATEPACK."></textarea>
+        <button type="submit">Submit slatepack</button>
+      </form>
+      {% else %}
+      <p>Manual receive is unavailable on this instance.</p>
+      {% endif %}
+    </details>
+  {% endif %}
+
+  {% if let Some(memo) = info.memo %}<p class="memo">{{ memo }}</p>{% endif %}
+  <p class="footer">Powered by GoblinPay &middot; receive-only Grin over Nostr</p>
+</main>
+</body>
+</html>

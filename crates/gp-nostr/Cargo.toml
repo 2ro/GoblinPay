@@ -1,0 +1,53 @@
+[package]
+name = "gp-nostr"
+description = "Nostr transport and secure handoff for GoblinPay (identity, gift wrap, ingest, Nym)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gp-core = { path = "../gp-core" }
+
+# Nostr: the same SDK line Goblin ships (relay pool, NIP-44 v2, NIP-49
+# ncryptsec, NIP-59 gift wrap). Deliberately NO `nip06` feature: the identity
+# is a random standalone nsec, never derived from any mnemonic (two-secrets
+# rule).
+nostr-sdk = { version = "0.44", features = ["nip44", "nip49", "nip59"] }
+nostr-relay-pool = "0.44"
+async-wsocket = "0.13"
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+
+# NIP-44 v3 (the companion crate, M0). Path dep on the local checkout, PINNED:
+# working tree is on branch `v3` at rev e3dfa5e ("Document the v3 API in the
+# README"). It provides encrypt_v3/decrypt_v3 with the authenticated
+# kind/scope context binding the NIP-17 extension rides on; v2 stays on
+# nostr-sdk. Do not float the checkout without re-running the wrap tests.
+nip44 = { path = "../../../nip44" }
+# The nip44 crate speaks secp256k1 0.31 types (nostr-sdk is on 0.29; the two
+# versions coexist, conversion goes through raw bytes). `global-context` gives
+# the shared `SECP256K1` context and `hashes` the SHA-256 used to sign the
+# server receipt (BIP-340 Schnorr over the receipt digest, same key as the
+# Nostr identity).
+secp256k1 = { version = "0.31", features = ["global-context", "hashes"] }
+
+# Nym mixnet, linked IN-PROCESS via smolmix (TCP/UDP tunnel over the mixnet
+# with an AUTO-SELECTED IPR exit; no sidecar, no SOCKS5 loopback, no
+# single-exit SPOF). Path dep into the local nym checkout, PINNED at rev
+# f6ed17d949cc19fee0fb51db3cb65771fd510d5b ("http-api-client: preconfigured
+# webpki roots on Android" — the Android patch is irrelevant server-side, but
+# the pin is what Goblin G14 validated; do not float it silently).
+smolmix = { path = "../../../nym/smolmix/core" }
+# mix-dns wire codec. Already in the dependency graph via nym-http-api-client
+# (smolmix -> nym-sdk), so we reuse it instead of vendoring a DNS
+# encode/parse (same justification as Goblin).
+hickory-proto = { version = "0.26", default-features = false, features = ["std"] }
+
+tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros", "sync"] }
+log = "0.4"
+serde = { workspace = true }
+serde_json = { workspace = true }
+# mix-dns transaction ids.
+rand = "0.9"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

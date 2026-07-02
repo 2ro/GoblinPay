@@ -1,0 +1,50 @@
+[package]
+name = "gp-wallet"
+description = "Grin wallet handoff for GoblinPay: receive-only over upstream grin-wallet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gp-core = { path = "../gp-core" }
+
+# Money-critical: the official upstream grin-wallet crates, never a
+# reimplementation of Grin crypto. The tag is PINNED by the Milestone-2
+# slatepack round-trip gate against Goblin's actual wallet stack
+# (goblin/wallet, fork of grin-wallet 5.4.0-alpha.1 over vendored
+# grin_core 5.4.1): tag v5.4.1 = rev 5c20635a24a1afa48c167775081015cae6321a4f.
+# Validated by tests/goblin_roundtrip.rs (goblin sender -> upstream receiver
+# -> goblin finalize). Do not bump without re-running that gate.
+grin_wallet_libwallet = { git = "https://github.com/mimblewimble/grin-wallet", tag = "v5.4.1" }
+grin_wallet_impls = { git = "https://github.com/mimblewimble/grin-wallet", tag = "v5.4.1" }
+
+# The grin node crates the wallet crates build on, held to the exact release
+# line Goblin vendors (goblin/node/* is grin 5.4.1).
+grin_core = "=5.4.1"
+grin_keychain = "=5.4.1"
+grin_util = "=5.4.1"
+
+# ed25519 for the Grin native payment proof (M4). Pinned to the SAME version
+# grin_wallet_libwallet uses (its `ed25519-dalek = "1.0.0-pre.4"` resolves to
+# 1.0.1), so the `DalekPublicKey`/`DalekSignature` types on the received
+# slate's `payment_proof` unify with ours. We only reconstruct the proof
+# message bytes and call this library's verify: never a hand-rolled ed25519.
+ed25519-dalek = "=1.0.1"
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# The exact node API type HTTPNodeClient parses a get_kernel response into.
+# Used only to assert the confirmation parser against a recorded node fixture
+# (no live node in the test); pinned to the node release line Goblin vendors.
+grin_api = "=5.4.1"
+# THE GATE (Milestone 2) lives in tests/goblin_roundtrip.rs. Goblin's actual
+# wallet stack acts as the SENDER through the sibling `gp-goblin-sender`
+# binary crate, driven as a subprocess. The two stacks cannot share one test
+# binary: Goblin's fork moved grin_store to heed (lmdb-master-sys) while
+# upstream grin_store uses lmdb-zero (liblmdb-sys), and the two bundled LMDB
+# C libraries collide at link time (duplicate mdb_* symbols; the loser then
+# calls the wrong LMDB and fails with MDB_BAD_TXN).
+rand = "0.6"
+serde_json = { workspace = true }

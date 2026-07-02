@@ -1,0 +1,37 @@
+[package]
+name = "gp-core"
+description = "GoblinPay domain core: configuration, persistence, invoices, payments"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+
+# Child-identity derivation (matching mode 2 + per-user endpubs): SHA-256 over
+# the master nsec, reduced to a valid secp256k1 scalar. secp256k1 is pinned to
+# the same 0.31 line gp-nostr already uses (shared in the lock).
+sha2 = "0.10"
+secp256k1 = "0.31"
+hex = "0.4"
+# Webhook HMAC signing (milestone 6) with a constant-time verify.
+hmac = "0.12"
+subtle = "2"
+# Server-rendered QR SVG at ECC-H, matrix only (no image/raster feature).
+qrcode = { version = "0.14", default-features = false }
+# Random invoice ids and unguessable checkout tokens (same line as gp-nostr).
+rand = "0.9"
+# Host-only log line when a stale rate is served (matches the crate's
+# host-only logging posture).
+log = "0.4"
+# The conversion-rate oracle fetch (milestone 7). DIRECT HTTP, never Nym:
+# gp-core has no mixnet linkage, so the direct path is structural. Reuses the
+# process-installed rustls `ring` provider (`rustls-no-provider`, no aws-lc-rs),
+# exactly as gp-server's webhook client does; no JSON feature (we parse the
+# small body with serde_json).
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }

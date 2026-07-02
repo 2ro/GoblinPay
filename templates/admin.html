@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GoblinPay admin</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<main class="admin">
+  <h1>GoblinPay admin</h1>
+
+  <section class="config">
+    <h2>Configuration</h2>
+    <ul>
+      <li>Node: <code>{{ node_url }}</code></li>
+      <li>Default match mode: <code>{{ match_mode }}</code></li>
+      <li>Nym: <code>{% if nym %}on{% else %}off{% endif %}</code></li>
+      <li>Ingest: <code>{% if ingest %}on{% else %}off{% endif %}</code></li>
+      <li>Relays watched: <code>{{ relay_count }}</code></li>
+      <li>Webhook: <code>{% if webhook_configured %}configured{% else %}off{% endif %}</code>
+          (pending: {{ pending_webhooks }})</li>
+      <li>Endpub rotation: <code>{{ rotate_interval }}s</code>, overlap <code>{{ overlap_epochs }}</code></li>
+    </ul>
+  </section>
+
+  <section class="balances">
+    <h2>Users &amp; balances</h2>
+    {% if balances.is_empty() %}
+      <p class="hint">No tenant users yet.</p>
+    {% else %}
+    <table>
+      <thead><tr><th>User</th><th>Endpub (npub)</th><th>Epoch</th><th>Balance (GRIN)</th></tr></thead>
+      <tbody>
+      {% for b in balances %}
+        <tr><td>{{ b.user_id }}</td><td class="mono">{{ b.npub }}</td><td>{{ b.epoch }}</td><td>{{ b.balance_grin }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  </section>
+
+  <section class="payments">
+    <h2>Recent payments</h2>
+    {% if payments.is_empty() %}
+      <p class="hint">No payments recorded yet.</p>
+    {% else %}
+    <table>
+      <thead><tr><th>Slate</th><th>GRIN</th><th>Status</th><th>Invoice</th><th>User</th><th>Received</th></tr></thead>
+      <tbody>
+      {% for p in payments %}
+        <tr>
+          <td class="mono">{{ p.slate_id }}</td>
+          <td>{{ p.amount_grin }}</td>
+          <td class="status-{{ p.status }}">{{ p.status }}</td>
+          <td class="mono">{{ p.invoice_id }}</td>
+          <td class="mono">{{ p.user_id }}</td>
+          <td>{{ p.created_at }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  </section>
+
+  <p class="footer">GoblinPay admin &middot; JSON API under <code>/admin/*</code></p>
+</main>
+</body>
+</html>

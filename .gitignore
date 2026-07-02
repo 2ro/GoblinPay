@@ -1,0 +1,15 @@
+/target
+*.db
+*.db-shm
+*.db-wal
+# Runtime wallet/node secrets, keys, and logs — NEVER commit (payment server)
+.owner_api_secret
+.foreign_api_secret
+grin-wallet.toml
+grin-wallet.log
+*.log
+.env
+secrets/
+/data
+/wallet_data
+*.seed

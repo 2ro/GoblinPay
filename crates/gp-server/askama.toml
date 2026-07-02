@@ -1,0 +1,3 @@
+# Templates live at the workspace root (see the repo layout in the plan).
+[general]
+dirs = ["../../templates"]

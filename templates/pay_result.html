@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Slatepack response</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<main class="checkout">
+  <h1>{% if ok %}Payment received{% else %}Could not receive{% endif %}</h1>
+  <p class="status {% if ok %}paid{% else %}expired{% endif %}">{{ message }}</p>
+
+  {% if ok %}
+    <label for="s2">Response slatepack (S2)</label>
+    <textarea id="s2" class="copybox" rows="8" readonly>{{ s2_armor }}</textarea>
+    <ol>
+      <li>Select all of the text above and copy it.</li>
+      <li>Paste it back into your wallet to finalize the transaction.</li>
+      <li>Your wallet posts it to the chain; GoblinPay confirms it on receipt.</li>
+    </ol>
+  {% endif %}
+
+  <p><a href="/pay/{{ token }}">Back to the invoice</a></p>
+  <p class="footer">Powered by GoblinPay</p>
+</main>
+</body>
+</html>

@@ -1,0 +1,3 @@
+# Default rustfmt style. Only the edition is pinned so formatting stays
+# reproducible across toolchains.
+edition = "2021"

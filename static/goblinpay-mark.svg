@@ -1,0 +1,4 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="GoblinPay">
+  <rect width="64" height="64" rx="14" fill="#e9c542"/>
+  <path fill="#201d09" fill-rule="evenodd" d="M22 14H35a12 12 0 0 1 0 24H30V50H22ZM30 21H34a6 6 0 0 1 0 12H30Z"/>
+</svg>

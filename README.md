@@ -17,7 +17,7 @@ carries the full merchant surface:
   invoice automatically.
 - **Hosted checkout:** a zero-JS `/pay/<token>` page (server-rendered
   Askama + one CSS file + a server-generated QR SVG at ECC level H with an
-  optional Goblin-mark center logo), live status via `<meta http-equiv=refresh>`,
+  optional GoblinPay-mark center logo), live status via `<meta http-equiv=refresh>`,
   and a manual slatepack fallback (paste S1 -> offline `receive_tx` -> copy the
   S2 back) on every page. The same renderer serves embedded and hosted use.
 - **Per-user endpubs:** an admin assigns one receiving identity per user
@@ -75,7 +75,7 @@ Everything is environment variables, defaults are safe for local use.
 | `GP_ADMIN_TOKEN` | unset | Bearer token for the admin dashboard + endpub/webhook API |
 | `GP_WEBHOOK_URL` | unset | Webhook endpoint for payment events (requires `GP_WEBHOOK_SECRET`) |
 | `GP_WEBHOOK_SECRET` | unset | HMAC-SHA256 secret for signing webhooks |
-| `GP_QR_LOGO` | Goblin mark | Checkout QR center logo: unset = Goblin mark, `off`/`none` = plain, else a URL/path |
+| `GP_QR_LOGO` | GoblinPay mark | Checkout QR center logo: unset = GoblinPay mark, `off`/`none` = plain, else a URL/path |
 | `GP_MERCHANT_NPUB` | unset | Merchant npub for the NIP-17 confirmed-payment DM |
 | `GP_NOTIFY_MERCHANT_DM` | `off` | Send a NIP-17 DM to the merchant on a received payment |
 | `GP_NOTIFY_PAYER_RECEIPT` | `off` | Send a NIP-17 receipt DM to the payer |

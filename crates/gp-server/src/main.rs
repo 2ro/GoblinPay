@@ -44,11 +44,27 @@ async fn style() -> impl Responder {
         .body(include_str!("../../../static/style.css"))
 }
 
-/// The bundled Goblin mark, the default QR center logo.
+/// The bundled Goblin mark (legacy default QR center logo; still served so an
+/// operator can keep `GP_QR_LOGO=/static/goblin-mark.svg`).
 async fn goblin_mark() -> impl Responder {
     HttpResponse::Ok()
         .content_type("image/svg+xml")
         .body(include_str!("../../../static/goblin-mark.svg"))
+}
+
+/// The GoblinPay mark, the default QR center logo (dark "P" on the brand gold,
+/// sized for contrast on the QR's white backing).
+async fn goblinpay_mark() -> impl Responder {
+    HttpResponse::Ok()
+        .content_type("image/svg+xml")
+        .body(include_str!("../../../static/goblinpay-mark.svg"))
+}
+
+/// The GoblinPay wordmark (white), shown as the checkout page header logo.
+async fn goblinpay_wordmark() -> impl Responder {
+    HttpResponse::Ok()
+        .content_type("image/svg+xml")
+        .body(include_str!("../../../static/goblinpay-wordmark.svg"))
 }
 
 /// Route table, shared by `main` and the tests.
@@ -56,7 +72,12 @@ fn routes(cfg: &mut web::ServiceConfig) {
     cfg.route("/", web::get().to(index))
         .route("/health", web::get().to(health))
         .route("/static/style.css", web::get().to(style))
-        .route("/static/goblin-mark.svg", web::get().to(goblin_mark));
+        .route("/static/goblin-mark.svg", web::get().to(goblin_mark))
+        .route("/static/goblinpay-mark.svg", web::get().to(goblinpay_mark))
+        .route(
+            "/static/goblinpay-wordmark.svg",
+            web::get().to(goblinpay_wordmark),
+        );
     // Payment status + signed-receipt reads (public-by-token, M4).
     payments::configure(cfg);
     // Hosted checkout + manual slatepack (public-by-token, M5).

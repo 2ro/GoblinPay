@@ -171,7 +171,7 @@ pub struct Config {
     #[serde(skip)]
     pub webhook_secret: Option<Secret>,
     /// Center-logo source for checkout QR codes (`GP_QR_LOGO`): unset = the
-    /// bundled Goblin mark, `off`/`none` = no logo, else a URL or static path.
+    /// bundled GoblinPay mark, `off`/`none` = no logo, else a URL or static path.
     pub qr_logo: Option<String>,
     /// Merchant npub for confirmed-payment DMs (`GP_MERCHANT_NPUB`).
     pub merchant_npub: Option<String>,
@@ -213,7 +213,7 @@ pub const DEFAULT_RATE_CACHE_TTL: i64 = 60;
 pub const DEFAULT_QUOTE_TTL: i64 = 900;
 
 /// Default center-logo path served by gp-server when `GP_QR_LOGO` is unset.
-pub const DEFAULT_QR_LOGO: &str = "/static/goblin-mark.svg";
+pub const DEFAULT_QR_LOGO: &str = "/static/goblinpay-mark.svg";
 
 impl Default for Config {
     fn default() -> Self {

@@ -31,6 +31,9 @@ main {
 
 main.admin { max-width: 60rem; }
 
+.brand { display: block; }
+.brandmark { height: 30px; width: auto; display: block; margin: 0 0 1.25rem; }
+
 h1 { font-size: 1.5rem; margin: 0 0 0.5rem; }
 h2 { font-size: 1.05rem; margin: 1.75rem 0 0.5rem; color: var(--dim); text-transform: uppercase; letter-spacing: 0.04em; }
 

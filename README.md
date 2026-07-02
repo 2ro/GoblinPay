@@ -6,36 +6,33 @@ travels as a gift-wrapped slatepack over Nostr (optionally over the Nym
 mixnet). GoblinPay auto-receives, returns the S2 reply so the payer can
 finalize, confirms the transaction on chain, and signals paid.
 
-**Status: milestone 6 (invoices, hosted checkout, per-user endpubs,
-notifications).** On top of the milestone 2-4 wallet + transport + confirmation
-path, GoblinPay now carries the full merchant surface:
+Beyond the core wallet + transport + on-chain confirmation path, GoblinPay
+carries the full merchant surface:
 
-- **Invoices + matching (M5):** create an invoice against an order, matched by
+- **Invoices + matching:** create an invoice against an order, matched by
   any of three modes (per-invoice override or the `GP_MATCH_MODE` default):
   the payer's memo, a per-invoice derived Nostr identity (a stateless child of
   the server nsec, recommended for stores), or an exact amount. The matcher
   runs inside the ingest pipeline, so a gift-wrapped payment resolves to its
   invoice automatically.
-- **Hosted checkout (M5):** a zero-JS `/pay/<token>` page (server-rendered
+- **Hosted checkout:** a zero-JS `/pay/<token>` page (server-rendered
   Askama + one CSS file + a server-generated QR SVG at ECC level H with an
   optional Goblin-mark center logo), live status via `<meta http-equiv=refresh>`,
   and a manual slatepack fallback (paste S1 -> offline `receive_tx` -> copy the
   S2 back) on every page. The same renderer serves embedded and hosted use.
-- **Per-user endpubs (M5b):** an admin assigns one receiving identity per user
+- **Per-user endpubs:** an admin assigns one receiving identity per user
   (a derived child keyed by `(user_id, epoch)`; only public keys and the
   rotation clock are stored, never private keys), with optional rolling rotation
   and an overlap window so a just-rotated endpub still lands. All funds still
   land in the one Grin wallet.
-- **Notifications (M6, all optional):** an HMAC-signed, idempotent, retried
+- **Notifications (all optional):** an HMAC-signed, idempotent, retried
   HTTP webhook (the WooCommerce contract), an authenticated admin dashboard +
   JSON API, and NIP-17 DMs to the merchant / payer.
 
 All relay traffic rides an in-process Nym mixnet tunnel (smolmix, auto-selected
 exit, mix-dns; `GP_NYM=off` is a debugging escape hatch only). Encryption
 negotiates NIP-44 v3 (the NIP-17 extension, via the companion `nip44` crate) per
-recipient, with v2 as the mandatory baseline. Store connectors and the
-conversion oracle arrive in later milestones; comprehensive documentation lands
-at milestone 11.
+recipient, with v2 as the mandatory baseline.
 
 ## Workspace
 
@@ -133,7 +130,7 @@ variant works for `GP_API_TOKEN`, `GP_ADMIN_TOKEN`, and `GP_WEBHOOK_SECRET` too.
 | GET | `/pay/{token}/status` | token | Invoice status JSON (for polling) |
 | POST | `/pay/{token}/slatepack` | token | Manual fallback: paste S1, returns the S2 page |
 | GET | `/payment/{id}` | token | Payment status JSON |
-| GET | `/payment/{id}/receipt` | token | Server-signed verifiable receipt (M4) |
+| GET | `/payment/{id}/receipt` | token | Server-signed verifiable receipt |
 | GET | `/admin` | admin | Dashboard (payments, balances, config) |
 | GET | `/admin/payments` | admin | Recent payments JSON |
 | GET/POST | `/admin/users` | admin | List users / create a user + endpub |

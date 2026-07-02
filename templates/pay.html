@@ -21,6 +21,7 @@
   {% else %}
     <p class="status open">Waiting for payment&#8230;</p>
 
+    {% if !info.nprofile.is_empty() %}
     <section class="pay-method">
       <h2>Pay with Goblin Wallet</h2>
       <div class="qr">{{ info.qr_svg|safe }}</div>
@@ -28,6 +29,7 @@
       <label for="nprofile">Payment address (nprofile)</label>
       <textarea id="nprofile" class="copybox" rows="3" readonly>{{ info.nprofile }}</textarea>
     </section>
+    {% endif %}
 
     {% if let Some(grin1) = info.slatepack_address %}
     <section class="pay-method">

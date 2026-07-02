@@ -58,9 +58,17 @@ pub struct CheckoutInfo {
 pub fn build_info(inv: &Invoice, cfg: &Config, slatepack_addr: Option<&str>) -> CheckoutInfo {
     let relays = gp_nostr::relays::resolve(&cfg.relays);
     let recipient_pubkey = inv.recipient_pubkey.clone().unwrap_or_default();
-    let (npub, nprofile) = match PublicKey::from_hex(&recipient_pubkey) {
-        Ok(pk) => (gp_nostr::npub_of(pk), gp_nostr::nprofile(pk, &relays)),
-        Err(_) => (String::new(), String::new()),
+    // The Nostr (Goblin Wallet) method is only surfaced when the operator has it
+    // enabled (`GP_CHECKOUT_METHODS`). Disabled, the nprofile/npub/QR are left
+    // empty and the template omits the whole section. This gates only the hosted
+    // PAGE display; the connector API and ingest are unaffected.
+    let (npub, nprofile) = if cfg.checkout_nostr {
+        match PublicKey::from_hex(&recipient_pubkey) {
+            Ok(pk) => (gp_nostr::npub_of(pk), gp_nostr::nprofile(pk, &relays)),
+            Err(_) => (String::new(), String::new()),
+        }
+    } else {
+        (String::new(), String::new())
     };
     // The QR carries a pay-URI so a scanning wallet can auto-fill the amount
     // (and memo). The human-readable nprofile/npub strings on the page are
@@ -76,8 +84,10 @@ pub fn build_info(inv: &Invoice, cfg: &Config, slatepack_addr: Option<&str>) -> 
     // QR carries the bare address (a Grin wallet reads no amount from it, so
     // the page states the amount to send in text next to it). No address means
     // no wallet loaded: the page simply omits the Slatepack option.
+    // The Slatepack method needs both operator opt-in (`GP_CHECKOUT_METHODS`)
+    // and a loaded wallet: an enabled method that cannot work is simply hidden.
     let (slatepack_address, slatepack_qr_svg) = match slatepack_addr {
-        Some(addr) if !addr.is_empty() => {
+        Some(addr) if cfg.checkout_slatepack && !addr.is_empty() => {
             let qr = qr::svg(addr, cfg.qr_logo_href()).unwrap_or_default();
             (Some(addr.to_string()), Some(qr))
         }
@@ -382,6 +392,71 @@ mod tests {
         let blank = build_info(&inv, &cfg, Some(""));
         assert!(blank.slatepack_address.is_none());
         assert!(blank.slatepack_qr_svg.is_none());
+    }
+
+    #[test]
+    fn checkout_nostr_disabled_hides_nostr_section() {
+        // GP_CHECKOUT_METHODS=slatepack: the Nostr method is off, so build_info
+        // leaves the nprofile/npub empty and the page omits the Nostr section
+        // while still showing the Slatepack one.
+        let inv = invoice(Some(1_500_000_000), None);
+        let mut cfg = Config::default();
+        cfg.checkout_nostr = false;
+        cfg.checkout_slatepack = true;
+        let info = build_info(&inv, &cfg, Some("grin1qtestaddress"));
+        assert!(info.nprofile.is_empty(), "nprofile empty when nostr off");
+        assert!(info.npub.is_empty(), "npub empty when nostr off");
+        assert_eq!(info.slatepack_address.as_deref(), Some("grin1qtestaddress"));
+
+        let page = PayPage {
+            info,
+            is_open: true,
+            is_paid: false,
+            is_expired: false,
+        };
+        let html = page.render().unwrap();
+        assert!(
+            !html.contains("Pay with Goblin Wallet"),
+            "Nostr section absent when checkout_nostr=false"
+        );
+        assert!(
+            html.contains("Pay by Slatepack"),
+            "Slatepack section still present"
+        );
+    }
+
+    #[test]
+    fn checkout_slatepack_disabled_hides_slatepack_section() {
+        // GP_CHECKOUT_METHODS=nostr: the Slatepack method is off, so even with a
+        // wallet address available, build_info drops it and the page omits the
+        // Slatepack section while still showing the Nostr one.
+        let inv = invoice(Some(1_500_000_000), None);
+        let mut cfg = Config::default();
+        cfg.checkout_nostr = true;
+        cfg.checkout_slatepack = false;
+        let info = build_info(&inv, &cfg, Some("grin1qtestaddress"));
+        assert!(
+            info.slatepack_address.is_none(),
+            "slatepack dropped when method off"
+        );
+        assert!(info.slatepack_qr_svg.is_none());
+        assert!(!info.nprofile.is_empty(), "nprofile present when nostr on");
+
+        let page = PayPage {
+            info,
+            is_open: true,
+            is_paid: false,
+            is_expired: false,
+        };
+        let html = page.render().unwrap();
+        assert!(
+            html.contains("Pay with Goblin Wallet"),
+            "Nostr section present"
+        );
+        assert!(
+            !html.contains("Pay by Slatepack"),
+            "Slatepack section absent when checkout_slatepack=false"
+        );
     }
 
     #[test]

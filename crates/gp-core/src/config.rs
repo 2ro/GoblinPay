@@ -136,6 +136,15 @@ pub struct Config {
     /// Run the Nostr ingest service (`GP_INGEST`: `on` or `off`, default on).
     /// When on, the wallet and identity secrets are required at boot.
     pub ingest: bool,
+    /// Show the Nostr (Goblin Wallet, `nprofile`) method on the hosted checkout
+    /// page. Part of `GP_CHECKOUT_METHODS` (comma list of `nostr`/`slatepack`;
+    /// unset = both). This gates only the hosted PAGE display, not the connector
+    /// API or the ingest service.
+    pub checkout_nostr: bool,
+    /// Show the Slatepack (`grin1`) method on the hosted checkout page. Part of
+    /// `GP_CHECKOUT_METHODS`. Still requires a loaded wallet to actually appear:
+    /// an enabled method that cannot work is simply hidden.
+    pub checkout_slatepack: bool,
     /// Global default matching mode (`GP_MATCH_MODE`).
     pub match_mode: MatchMode,
     /// Grin seed mnemonic (`GP_MNEMONIC` or `GP_MNEMONIC_FILE`). Money secret.
@@ -228,6 +237,8 @@ impl Default for Config {
             relays: Vec::new(),
             nym: true,
             ingest: true,
+            checkout_nostr: true,
+            checkout_slatepack: true,
             match_mode: MatchMode::Memo,
             mnemonic: None,
             wallet_password: None,
@@ -322,6 +333,9 @@ impl Config {
             other => return Err(format!("GP_INGEST must be `on` or `off` (got `{other}`)")),
         };
 
+        let (checkout_nostr, checkout_slatepack) =
+            parse_checkout_methods(get("GP_CHECKOUT_METHODS"));
+
         let match_mode = match get("GP_MATCH_MODE").as_deref().unwrap_or("memo") {
             "memo" => MatchMode::Memo,
             "derived" => MatchMode::Derived,
@@ -394,6 +408,8 @@ impl Config {
             relays,
             nym,
             ingest,
+            checkout_nostr,
+            checkout_slatepack,
             match_mode,
             mnemonic,
             wallet_password,
@@ -423,6 +439,18 @@ impl Config {
     /// The QR center-logo href to render, or `None` when disabled.
     pub fn qr_logo_href(&self) -> Option<&str> {
         self.qr_logo.as_deref()
+    }
+
+    /// The enabled checkout methods as a stable comma list, for the startup log.
+    fn checkout_methods_str(&self) -> String {
+        let mut methods = Vec::new();
+        if self.checkout_nostr {
+            methods.push("nostr");
+        }
+        if self.checkout_slatepack {
+            methods.push("slatepack");
+        }
+        methods.join(",")
     }
 
     /// Fail-fast consistency checks.
@@ -479,7 +507,8 @@ impl Config {
         let set = |o: bool| if o { "set" } else { "unset" };
         format!(
             "bind={} tls={} db={} data_dir={} node={} chain={:?} relay_mode={:?} \
-             relays={:?} nym={} ingest={} match_mode={:?} mnemonic={} wallet_password={} \
+             relays={:?} nym={} ingest={} checkout_methods={} match_mode={:?} mnemonic={} \
+             wallet_password={} \
              nsec={} ncryptsec={} public_url={} api_token={} admin_token={} webhook_url={} \
              webhook_secret={} qr_logo={} merchant_npub={} notify_merchant_dm={} \
              notify_payer_receipt={} endpub_rotate_interval={} endpub_overlap_epochs={} \
@@ -498,6 +527,7 @@ impl Config {
             self.relays,
             if self.nym { "on" } else { "off" },
             if self.ingest { "on" } else { "off" },
+            self.checkout_methods_str(),
             self.match_mode,
             set(self.mnemonic.is_some()),
             set(self.wallet_password.is_some()),
@@ -525,6 +555,35 @@ impl Config {
             self.rate_stale_max,
         )
     }
+}
+
+/// Parse `GP_CHECKOUT_METHODS` (comma list of `nostr`/`slatepack`) into the two
+/// display flags. Parsing is lenient: tokens are trimmed, lowercased, and
+/// unknown tokens are ignored with a warning. Unset (`None`) enables both, which
+/// preserves the historical default of showing every available method. If a set
+/// value parses to no known methods, both are enabled (a checkout must offer at
+/// least one way to pay) and a warning is logged.
+fn parse_checkout_methods(raw: Option<String>) -> (bool, bool) {
+    let Some(raw) = raw else {
+        return (true, true);
+    };
+    let mut nostr = false;
+    let mut slatepack = false;
+    for tok in raw.split(',') {
+        match tok.trim().to_lowercase().as_str() {
+            "" => {}
+            "nostr" => nostr = true,
+            "slatepack" => slatepack = true,
+            other => log::warn!("GP_CHECKOUT_METHODS: ignoring unknown method `{other}`"),
+        }
+    }
+    if !nostr && !slatepack {
+        log::warn!(
+            "GP_CHECKOUT_METHODS enabled no known methods; defaulting to both (nostr,slatepack)"
+        );
+        return (true, true);
+    }
+    (nostr, slatepack)
 }
 
 /// Parse an `on`/`off` flag with a default.
@@ -635,6 +694,36 @@ mod tests {
         assert!(!cfg.nym);
         assert!(!cfg.ingest);
         assert_eq!(cfg.match_mode, MatchMode::Derived);
+    }
+
+    #[test]
+    fn checkout_methods_default_and_parsing() {
+        // Unset: both methods on (unchanged historical behavior).
+        let cfg = load(&[]).unwrap();
+        assert!(cfg.checkout_nostr);
+        assert!(cfg.checkout_slatepack);
+
+        // Single method selects only that method.
+        let cfg = load(&[("GP_CHECKOUT_METHODS", "nostr")]).unwrap();
+        assert!(cfg.checkout_nostr);
+        assert!(!cfg.checkout_slatepack);
+
+        let cfg = load(&[("GP_CHECKOUT_METHODS", "slatepack")]).unwrap();
+        assert!(!cfg.checkout_nostr);
+        assert!(cfg.checkout_slatepack);
+
+        // Both, order/whitespace/case insensitive, unknown tokens ignored.
+        let cfg = load(&[("GP_CHECKOUT_METHODS", " Slatepack , NOSTR ,bogus,")]).unwrap();
+        assert!(cfg.checkout_nostr);
+        assert!(cfg.checkout_slatepack);
+
+        // Empty or all-garbage parses to no methods -> defaults to both.
+        let cfg = load(&[("GP_CHECKOUT_METHODS", "")]).unwrap();
+        assert!(cfg.checkout_nostr);
+        assert!(cfg.checkout_slatepack);
+        let cfg = load(&[("GP_CHECKOUT_METHODS", "lightning, bitcoin")]).unwrap();
+        assert!(cfg.checkout_nostr);
+        assert!(cfg.checkout_slatepack);
     }
 
     #[test]

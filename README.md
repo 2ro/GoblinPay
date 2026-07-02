@@ -77,6 +77,7 @@ Everything is environment variables, defaults are safe for local use.
 | `GP_RELAYS` | unset | Comma-separated relay URLs |
 | `GP_NYM` | `on` | Route Nostr traffic over the Nym mixnet (`on` or `off`) |
 | `GP_INGEST` | `on` | Nostr ingest service (`off` = HTTP surface only, for debugging) |
+| `GP_CHECKOUT_METHODS` | `nostr,slatepack` | Which payment methods the hosted `/pay/<token>` page shows: comma list of `nostr` (Goblin Wallet) and `slatepack` (`grin1`). Unset = both. Unknown tokens are ignored; an empty result falls back to both |
 | `GP_MATCH_MODE` | `memo` | Default matching mode: `memo`, `derived`, `amount` |
 | `GP_MNEMONIC` | unset | Grin seed mnemonic (money secret) |
 | `GP_WALLET_PASSWORD` | unset | Password encrypting the wallet seed and the Nostr identity at rest |
@@ -98,6 +99,19 @@ Everything is environment variables, defaults are safe for local use.
 | `GP_RATE_CACHE_TTL` | `60` | Seconds a fetched rate is reused before refetching (0 = always) |
 | `GP_QUOTE_TTL` | `900` | Seconds a created fiat invoice locks its Grin quote (its expiry window) |
 | `GP_RATE_STALE_MAX` | `0` | Bounded stale-rate fallback in seconds if a live fetch fails (0 = off) |
+
+### Checkout methods
+
+`GP_CHECKOUT_METHODS` only controls what the hosted `/pay/<token>` page
+advertises to a payer; it does not turn any payment processing on or off. The
+Slatepack (`grin1`) method also needs a loaded wallet to appear, so an enabled
+method that cannot work is simply hidden. Keep this consistent with `GP_INGEST`:
+`GP_INGEST` runs the Nostr ingest service that actually receives and matches
+Goblin Wallet payments, so `GP_INGEST=off` with `GP_CHECKOUT_METHODS=nostr`
+would advertise a Nostr method that nothing is listening for. If you disable
+ingest, drop `nostr` from `GP_CHECKOUT_METHODS`; if you advertise `nostr`, keep
+ingest on. The connector `POST /invoice` JSON response still returns the
+`nprofile` regardless of this setting, which affects only the hosted page.
 
 ### Conversion rates (optional)
 

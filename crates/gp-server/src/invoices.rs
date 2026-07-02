@@ -145,7 +145,9 @@ async fn create_invoice(
                 .json(serde_json::json!({"error": "internal error"}));
         }
     };
-    let info = build_info(&inv, cfg.get_ref());
+    // The JSON connector API surfaces the Nostr checkout fields only; the
+    // grin1 Slatepack option is presented on the hosted /pay page.
+    let info = build_info(&inv, cfg.get_ref(), None);
     HttpResponse::Ok().json(checkout_json(&info))
 }
 
@@ -161,7 +163,7 @@ async fn get_invoice(
     }
     match invoice::get(pool.get_ref(), &path.into_inner()).await {
         Ok(Some(inv)) => {
-            let info = build_info(&inv, cfg.get_ref());
+            let info = build_info(&inv, cfg.get_ref(), None);
             HttpResponse::Ok().json(checkout_json(&info))
         }
         Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),

@@ -95,6 +95,11 @@ details.manual { margin-top: 1.5rem; border-top: 1px solid var(--line); padding-
 details.manual summary { cursor: pointer; color: var(--accent); font-weight: 600; }
 details.manual ol { color: var(--dim); font-size: 0.9rem; padding-left: 1.2rem; }
 
+/* Each first-class way to pay (Goblin/Nostr, Slatepack/grin1). */
+.pay-method { margin-top: 1.5rem; border-top: 1px solid var(--line); padding-top: 0.75rem; }
+.pay-method:first-of-type { border-top: none; padding-top: 0; }
+.pay-method ol { color: var(--dim); font-size: 0.9rem; padding-left: 1.2rem; }
+
 a { color: var(--accent); }
 
 .footer { margin-top: 2rem; color: var(--dim); font-size: 0.78rem; text-align: center; }

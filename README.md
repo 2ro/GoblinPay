@@ -17,9 +17,21 @@ carries the full merchant surface:
   invoice automatically.
 - **Hosted checkout:** a zero-JS `/pay/<token>` page (server-rendered
   Askama + one CSS file + a server-generated QR SVG at ECC level H with an
-  optional GoblinPay-mark center logo), live status via `<meta http-equiv=refresh>`,
-  and a manual slatepack fallback (paste S1 -> offline `receive_tx` -> copy the
-  S2 back) on every page. The same renderer serves embedded and hosted use.
+  optional GoblinPay-mark center logo) with live status via
+  `<meta http-equiv=refresh>`. It offers two first-class ways to pay:
+  - **Goblin Wallet (Nostr):** scan the `nprofile` QR (or copy it) and the
+    payment auto-receives over Nostr.
+  - **Slatepack (`grin1`):** pay from any Grin wallet, no Nostr needed. The
+    page shows the wallet's stable index-0 Slatepack address (`grin1...`) plus
+    its QR and the exact amount to send. The payer sends that amount to the
+    address using their wallet's Slatepack/file method, pastes the resulting S1
+    into the page (offline `receive_tx`), then copies the returned S2 back into
+    their wallet to finalize and broadcast it. There is no Tor listener; the
+    `grin1` address is stable and reused across invoices, and the existing
+    invoice matcher and on-chain confirmation handle the received payment like
+    any other. The Slatepack option only appears when a wallet is loaded.
+
+  The same renderer serves embedded and hosted use.
 - **Per-user endpubs:** an admin assigns one receiving identity per user
   (a derived child keyed by `(user_id, epoch)`; only public keys and the
   rotation clock are stored, never private keys), with optional rolling rotation

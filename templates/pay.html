@@ -20,30 +20,35 @@
     <p class="status expired">This invoice has expired.</p>
   {% else %}
     <p class="status open">Waiting for payment&#8230;</p>
-    <div class="qr">{{ info.qr_svg|safe }}</div>
-    <p class="hint">Scan with your Goblin Wallet, or copy the address below.</p>
 
-    <label for="nprofile">Payment address (nprofile)</label>
-    <textarea id="nprofile" class="copybox" rows="3" readonly>{{ info.nprofile }}</textarea>
+    <section class="pay-method">
+      <h2>Pay with Goblin Wallet</h2>
+      <div class="qr">{{ info.qr_svg|safe }}</div>
+      <p class="hint">Scan with your Goblin Wallet, or copy the address below.</p>
+      <label for="nprofile">Payment address (nprofile)</label>
+      <textarea id="nprofile" class="copybox" rows="3" readonly>{{ info.nprofile }}</textarea>
+    </section>
 
-    <details class="manual">
-      <summary>Can&#39;t scan? Pay manually with a slatepack</summary>
-      {% if wallet_available %}
+    {% if let Some(grin1) = info.slatepack_address %}
+    <section class="pay-method">
+      <h2>Pay by Slatepack (grin1)</h2>
+      <p class="hint">Pay from any Grin wallet, no Nostr needed. Send <strong>{{ info.amount_display }}</strong> to the address below.</p>
+      {% if let Some(grin1_qr) = info.slatepack_qr_svg %}<div class="qr">{{ grin1_qr|safe }}</div>{% endif %}
+      <label for="grin1">Slatepack address (grin1)</label>
+      <textarea id="grin1" class="copybox" rows="3" readonly>{{ grin1 }}</textarea>
       <ol>
-        <li>In your wallet, send {{ info.amount_display }} using the manual / slatepack option.</li>
-        <li>Paste the generated <strong>S1</strong> slatepack below and submit.</li>
-        <li>Copy the <strong>response</strong> slatepack we return, back into your wallet to finalize and post.</li>
+        <li>In your Grin wallet, send {{ info.amount_display }} to this address using the Slatepack / file method, then paste the Slatepack it produces below.</li>
+        <li>The pasted <strong>S1</strong> Slatepack is received here and a <strong>response</strong> Slatepack is returned.</li>
+        <li>Paste that response back into your wallet to finalize and broadcast it, which completes the payment.</li>
       </ol>
       <form method="post" action="/pay/{{ info.token }}/slatepack">
-        <label for="s1">Your slatepack (S1)</label>
+        <label for="s1">Your Slatepack (S1)</label>
         <textarea id="s1" name="slatepack" rows="6" required
           placeholder="BEGINSLATEPACK. &#8230; ENDSLATEPACK."></textarea>
         <button type="submit">Submit slatepack</button>
       </form>
-      {% else %}
-      <p>Manual receive is unavailable on this instance.</p>
-      {% endif %}
-    </details>
+    </section>
+    {% endif %}
   {% endif %}
 
   {% if let Some(memo) = info.memo %}<p class="memo">{{ memo }}</p>{% endif %}

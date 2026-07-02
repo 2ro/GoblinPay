@@ -165,6 +165,10 @@ async fn pay_page_renders_zero_js_with_qr_and_nprofile() {
     assert!(html.contains("<svg"), "server-rendered QR present");
     assert!(html.contains("nprofile1"), "nprofile string present");
     assert!(
+        !html.contains("Pay by Slatepack"),
+        "no wallet loaded: the grin1 Slatepack option is omitted"
+    );
+    assert!(
         html.contains("http-equiv=\"refresh\""),
         "live status refresh while open"
     );

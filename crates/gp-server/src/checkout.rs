@@ -1,13 +1,15 @@
 //! The hosted, zero-JS checkout: the `/pay/<token>` page (shared renderer for
-//! embedded and hosted use), its live status, and the manual-slatepack
-//! fallback.
+//! embedded and hosted use), its live status, and the Slatepack receive flow.
 //!
-//! The page shows the amount, a server-generated QR SVG of the recipient
-//! `nprofile`, the `nprofile`/`npub` strings, live status via a
-//! `<meta http-equiv="refresh">` while open, and a `<textarea>` POST form to
-//! paste an S1 slatepack when the automatic Nostr flow cannot be used. On
-//! submit, the same offline `receive_tx` runs and the S2 reply renders back for
-//! the payer to copy and finalize. No JavaScript anywhere.
+//! The page offers two first-class ways to pay: the Goblin/Nostr path (a QR
+//! SVG of the recipient `nprofile` plus the `nprofile`/`npub` strings) and a
+//! Slatepack (`grin1`) path for any Grin wallet (the wallet's stable index-0
+//! Slatepack address, its QR, and a `<textarea>` POST form to paste the S1 the
+//! payer's wallet produces). It also shows the amount and live status via a
+//! `<meta http-equiv="refresh">` while open. On submit, the same offline
+//! `receive_tx` runs and the S2 reply renders back for the payer to finalize
+//! and broadcast. The Slatepack path only appears when a wallet is loaded. No
+//! JavaScript anywhere.
 
 use actix_web::{web, HttpResponse, Responder};
 use askama::Template;
@@ -32,6 +34,12 @@ pub struct CheckoutInfo {
     pub npub: String,
     pub nprofile: String,
     pub qr_svg: String,
+    /// The wallet's stable `grin1` Slatepack address, when a wallet is loaded.
+    /// `None` (and no Slatepack option shown) when the instance runs with no
+    /// wallet, mirroring how the manual receive handler degrades.
+    pub slatepack_address: Option<String>,
+    /// QR SVG of the `grin1` Slatepack address (present with the address).
+    pub slatepack_qr_svg: Option<String>,
     pub amount_display: String,
     pub status: String,
     pub memo: Option<String>,
@@ -41,7 +49,13 @@ pub struct CheckoutInfo {
 /// Build the presentation for an invoice: the nprofile, its QR, the pay URL,
 /// and a human amount. Shared by the hosted page and the connector API so both
 /// render identically.
-pub fn build_info(inv: &Invoice, cfg: &Config) -> CheckoutInfo {
+///
+/// `slatepack_addr` is the wallet's stable `grin1` Slatepack address when a
+/// wallet is loaded (the hosted page passes it so a payer can pay from any Grin
+/// wallet without Nostr); pass `None` when no wallet is available or the
+/// caller does not surface the Slatepack option (e.g. the JSON connector API),
+/// in which case no Slatepack address or QR is produced.
+pub fn build_info(inv: &Invoice, cfg: &Config, slatepack_addr: Option<&str>) -> CheckoutInfo {
     let relays = gp_nostr::relays::resolve(&cfg.relays);
     let recipient_pubkey = inv.recipient_pubkey.clone().unwrap_or_default();
     let (npub, nprofile) = match PublicKey::from_hex(&recipient_pubkey) {
@@ -58,6 +72,17 @@ pub fn build_info(inv: &Invoice, cfg: &Config) -> CheckoutInfo {
         pay_uri(&nprofile, inv)
     };
     let qr_svg = qr::svg(&qr_payload, cfg.qr_logo_href()).unwrap_or_default();
+    // The Slatepack (grin1) address is stable and reused across invoices; its
+    // QR carries the bare address (a Grin wallet reads no amount from it, so
+    // the page states the amount to send in text next to it). No address means
+    // no wallet loaded: the page simply omits the Slatepack option.
+    let (slatepack_address, slatepack_qr_svg) = match slatepack_addr {
+        Some(addr) if !addr.is_empty() => {
+            let qr = qr::svg(addr, cfg.qr_logo_href()).unwrap_or_default();
+            (Some(addr.to_string()), Some(qr))
+        }
+        _ => (None, None),
+    };
     let amount_display = amount_display(inv);
     let token = inv.token.clone().unwrap_or_default();
     CheckoutInfo {
@@ -68,6 +93,8 @@ pub fn build_info(inv: &Invoice, cfg: &Config) -> CheckoutInfo {
         npub,
         nprofile,
         qr_svg,
+        slatepack_address,
+        slatepack_qr_svg,
         amount_display,
         status: inv.status.clone(),
         memo: inv.memo.clone(),
@@ -150,7 +177,6 @@ struct PayPage {
     is_open: bool,
     is_paid: bool,
     is_expired: bool,
-    wallet_available: bool,
 }
 
 /// The manual-slatepack result template (S2 to copy back).
@@ -187,12 +213,18 @@ async fn pay_page(
         }
     };
     let status = inv.status();
+    // Surface the wallet's stable grin1 Slatepack address (same wallet handle
+    // the manual receive uses). No wallet loaded, or the address cannot be
+    // derived, means no Slatepack option is shown.
+    let slatepack_addr = wallet
+        .get_ref()
+        .as_ref()
+        .and_then(|w| w.slatepack_address().ok());
     let page = PayPage {
-        info: build_info(&inv, cfg.get_ref()),
+        info: build_info(&inv, cfg.get_ref(), slatepack_addr.as_deref()),
         is_open: status == InvoiceStatus::Open,
         is_paid: status == InvoiceStatus::Paid,
         is_expired: status == InvoiceStatus::Expired,
-        wallet_available: wallet.get_ref().is_some(),
     };
     render(page)
 }
@@ -324,6 +356,32 @@ mod tests {
             quote_rate: None,
             quote_source: None,
         }
+    }
+
+    #[test]
+    fn build_info_surfaces_slatepack_address_when_wallet_loaded() {
+        // A loaded wallet passes its grin1 address: build_info exposes it plus
+        // a QR for it, so the hosted page can show the Slatepack option.
+        let inv = invoice(Some(1_500_000_000), None);
+        let cfg = Config::default();
+        let info = build_info(&inv, &cfg, Some("grin1qtestaddress"));
+        assert_eq!(info.slatepack_address.as_deref(), Some("grin1qtestaddress"));
+        let qr = info.slatepack_qr_svg.expect("slatepack QR present");
+        assert!(qr.contains("<svg"), "grin1 QR is an SVG");
+    }
+
+    #[test]
+    fn build_info_omits_slatepack_when_no_wallet() {
+        // No wallet (None) or a blank address: no Slatepack address or QR, so
+        // the page simply does not show the Slatepack option.
+        let inv = invoice(Some(1_500_000_000), None);
+        let cfg = Config::default();
+        let info = build_info(&inv, &cfg, None);
+        assert!(info.slatepack_address.is_none());
+        assert!(info.slatepack_qr_svg.is_none());
+        let blank = build_info(&inv, &cfg, Some(""));
+        assert!(blank.slatepack_address.is_none());
+        assert!(blank.slatepack_qr_svg.is_none());
     }
 
     #[test]

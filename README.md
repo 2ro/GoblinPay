@@ -41,10 +41,15 @@ carries the full merchant surface:
   HTTP webhook (the WooCommerce contract), an authenticated admin dashboard +
   JSON API, and NIP-17 DMs to the merchant / payer.
 
-All relay traffic rides an in-process Nym mixnet tunnel (smolmix, auto-selected
-exit, mix-dns; `GP_NYM=off` is a debugging escape hatch only). Encryption
-negotiates NIP-44 v3 (the NIP-17 extension, via the companion `nip44` crate) per
-recipient, with v2 as the mandatory baseline.
+By default all relay traffic rides an in-process Nym mixnet tunnel (smolmix,
+auto-selected exit, mix-dns). `GP_NYM=off` is also a supported production
+posture, not just a debugging switch: the server then reaches relays over
+clearnet, but the payer's Goblin Wallet still provides sender privacy over its
+own mixnet and the payload stays gift-wrapped end to end. An operator who fronts
+GoblinPay with their own network privacy, or who accepts server-side clearnet for
+a receive-only till, can run it that way. Encryption negotiates NIP-44 v3 (the
+NIP-17 extension, via the companion `nip44` crate) per recipient, with v2 as the
+mandatory baseline.
 
 ## Workspace
 
@@ -73,9 +78,10 @@ Everything is environment variables, defaults are safe for local use.
 | `GP_DATA_DIR` | `./gp-data` | Data directory (wallet files, encrypted seed) |
 | `GP_NODE_URL` | `https://main.gri.mw` | External Grin node (read only) |
 | `GP_CHAIN` | `mainnet` | Grin network: `mainnet` or `testnet` |
-| `GP_RELAY_MODE` | `bundled` | `bundled` or `external` |
-| `GP_RELAYS` | unset | Comma-separated relay URLs |
-| `GP_NYM` | `on` | Route Nostr traffic over the Nym mixnet (`on` or `off`) |
+| `GP_RELAY_MODE` | `bundled` | `bundled` (GoblinPay runs its own co-located relay) or `external` |
+| `GP_BUNDLED_RELAY_URL` | `ws://127.0.0.1:7777` | In `bundled` mode, the self-contained relay GoblinPay dials AND advertises in the checkout `nprofile`; set to the relay's public `wss://` URL in production |
+| `GP_RELAYS` | unset | Extra relay URLs (comma separated): redundancy in `bundled` mode, the whole set in `external` mode |
+| `GP_NYM` | `on` | Route this server's Nostr traffic over the Nym mixnet (`on`, or `off` for supported server-side clearnet) |
 | `GP_INGEST` | `on` | Nostr ingest service (`off` = HTTP surface only, for debugging) |
 | `GP_CHECKOUT_METHODS` | `nostr,slatepack` | Which payment methods the hosted `/pay/<token>` page shows: comma list of `nostr` (Goblin Wallet) and `slatepack` (`grin1`). Unset = both. Unknown tokens are ignored; an empty result falls back to both |
 | `GP_MATCH_MODE` | `memo` | Default matching mode: `memo`, `derived`, `amount` |
@@ -112,6 +118,27 @@ would advertise a Nostr method that nothing is listening for. If you disable
 ingest, drop `nostr` from `GP_CHECKOUT_METHODS`; if you advertise `nostr`, keep
 ingest on. The connector `POST /invoice` JSON response still returns the
 `nprofile` regardless of this setting, which affects only the hosted page.
+
+### Bundled relay
+
+`GP_RELAY_MODE=bundled` (the default) means GoblinPay runs against its own
+co-located Nostr relay, so a merchant needs no third-party relay. The relay is a
+stock, unmodified `nostr-rs-relay` (a small, SQLite-backed Rust relay) vendored
+as the `relay` service in `deploy/docker-compose.yml` with a config file at
+`deploy/relay/nostr-rs-relay.toml` (config only, no fork). It was chosen over
+writing a relay from scratch: it is battle-tested, lightweight enough for a
+single-merchant till, and keeps the money path off any third-party
+infrastructure.
+
+`GP_BUNDLED_RELAY_URL` is the relay's URL. It is both dialed by the server and
+advertised to payers in the checkout `nprofile`, so the payer's Goblin Wallet is
+told to deliver the gift-wrapped slatepack straight to the merchant's own relay.
+Set it to the relay's public `wss://` URL in production (the compose file and
+`deploy/Caddyfile` serve it on `relay.<GP_DOMAIN>`); the default
+`ws://127.0.0.1:7777` suits local and same-host development. Any `GP_RELAYS` are
+appended for redundancy and advertised alongside the bundled relay.
+
+`GP_RELAY_MODE=external` uses only the `GP_RELAYS` set and runs no bundled relay.
 
 ### Conversion rates (optional)
 
@@ -202,6 +229,27 @@ curl http://127.0.0.1:8080/health
 ./ci.sh   # cargo fmt --check, clippy -D warnings, tests
 ```
 
+## Connectors
+
+Store integrations live under `connectors/` and all speak the same
+create-invoice + signed-webhook contract:
+
+- `connectors/woocommerce` — a WordPress/WooCommerce gateway (classic + Blocks).
+- `connectors/medusa` — a Medusa v2 payment-module provider.
+- The generic REST connector is built in: `POST /invoice` plus the webhook.
+
+Refunds are unsupported/manual everywhere (GoblinPay is receive-only).
+
+## Deploy
+
+`deploy/` holds a reproducible deployment: a hardened systemd unit
+(`gp-server.service`) with `deploy/install.sh` for bare metal, and a
+`docker-compose.yml` that brings up the server, the bundled relay, and an
+auto-HTTPS Caddy proxy. CI (`.github` / `.gitea` workflows) runs fmt, clippy,
+and tests. See `deploy/` for details.
+
 ## Credits
 
 GoblinPay is developed with the help of Claude (Anthropic).
+
+Built with AI pair-programming assistance (Claude)

@@ -132,7 +132,7 @@ async fn start_ingest(cfg: &Config, pool: sqlx::SqlitePool) -> (Keys, GpWallet) 
         eprintln!("warning: GP_NOTIFY_MERCHANT_DM=on but GP_MERCHANT_NPUB is unset/invalid");
     }
     let opts = gp_nostr::service::ServiceOptions {
-        relays: gp_nostr::relays::resolve(&cfg.relays),
+        relays: gp_nostr::relays::resolve(cfg.relay_mode, &cfg.bundled_relay_url, &cfg.relays),
         nym: cfg.nym,
         notify: gp_nostr::service::NotifyOptions {
             merchant,

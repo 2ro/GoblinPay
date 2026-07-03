@@ -56,7 +56,7 @@ pub struct CheckoutInfo {
 /// caller does not surface the Slatepack option (e.g. the JSON connector API),
 /// in which case no Slatepack address or QR is produced.
 pub fn build_info(inv: &Invoice, cfg: &Config, slatepack_addr: Option<&str>) -> CheckoutInfo {
-    let relays = gp_nostr::relays::resolve(&cfg.relays);
+    let relays = gp_nostr::relays::resolve(cfg.relay_mode, &cfg.bundled_relay_url, &cfg.relays);
     let recipient_pubkey = inv.recipient_pubkey.clone().unwrap_or_default();
     // The Nostr (Goblin Wallet) method is only surfaced when the operator has it
     // enabled (`GP_CHECKOUT_METHODS`). Disabled, the nprofile/npub/QR are left

@@ -105,7 +105,8 @@ async fn dashboard(
         match_mode: format!("{:?}", cfg.match_mode).to_lowercase(),
         nym: cfg.nym,
         ingest: cfg.ingest,
-        relay_count: gp_nostr::relays::resolve(&cfg.relays).len(),
+        relay_count: gp_nostr::relays::resolve(cfg.relay_mode, &cfg.bundled_relay_url, &cfg.relays)
+            .len(),
         webhook_configured: cfg.webhook_url.is_some(),
         pending_webhooks,
         rotate_interval: cfg.endpub_rotate_interval,
@@ -206,7 +207,7 @@ struct CreateUserBody {
 }
 
 fn endpub_json(cfg: &Config, user_id: &str, epoch: i64, pubkey: &str) -> serde_json::Value {
-    let relays = gp_nostr::relays::resolve(&cfg.relays);
+    let relays = gp_nostr::relays::resolve(cfg.relay_mode, &cfg.bundled_relay_url, &cfg.relays);
     let (npub, nprofile, qr) = match PublicKey::from_hex(pubkey) {
         Ok(pk) => (
             gp_nostr::npub_of(pk),

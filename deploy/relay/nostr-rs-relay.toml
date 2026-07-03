@@ -1,0 +1,39 @@
+# Configuration for the BUNDLED GoblinPay relay: a stock, unmodified
+# nostr-rs-relay (https://github.com/scsibug/nostr-rs-relay) run as the `relay`
+# service in docker-compose.yml. This is the self-contained relay that
+# `GP_RELAY_MODE=bundled` (the default) points at, so a merchant needs no
+# third-party relay: GoblinPay dials it, and the checkout `nprofile` advertises
+# it to payers, who deliver their gift-wrapped slatepack straight to the
+# merchant's own relay.
+#
+# nostr-rs-relay is a small, SQLite-backed Rust relay: a good fit for a
+# single-merchant till, and vendored as-is (config only, no fork).
+
+[info]
+# Set this to the relay's PUBLIC wss URL (the same value you put in
+# GP_BUNDLED_RELAY_URL). Payers connect here.
+relay_url = "wss://pay.example/"
+name = "GoblinPay bundled relay"
+description = "Co-located Nostr relay for a GoblinPay merchant till."
+
+[database]
+data_directory = "/usr/src/app/db"
+
+[network]
+# Inside the container. Caddy terminates TLS and proxies wss -> here.
+address = "0.0.0.0"
+port = 7777
+
+[limits]
+# Bound the footprint so an unauthenticated ingest/subscription flood cannot
+# starve the till (mirrors the reasoning behind the bundled strfry limits in
+# goblin-nip05d). Payers publish NIP-59 gift wraps from random ephemeral keys,
+# so a pubkey allowlist is intentionally NOT used (it would block payments).
+messages_per_sec = 10
+subscriptions_per_min = 60
+max_event_bytes = 131072
+max_ws_message_bytes = 262144
+max_subscriptions = 20
+
+[options]
+reject_future_seconds = 1800

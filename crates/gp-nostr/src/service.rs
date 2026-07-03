@@ -41,8 +41,9 @@ const NYM_WARM_WAIT: Duration = Duration::from_secs(30);
 pub struct ServiceOptions {
     /// Relay set to listen on and publish to.
     pub relays: Vec<String>,
-    /// Route everything over the Nym mixnet (default on; clearnet is a
-    /// debugging escape hatch only).
+    /// Route everything over the Nym mixnet (default on). `off` is a supported
+    /// production posture (server-side clearnet): the payer's Goblin Wallet
+    /// still rides its own mixnet, and the payload is gift-wrapped end to end.
     pub nym: bool,
     /// Optional NIP-17 payment DMs (milestone 6, all off by default).
     pub notify: NotifyOptions,
@@ -141,7 +142,10 @@ pub async fn run<R: SlatepackReceiver>(
             .websocket_transport(NymWebSocketTransport)
             .build()
     } else {
-        warn!("nostr: GP_NYM=off — relay traffic goes CLEARNET (debugging only)");
+        warn!(
+            "nostr: GP_NYM=off — this server's relay traffic goes CLEARNET (supported: the \
+             payer's wallet still provides sender privacy; the payload stays gift-wrapped)"
+        );
         Client::builder().build()
     };
 

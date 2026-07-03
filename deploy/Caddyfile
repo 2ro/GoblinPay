@@ -1,0 +1,23 @@
+# Caddy reverse proxy for a GoblinPay till, with automatic HTTPS.
+#
+# Two names on one host (point both A/AAAA records at this server before
+# `docker compose up`, so Caddy can obtain certificates):
+#   {$GP_DOMAIN}        -> the GoblinPay checkout pages + REST API (gp-server)
+#   relay.{$GP_DOMAIN}  -> the bundled nostr-rs-relay (payers connect here; it
+#                          is what the checkout nprofile advertises)
+#
+# The relay gets its OWN subdomain rather than a path on the main domain so
+# there is no path rewriting: nostr-rs-relay serves both the WebSocket relay
+# protocol and the NIP-11 relay-info document at the root.
+#
+# GP_DOMAIN is injected from the environment by docker-compose.
+
+{$GP_DOMAIN} {
+	encode gzip
+	reverse_proxy gp-server:8080
+}
+
+relay.{$GP_DOMAIN} {
+	# WebSocket upgrades and the NIP-11 document both go straight through.
+	reverse_proxy relay:7777
+}

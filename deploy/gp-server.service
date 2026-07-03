@@ -1,0 +1,80 @@
+# Hardened systemd unit for the GoblinPay server on bare metal.
+#
+# Install (or just run deploy/install.sh):
+#   sudo install -m0755 target/release/gp-server /usr/local/bin/
+#   sudo install -m0640 deploy/.env.example /etc/goblinpay.env   # then EDIT it
+#   sudo install -m0644 deploy/gp-server.service /etc/systemd/system/
+#   sudo mkdir -p /etc/goblinpay/secrets                          # 0400 secret files
+#   sudo systemctl daemon-reload && sudo systemctl enable --now gp-server
+#
+# Unlike goblin-nip05d, this service holds MONEY secrets (the Grin seed and the
+# wallet password) and a wallet data directory. The seed and password are passed
+# as systemd credentials (read by PID1 as root, exposed read-only to the dynamic
+# service user) rather than left world-readable, and the config supports the
+# `*_FILE` mounted-secret variants for exactly this.
+
+[Unit]
+Description=GoblinPay — self-hostable, receive-only Grin payment server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+# Throwaway unprivileged user allocated at runtime. For a stable data owner,
+# comment this out and set `User=goblinpay` (create the user first).
+DynamicUser=yes
+
+# Non-secret config (domain, node, tokens, webhook, relay URL). Read by systemd
+# as root, so a 0640 root:root file is fine even under DynamicUser.
+EnvironmentFile=/etc/goblinpay.env
+
+# Money/identity secrets as credentials: the source files stay root-owned 0400;
+# systemd exposes copies under $CREDENTIALS_DIRECTORY (%d), readable by the
+# dynamic service user. Point the wallet at them via the *_FILE variants.
+LoadCredential=gp_mnemonic:/etc/goblinpay/secrets/mnemonic
+LoadCredential=gp_wallet_password:/etc/goblinpay/secrets/wallet_password
+Environment=GP_MNEMONIC_FILE=%d/gp_mnemonic
+Environment=GP_WALLET_PASSWORD_FILE=%d/gp_wallet_password
+# Optional: a NIP-49 encrypted Nostr identity (else a random one is generated
+# and persisted under the data dir on first start). Uncomment with its file:
+#LoadCredential=gp_ncryptsec:/etc/goblinpay/secrets/ncryptsec
+#Environment=GP_NCRYPTSEC_FILE=%d/gp_ncryptsec
+
+# Managed state at /var/lib/goblinpay: the SQLite db, the wallet files, and the
+# encrypted seed at rest. 0700 — only the service user may read it.
+StateDirectory=goblinpay
+StateDirectoryMode=0700
+Environment=GP_DB_PATH=/var/lib/goblinpay/goblinpay.db
+Environment=GP_DATA_DIR=/var/lib/goblinpay/gp-data
+
+ExecStart=/usr/local/bin/gp-server
+Restart=on-failure
+RestartSec=2
+
+# --- hardening ---
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# If the Nym mixnet stack ever fails to start with a W^X error, comment this out.
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# Only the state directory is writable.
+ReadWritePaths=/var/lib/goblinpay
+# No raw sockets; only IP + unix.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

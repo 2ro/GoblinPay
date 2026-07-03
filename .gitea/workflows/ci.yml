@@ -1,0 +1,58 @@
+# CI gate for GoblinPay. Mirror of .github/workflows/ci.yml.
+#
+# What runs where:
+#   - fmt + the gp-core clippy/test gate run on ANY runner: gp-core is
+#     self-contained (no out-of-repo deps), and it holds the domain logic
+#     (config, invoices, matching, webhooks, rates, the connector seam).
+#   - The FULL gate (gp-wallet + gp-nostr + gp-server, via ./ci.sh) needs the
+#     sibling checkouts next to the repo: nip44/ and nym/ (the Nostr/Nym path)
+#     and goblin/ (the gp-goblin-sender round-trip gate). Where the workspace is
+#     laid out like the deploy host, it runs too; otherwise it is skipped with a
+#     note. `-p` scoping always keeps the goblin-tree dev crate off the money
+#     path build.
+name: ci
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  rust:
+    name: fmt / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Format check (whole workspace)
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (gp-core, deny warnings)
+        run: cargo clippy -p gp-core --all-targets -- -D warnings
+
+      - name: Test (gp-core)
+        run: cargo test -p gp-core --locked
+
+      - name: Full gate (when sibling checkouts are present)
+        run: |
+          if [ -d ../nip44 ] && [ -d ../nym/smolmix/core ] && [ -d ../goblin ]; then
+            echo "Workspace siblings present — running the full ./ci.sh gate."
+            ./ci.sh
+          else
+            echo "nip44/nym/goblin siblings absent on this runner;"
+            echo "the full gp-server gate runs via ./ci.sh on the deploy host."
+          fi

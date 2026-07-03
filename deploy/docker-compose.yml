@@ -1,0 +1,89 @@
+# A full, self-contained GoblinPay till: the server, its BUNDLED relay, and an
+# auto-HTTPS reverse proxy.
+#
+#   cd deploy
+#   cp .env.example .env            # then edit it (domain, tokens)
+#   mkdir -p secrets                # drop the mounted-secret files in here
+#   docker compose up -d
+#
+# gives you:
+#   - gp-server : the GoblinPay payment server (this repo)
+#   - relay     : a stock nostr-rs-relay, the bundled relay GP_RELAY_MODE=bundled
+#                 points at (so no third-party relay is needed)
+#   - caddy     : auto-TLS reverse proxy terminating HTTPS for both
+#
+# Set GP_DOMAIN in .env to your own domain BEFORE bringing it up: Caddy obtains
+# a certificate for it, so DNS must already point at this host.
+#
+# NOTE on the build context: gp-server's Nostr/Nym path depends on the sibling
+# crates nip44/ and nym/ (see deploy/Dockerfile), so the build context is the
+# workspace parent (`../..`) that holds GoblinPay, nip44, and nym.
+
+services:
+  gp-server:
+    build:
+      context: ../..
+      dockerfile: GoblinPay/deploy/Dockerfile
+    image: goblinpay:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Bundled relay (default mode). GP_BUNDLED_RELAY_URL is BOTH dialed by the
+      # server and advertised to payers in the nprofile, so it must be the
+      # relay's PUBLIC url (payers connect here); the server reaches it back
+      # through Caddy.
+      GP_RELAY_MODE: bundled
+      GP_BUNDLED_RELAY_URL: ${GP_BUNDLED_RELAY_URL:-wss://relay.${GP_DOMAIN}}
+      GP_PUBLIC_URL: ${GP_PUBLIC_URL:-https://${GP_DOMAIN}}
+      GP_BIND: 0.0.0.0:8080
+      GP_DB_PATH: /data/goblinpay.db
+      GP_DATA_DIR: /data/gp-data
+      # Money/identity secrets come from mounted files (never the image/env):
+      GP_MNEMONIC_FILE: /run/secrets/gp_mnemonic
+      GP_WALLET_PASSWORD_FILE: /run/secrets/gp_wallet_password
+      GP_NCRYPTSEC_FILE: /run/secrets/gp_ncryptsec
+    volumes:
+      - gp-data:/data
+      - ./secrets:/run/secrets:ro
+    expose:
+      - "8080"
+    depends_on:
+      - relay
+
+  relay:
+    image: scsibug/nostr-rs-relay:latest
+    restart: unless-stopped
+    volumes:
+      - ./relay/nostr-rs-relay.toml:/usr/src/app/config.toml:ro
+      - relay-data:/usr/src/app/db
+    expose:
+      - "7777"
+    # Bound the relay's footprint so an unauthenticated flood cannot starve the
+    # till or proxy on the same host.
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - gp-server
+      - relay
+    environment:
+      GP_DOMAIN: ${GP_DOMAIN:-pay.example}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  gp-data:
+  relay-data:
+  caddy-data:
+  caddy-config:

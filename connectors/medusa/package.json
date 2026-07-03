@@ -1,0 +1,41 @@
+{
+  "name": "medusa-payment-goblinpay",
+  "version": "1.0.0",
+  "description": "GoblinPay payment provider for Medusa v2: accept Grin (GRIN / MimbleWimble) payments through a self-hosted, receive-only GoblinPay server.",
+  "license": "Apache-2.0",
+  "keywords": [
+    "medusa",
+    "medusa-v2",
+    "medusa-plugin",
+    "medusa-plugin-payment",
+    "payment",
+    "grin",
+    "mimblewimble",
+    "goblinpay"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://git.us-ea.st/GRIN/GoblinPay"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "INSTALL.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@medusajs/framework": "^2.0.0"
+  },
+  "devDependencies": {
+    "@medusajs/framework": "^2.12.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  }
+}

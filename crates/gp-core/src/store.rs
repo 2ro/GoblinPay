@@ -1,8 +1,8 @@
 //! The store-connector seam.
 //!
-//! Every store integration (the built-in generic REST connector, the
-//! WooCommerce and Medusa plugins that arrive in a later milestone, and the
-//! future pop-up Nostr store) drives GoblinPay through one uniform contract:
+//! Every store integration (the built-in generic REST connector, the shipped
+//! WooCommerce and Medusa plugins under `connectors/`, and the future pop-up
+//! Nostr store) drives GoblinPay through one uniform contract:
 //! a create-invoice request in, a hosted checkout + signed webhook out. This
 //! trait keeps that mapping in one place so the core never grows per-store
 //! branches: a connector only decides how a store's order becomes invoice

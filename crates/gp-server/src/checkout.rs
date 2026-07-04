@@ -400,9 +400,11 @@ mod tests {
         // leaves the nprofile/npub empty and the page omits the Nostr section
         // while still showing the Slatepack one.
         let inv = invoice(Some(1_500_000_000), None);
-        let mut cfg = Config::default();
-        cfg.checkout_nostr = false;
-        cfg.checkout_slatepack = true;
+        let cfg = Config {
+            checkout_nostr: false,
+            checkout_slatepack: true,
+            ..Config::default()
+        };
         let info = build_info(&inv, &cfg, Some("grin1qtestaddress"));
         assert!(info.nprofile.is_empty(), "nprofile empty when nostr off");
         assert!(info.npub.is_empty(), "npub empty when nostr off");
@@ -431,9 +433,11 @@ mod tests {
         // wallet address available, build_info drops it and the page omits the
         // Slatepack section while still showing the Nostr one.
         let inv = invoice(Some(1_500_000_000), None);
-        let mut cfg = Config::default();
-        cfg.checkout_nostr = true;
-        cfg.checkout_slatepack = false;
+        let cfg = Config {
+            checkout_nostr: true,
+            checkout_slatepack: false,
+            ..Config::default()
+        };
         let info = build_info(&inv, &cfg, Some("grin1qtestaddress"));
         assert!(
             info.slatepack_address.is_none(),

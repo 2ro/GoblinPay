@@ -3,7 +3,7 @@
 Accept Grin (GRIN / MimbleWimble) payments in a Medusa v2 store through a
 self-hosted GoblinPay server. The customer pays from their Goblin Wallet by
 scanning an `nprofile` QR code. The payment travels as a gift-wrapped slatepack
-over Nostr (optionally over the Nym mixnet). GoblinPay receives it, returns the
+over Nostr. GoblinPay receives it, returns the
 reply slatepack to the payer, watches the chain to confirm, and notifies Medusa
 through a signed webhook.
 

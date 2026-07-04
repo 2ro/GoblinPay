@@ -1,5 +1,5 @@
 //! Nostr transport and secure handoff for GoblinPay, mirroring Goblin's
-//! proven `src/nostr` + `src/nym` stack adapted to a headless daemon:
+//! proven `src/nostr` stack adapted to a headless daemon:
 //!
 //! - [`identity`]: a random standalone nsec (or an imported one), NIP-49
 //!   encrypted at rest, deliberately independent of the Grin seed (the
@@ -13,18 +13,15 @@
 //! - [`ingest`]: the guarded ingest pipeline (dedupe, rate limits, the pure
 //!   `decide()` policy) handing S1 slatepacks to the wallet and building the
 //!   S2 reply rumor.
-//! - [`service`]: the daemon loop — relay pool over the in-process Nym
-//!   mixnet, kind-10050 publishing, catch-up + live subscription, reply
-//!   dispatch, boot-time reconcile.
-//! - [`nym`]: the smolmix tunnel, mix-dns and the relay websocket transport,
-//!   ported from Goblin (G14).
+//! - [`service`]: the daemon loop — relay pool (clearnet), kind-10050
+//!   publishing, catch-up + live subscription, reply dispatch, boot-time
+//!   reconcile.
 //!
 //! Privacy: log lines carry short event/key prefixes and hosts only — never
 //! armor contents, full URLs, or secrets (Goblin's host-only level).
 
 pub mod identity;
 pub mod ingest;
-pub mod nym;
 pub mod protocol;
 pub mod receipt;
 pub mod relays;

@@ -146,11 +146,6 @@ pub struct Config {
     /// (`GP_BUNDLED_RELAY_URL`, default `ws://127.0.0.1:7777`). Both dialed by
     /// the ingest service and advertised to payers in the checkout `nprofile`.
     pub bundled_relay_url: String,
-    /// Route Nostr traffic over the Nym mixnet (`GP_NYM`: `on` or `off`,
-    /// default on). Production may deliberately run `off` (server-side
-    /// clearnet): the payer's Goblin Wallet still provides sender privacy over
-    /// its own mixnet, and the payload is gift-wrapped end to end regardless.
-    pub nym: bool,
     /// Run the Nostr ingest service (`GP_INGEST`: `on` or `off`, default on).
     /// When on, the wallet and identity secrets are required at boot.
     pub ingest: bool,
@@ -254,7 +249,6 @@ impl Default for Config {
             relay_mode: RelayMode::Bundled,
             relays: Vec::new(),
             bundled_relay_url: DEFAULT_BUNDLED_RELAY.into(),
-            nym: true,
             ingest: true,
             checkout_nostr: true,
             checkout_slatepack: true,
@@ -344,12 +338,6 @@ impl Config {
             .filter(|s| !s.is_empty())
             .unwrap_or(defaults.bundled_relay_url);
 
-        let nym = match get("GP_NYM").as_deref().unwrap_or("on") {
-            "on" => true,
-            "off" => false,
-            other => return Err(format!("GP_NYM must be `on` or `off` (got `{other}`)")),
-        };
-
         let ingest = match get("GP_INGEST").as_deref().unwrap_or("on") {
             "on" => true,
             "off" => false,
@@ -430,7 +418,6 @@ impl Config {
             relay_mode,
             relays,
             bundled_relay_url,
-            nym,
             ingest,
             checkout_nostr,
             checkout_slatepack,
@@ -534,7 +521,7 @@ impl Config {
         let set = |o: bool| if o { "set" } else { "unset" };
         format!(
             "bind={} tls={} db={} data_dir={} node={} chain={:?} relay_mode={:?} \
-             relays={:?} bundled_relay={} nym={} ingest={} checkout_methods={} match_mode={:?} \
+             relays={:?} bundled_relay={} ingest={} checkout_methods={} match_mode={:?} \
              mnemonic={} \
              wallet_password={} \
              nsec={} ncryptsec={} public_url={} api_token={} admin_token={} webhook_url={} \
@@ -554,7 +541,6 @@ impl Config {
             self.relay_mode,
             self.relays,
             self.bundled_relay_url,
-            if self.nym { "on" } else { "off" },
             if self.ingest { "on" } else { "off" },
             self.checkout_methods_str(),
             self.match_mode,
@@ -687,7 +673,6 @@ mod tests {
         assert_eq!(cfg.relay_mode, RelayMode::Bundled);
         assert!(cfg.relays.is_empty());
         assert_eq!(cfg.bundled_relay_url, DEFAULT_BUNDLED_RELAY);
-        assert!(cfg.nym);
         assert!(cfg.ingest);
         assert_eq!(cfg.match_mode, MatchMode::Memo);
         assert!(cfg.mnemonic.is_none());
@@ -707,7 +692,6 @@ mod tests {
             ("GP_RELAY_MODE", "external"),
             ("GP_RELAYS", "wss://relay.example, wss://relay2.example ,"),
             ("GP_BUNDLED_RELAY_URL", "wss://relay.mystore.example"),
-            ("GP_NYM", "off"),
             ("GP_INGEST", "off"),
             ("GP_MATCH_MODE", "derived"),
         ])
@@ -723,7 +707,6 @@ mod tests {
             vec!["wss://relay.example", "wss://relay2.example"]
         );
         assert_eq!(cfg.bundled_relay_url, "wss://relay.mystore.example");
-        assert!(!cfg.nym);
         assert!(!cfg.ingest);
         assert_eq!(cfg.match_mode, MatchMode::Derived);
     }
@@ -782,7 +765,6 @@ mod tests {
         assert!(load(&[("GP_TLS", "acme")]).is_err());
         assert!(load(&[("GP_CHAIN", "floonet")]).is_err());
         assert!(load(&[("GP_RELAY_MODE", "both")]).is_err());
-        assert!(load(&[("GP_NYM", "true")]).is_err());
         assert!(load(&[("GP_INGEST", "yes")]).is_err());
         assert!(load(&[("GP_MATCH_MODE", "exact")]).is_err());
     }

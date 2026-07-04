@@ -9,8 +9,8 @@
 # Re-runnable: it never overwrites an existing /etc/goblinpay.env.
 # Requires: a Rust toolchain (cargo) and root (sudo) for the install steps.
 #
-# BUILD PREREQUISITE: gp-server's Nostr/Nym path depends on the sibling crates
-# nip44/ and nym/ (see crates/gp-nostr/Cargo.toml). They must sit next to this
+# BUILD PREREQUISITE: gp-server's Nostr path depends on the sibling crate
+# nip44/ (see crates/gp-nostr/Cargo.toml). It must sit next to this
 # repo, exactly as on the deploy host. `-p gp-server` deliberately excludes the
 # gp-goblin-sender dev crate, which needs the (absent) goblin wallet tree.
 #

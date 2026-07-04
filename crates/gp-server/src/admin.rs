@@ -74,7 +74,6 @@ struct AdminPage {
     balances: Vec<BalanceRow>,
     node_url: String,
     match_mode: String,
-    nym: bool,
     ingest: bool,
     relay_count: usize,
     webhook_configured: bool,
@@ -103,7 +102,6 @@ async fn dashboard(
         balances,
         node_url: cfg.node_url.clone(),
         match_mode: format!("{:?}", cfg.match_mode).to_lowercase(),
-        nym: cfg.nym,
         ingest: cfg.ingest,
         relay_count: gp_nostr::relays::resolve(cfg.relay_mode, &cfg.bundled_relay_url, &cfg.relays)
             .len(),

@@ -1,15 +1,14 @@
 # Multi-stage build for the GoblinPay server, run as a non-root user.
 #
 # IMPORTANT — build context is the WORKSPACE PARENT, not the repo.
-# The Nostr/Nym money path depends on two crates that live next to this repo,
-# not inside it (see crates/gp-nostr/Cargo.toml):
+# The Nostr money path depends on a crate that lives next to this repo, not
+# inside it (see crates/gp-nostr/Cargo.toml):
 #   nip44  -> ../nip44          (the NIP-44 v3 companion crate)
-#   smolmix-> ../nym/smolmix/core (the in-process Nym mixnet)
-# So the image must be built from the directory that contains GoblinPay/,
-# nip44/, and nym/ side by side. docker-compose.yml already sets
+# So the image must be built from the directory that contains GoblinPay/ and
+# nip44/ side by side. docker-compose.yml already sets
 # `build.context: ../..` for this; to build by hand:
 #
-#   cd "<workspace parent containing GoblinPay, nip44, nym>"
+#   cd "<workspace parent containing GoblinPay, nip44>"
 #   docker build -f GoblinPay/deploy/Dockerfile -t goblinpay:latest .
 #
 # Only `-p gp-server` is built, which EXCLUDES the gp-goblin-sender dev crate
@@ -23,11 +22,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 
-# The three trees the gp-server dependency graph needs, in the same relative
-# layout the path deps expect (nip44 and nym are siblings of GoblinPay).
+# The trees the gp-server dependency graph needs, in the same relative layout
+# the path deps expect (nip44 is a sibling of GoblinPay).
 COPY GoblinPay ./GoblinPay
 COPY nip44 ./nip44
-COPY nym ./nym
 
 WORKDIR /build/GoblinPay
 # Build ONLY gp-server (and its deps); never the goblin-tree dev crate.

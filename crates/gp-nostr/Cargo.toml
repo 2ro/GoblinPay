@@ -1,6 +1,6 @@
 [package]
 name = "gp-nostr"
-description = "Nostr transport and secure handoff for GoblinPay (identity, gift wrap, ingest, Nym)"
+description = "Nostr transport and secure handoff for GoblinPay (identity, gift wrap, ingest)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -30,24 +30,10 @@ nip44 = { path = "../../../nip44" }
 # Nostr identity).
 secp256k1 = { version = "0.31", features = ["global-context", "hashes"] }
 
-# Nym mixnet, linked IN-PROCESS via smolmix (TCP/UDP tunnel over the mixnet
-# with an AUTO-SELECTED IPR exit; no sidecar, no SOCKS5 loopback, no
-# single-exit SPOF). Path dep into the local nym checkout, PINNED at rev
-# f6ed17d949cc19fee0fb51db3cb65771fd510d5b ("http-api-client: preconfigured
-# webpki roots on Android" — the Android patch is irrelevant server-side, but
-# the pin is what Goblin G14 validated; do not float it silently).
-smolmix = { path = "../../../nym/smolmix/core" }
-# mix-dns wire codec. Already in the dependency graph via nym-http-api-client
-# (smolmix -> nym-sdk), so we reuse it instead of vendoring a DNS
-# encode/parse (same justification as Goblin).
-hickory-proto = { version = "0.26", default-features = false, features = ["std"] }
-
 tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros", "sync"] }
 log = "0.4"
 serde = { workspace = true }
 serde_json = { workspace = true }
-# mix-dns transaction ids.
-rand = "0.9"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

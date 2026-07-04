@@ -5,8 +5,8 @@
 #     self-contained (no out-of-repo deps), and it holds the domain logic
 #     (config, invoices, matching, webhooks, rates, the connector seam).
 #   - The FULL gate (gp-wallet + gp-nostr + gp-server, via ./ci.sh) needs the
-#     sibling checkouts next to the repo: nip44/ and nym/ (the Nostr/Nym path)
-#     and goblin/ (the gp-goblin-sender round-trip gate). Where the workspace is
+#     sibling checkouts next to the repo: nip44/ (the Nostr path) and goblin/
+#     (the gp-goblin-sender round-trip gate). Where the workspace is
 #     laid out like the deploy host, it runs too; otherwise it is skipped with a
 #     note. `-p` scoping always keeps the goblin-tree dev crate off the money
 #     path build.
@@ -49,10 +49,10 @@ jobs:
 
       - name: Full gate (when sibling checkouts are present)
         run: |
-          if [ -d ../nip44 ] && [ -d ../nym/smolmix/core ] && [ -d ../goblin ]; then
+          if [ -d ../nip44 ] && [ -d ../goblin ]; then
             echo "Workspace siblings present — running the full ./ci.sh gate."
             ./ci.sh
           else
-            echo "nip44/nym/goblin siblings absent on this runner;"
+            echo "nip44/goblin siblings absent on this runner;"
             echo "the full gp-server gate runs via ./ci.sh on the deploy host."
           fi

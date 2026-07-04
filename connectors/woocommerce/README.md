@@ -2,8 +2,8 @@
 
 Accept Grin (GRIN / MimbleWimble) payments in WooCommerce through a self-hosted
 GoblinPay server. The customer pays from their Goblin Wallet by scanning an
-`nprofile` QR code. The payment travels as a gift-wrapped slatepack over Nostr
-(optionally over the Nym mixnet). GoblinPay receives it, returns the reply
+`nprofile` QR code. The payment travels as a gift-wrapped slatepack over Nostr.
+GoblinPay receives it, returns the reply
 slatepack to the payer, watches the chain to confirm, and notifies WooCommerce.
 
 This plugin is a thin client. All of the Grin and Nostr work happens in

@@ -34,7 +34,7 @@ log = "0.4"
 # ring crypto provider (no aws-lc-rs build) and brings platform-verifier roots;
 # no JSON feature (we send a pre-signed body).
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
-# Stderr logger for the gp-nostr/nym `log` output; no regex filtering needed.
+# Stderr logger for the gp-nostr `log` output; no regex filtering needed.
 env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
 
 [dev-dependencies]

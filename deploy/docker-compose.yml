@@ -15,9 +15,9 @@
 # Set GP_DOMAIN in .env to your own domain BEFORE bringing it up: Caddy obtains
 # a certificate for it, so DNS must already point at this host.
 #
-# NOTE on the build context: gp-server's Nostr/Nym path depends on the sibling
-# crates nip44/ and nym/ (see deploy/Dockerfile), so the build context is the
-# workspace parent (`../..`) that holds GoblinPay, nip44, and nym.
+# NOTE on the build context: gp-server's Nostr path depends on the sibling
+# crate nip44/ (see deploy/Dockerfile), so the build context is the workspace
+# parent (`../..`) that holds GoblinPay and nip44.
 
 services:
   gp-server:

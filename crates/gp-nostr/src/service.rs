@@ -1,6 +1,6 @@
 //! The daemon service loop, adapted from `goblin/src/nostr/client.rs`
-//! (`run_service`): connect the relay pool over the in-process Nym mixnet,
-//! publish the kind 10050 inbox (with the NIP-17 `encryption` capability
+//! (`run_service`): connect the relay pool, publish the kind 10050 inbox
+//! (with the NIP-17 `encryption` capability
 //! tag) and its kind 10002 mirror, catch up on missed gift wraps, subscribe
 //! live, and for every received payment dispatch the S2 reply to the payer's
 //! advertised relays (their 10050; our own set as the fallback), encrypted
@@ -19,7 +19,6 @@ use nostr_sdk::{
 };
 
 use crate::ingest::{Ingest, IngestOutcome, PendingReply};
-use crate::nym::NymWebSocketTransport;
 use crate::relays::MAX_DM_RELAYS;
 use crate::unix_time;
 use crate::wrap;
@@ -33,18 +32,12 @@ const LOOKBACK_SECS: i64 = 3 * 86_400;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Send dispatch timeout.
 const SEND_TIMEOUT: Duration = Duration::from_secs(40);
-/// How long to wait for the mixnet tunnel before dialing relays anyway.
-const NYM_WARM_WAIT: Duration = Duration::from_secs(30);
 
 /// Service configuration (already resolved from the environment).
 #[derive(Debug, Clone)]
 pub struct ServiceOptions {
     /// Relay set to listen on and publish to.
     pub relays: Vec<String>,
-    /// Route everything over the Nym mixnet (default on). `off` is a supported
-    /// production posture (server-side clearnet): the payer's Goblin Wallet
-    /// still rides its own mixnet, and the payload is gift-wrapped end to end.
-    pub nym: bool,
     /// Optional NIP-17 payment DMs (milestone 6, all off by default).
     pub notify: NotifyOptions,
 }
@@ -121,33 +114,10 @@ pub async fn run<R: SlatepackReceiver>(
     receiver: R,
     directory: Arc<dyn KeyDirectory>,
 ) {
-    let client = if opts.nym {
-        // Wait for the in-process Nym mixnet tunnel before any network work:
-        // dialing before it is up drops every relay into the pool's
-        // backing-off reconnect (Goblin's wallet-open ordering lesson).
-        crate::nym::warm_up();
-        let waited = std::time::Instant::now();
-        while !crate::nym::is_ready() && waited.elapsed() < NYM_WARM_WAIT {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-        if crate::nym::is_ready() {
-            info!(
-                "nostr: Nym tunnel ready after ~{}ms",
-                waited.elapsed().as_millis()
-            );
-        } else {
-            warn!("nostr: Nym tunnel still warming; relays will retry through it");
-        }
-        Client::builder()
-            .websocket_transport(NymWebSocketTransport)
-            .build()
-    } else {
-        warn!(
-            "nostr: GP_NYM=off — this server's relay traffic goes CLEARNET (supported: the \
-             payer's wallet still provides sender privacy; the payload stays gift-wrapped)"
-        );
-        Client::builder().build()
-    };
+    // This server's relay traffic goes over clearnet. The payer's Goblin Wallet
+    // still provides sender privacy, and the payload stays gift-wrapped end to
+    // end regardless of the pipe it travels through.
+    let client = Client::builder().build();
 
     let ingest = Ingest::with_directory(keys.clone(), receiver, directory);
     let npub_prefix: String = keys.public_key().to_hex().chars().take(8).collect();
@@ -469,8 +439,8 @@ async fn connect_relays(client: &Client, urls: &[String]) {
         let url = url.clone();
         async move {
             let _ = client.add_relay(&url).await;
-            // Short cap: a reachable relay connects in ~2-4s over the mixnet;
-            // one dead relay in the list must not stall the whole send.
+            // Short cap: a reachable relay connects in ~2-4s; one dead relay in
+            // the list must not stall the whole send.
             let _ = client.try_connect_relay(&url, Duration::from_secs(6)).await;
         }
     });

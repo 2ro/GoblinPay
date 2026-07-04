@@ -2,8 +2,8 @@
 
 A self-hostable, receive-only Grin payment server. A merchant runs it, a
 customer pays from Goblin Wallet by scanning a QR code, and the payment
-travels as a gift-wrapped slatepack over Nostr (optionally over the Nym
-mixnet). GoblinPay auto-receives, returns the S2 reply so the payer can
+travels as a gift-wrapped slatepack over Nostr. GoblinPay auto-receives,
+returns the S2 reply so the payer can
 finalize, confirms the transaction on chain, and signals paid.
 
 Beyond the core wallet + transport + on-chain confirmation path, GoblinPay
@@ -41,13 +41,12 @@ carries the full merchant surface:
   HTTP webhook (the WooCommerce contract), an authenticated admin dashboard +
   JSON API, and NIP-17 DMs to the merchant / payer.
 
-By default all relay traffic rides an in-process Nym mixnet tunnel (smolmix,
-auto-selected exit, mix-dns). `GP_NYM=off` is also a supported production
-posture, not just a debugging switch: the server then reaches relays over
-clearnet, but the payer's Goblin Wallet still provides sender privacy over its
-own mixnet and the payload stays gift-wrapped end to end. An operator who fronts
-GoblinPay with their own network privacy, or who accepts server-side clearnet for
-a receive-only till, can run it that way. Encryption negotiates NIP-44 v3 (the
+GoblinPay reaches its relays over clearnet. That is a supported posture for a
+receive-only till: the sender privacy that matters belongs to the paying
+customer and rides their own Goblin Wallet's transport, not GoblinPay's, and the
+payload stays gift-wrapped end to end regardless of the pipe it travels through.
+An operator who wants to hide GoblinPay's own server-to-relay hop as well can
+front it with their own network privacy. Encryption negotiates NIP-44 v3 (the
 NIP-17 extension, via the companion `nip44` crate) per recipient, with v2 as the
 mandatory baseline.
 
@@ -57,7 +56,7 @@ mandatory baseline.
 |---|---|
 | `crates/gp-wallet` | Grin wallet handoff: open from mnemonic, S1 -> `receive_tx` -> S2 (offline) |
 | `crates/gp-goblin-sender` | Test-only gate helper: sends and finalizes with Goblin's wallet stack |
-| `crates/gp-nostr` | Nostr transport: identity, gift wrap (NIP-44 v2/v3), ingest, Nym mixnet |
+| `crates/gp-nostr` | Nostr transport: identity, gift wrap (NIP-44 v2/v3), ingest |
 | `crates/gp-core` | Domain core: config, SQLite persistence (sqlx, raw SQL) |
 | `crates/gp-server` | Actix-Web binary: routes, Askama templates, rustls TLS |
 
@@ -81,7 +80,6 @@ Everything is environment variables, defaults are safe for local use.
 | `GP_RELAY_MODE` | `bundled` | `bundled` (GoblinPay runs its own co-located relay) or `external` |
 | `GP_BUNDLED_RELAY_URL` | `ws://127.0.0.1:7777` | In `bundled` mode, the self-contained relay GoblinPay dials AND advertises in the checkout `nprofile`; set to the relay's public `wss://` URL in production |
 | `GP_RELAYS` | unset | Extra relay URLs (comma separated): redundancy in `bundled` mode, the whole set in `external` mode |
-| `GP_NYM` | `on` | Route this server's Nostr traffic over the Nym mixnet (`on`, or `off` for supported server-side clearnet) |
 | `GP_INGEST` | `on` | Nostr ingest service (`off` = HTTP surface only, for debugging) |
 | `GP_CHECKOUT_METHODS` | `nostr,slatepack` | Which payment methods the hosted `/pay/<token>` page shows: comma list of `nostr` (Goblin Wallet) and `slatepack` (`grin1`). Unset = both. Unknown tokens are ignored; an empty result falls back to both |
 | `GP_MATCH_MODE` | `memo` | Default matching mode: `memo`, `derived`, `amount` |
@@ -155,8 +153,7 @@ hammer the source. If the source is unreachable or the currency is not enabled,
 `create-invoice` fails fast with a clear error rather than creating an
 unpriceable invoice; `GP_RATE_STALE_MAX` optionally permits serving the last
 cached rate within a bounded window instead. The oracle fetch goes DIRECT over
-normal HTTP, never through the Nym mixnet (the mixnet carries only the Nostr
-gift-wrap layer, the same ruling as the read-only node client).
+normal HTTP, the same as the read-only node client.
 
 The secrets also accept mounted-file variants, `GP_MNEMONIC_FILE`,
 `GP_WALLET_PASSWORD_FILE`, `GP_NSEC_FILE`, and `GP_NCRYPTSEC_FILE`

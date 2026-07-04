@@ -1,7 +1,6 @@
 //! GoblinPay HTTP server: Actix-Web with in-process rustls TLS (off by
 //! default), a zero-JS Askama frontend, the SQLite-backed domain core, and
-//! (config-gated) the Nostr ingest service receiving payments over the Nym
-//! mixnet.
+//! (config-gated) the Nostr ingest service receiving payments over Nostr.
 
 use std::io;
 use std::sync::Arc;
@@ -89,7 +88,7 @@ fn routes(cfg: &mut web::ServiceConfig) {
 
 /// Boot the Nostr ingest service (M3): open the wallet, resolve the payment
 /// identity, build the multi-identity key directory (M5b), seed the initial
-/// watch set, and start the relay listener over Nym on its own thread. Fails
+/// watch set, and start the relay listener on its own thread. Fails
 /// fast on misconfiguration. Returns the identity keys (for receipts + invoice
 /// derivation) and a clone of the wallet (for the manual-slatepack handler).
 async fn start_ingest(cfg: &Config, pool: sqlx::SqlitePool) -> (Keys, GpWallet) {
@@ -121,9 +120,6 @@ async fn start_ingest(cfg: &Config, pool: sqlx::SqlitePool) -> (Keys, GpWallet) 
         gp_nostr::wrap::ENCRYPTION_CAPABILITIES
     );
 
-    if cfg.nym {
-        gp_nostr::nym::warm_up();
-    }
     let merchant = cfg
         .merchant_npub
         .as_deref()
@@ -133,7 +129,6 @@ async fn start_ingest(cfg: &Config, pool: sqlx::SqlitePool) -> (Keys, GpWallet) 
     }
     let opts = gp_nostr::service::ServiceOptions {
         relays: gp_nostr::relays::resolve(cfg.relay_mode, &cfg.bundled_relay_url, &cfg.relays),
-        nym: cfg.nym,
         notify: gp_nostr::service::NotifyOptions {
             merchant,
             merchant_dm: cfg.notify_merchant_dm,
@@ -203,8 +198,7 @@ fn tls_server_config(cert_path: &str, key_path: &str) -> Result<rustls::ServerCo
 #[actix_web::main]
 async fn main() -> io::Result<()> {
     // Install the rustls ring provider exactly once, before anything else
-    // touches rustls. Shared by sqlx, nostr-sdk, tungstenite, reqwest, and the
-    // Nym stack (the Build 65/66 gotcha).
+    // touches rustls. Shared by sqlx, nostr-sdk, tungstenite, and reqwest.
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("install rustls ring crypto provider");

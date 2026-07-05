@@ -1769,6 +1769,7 @@ dependencies = [
  "sqlx",
  "subtle",
  "tokio 1.52.3",
+ "zeroize",
 ]
 
 [[package]]

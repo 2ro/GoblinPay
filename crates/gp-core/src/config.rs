@@ -9,6 +9,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 /// Default listen address (loopback; put a proxy or `GP_TLS=rustls` in front
 /// for public exposure).
@@ -101,7 +102,9 @@ pub enum MatchMode {
 }
 
 /// A sensitive value. Debug and serde output never reveal it, so a config
-/// dump or a startup log line cannot leak a seed or key.
+/// dump or a startup log line cannot leak a seed or key. The backing buffer is
+/// zeroized on drop (defense in depth against the value lingering in freed
+/// heap; the seed is also handed to grin-wallet as a `ZeroingString`).
 #[derive(Clone, PartialEq, Eq)]
 pub struct Secret(String);
 
@@ -119,6 +122,12 @@ impl Secret {
 impl fmt::Debug for Secret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Secret(redacted)")
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.0.zeroize();
     }
 }
 

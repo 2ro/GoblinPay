@@ -192,8 +192,9 @@ pub struct Config {
     /// HMAC secret for signing webhooks (`GP_WEBHOOK_SECRET`).
     #[serde(skip)]
     pub webhook_secret: Option<Secret>,
-    /// Center-logo source for checkout QR codes (`GP_QR_LOGO`): unset = the
-    /// bundled GoblinPay mark, `off`/`none` = no logo, else a URL or static path.
+    /// Center-logo source for checkout QR codes (`GP_QR_LOGO`): unset or
+    /// `builtin`/`goblin` = the inlined Goblin mark (self-contained, the
+    /// default), `off`/`none` = no logo, else a URL used as an external image.
     pub qr_logo: Option<String>,
     /// Merchant npub for confirmed-payment DMs (`GP_MERCHANT_NPUB`).
     pub merchant_npub: Option<String>,
@@ -234,8 +235,10 @@ pub const DEFAULT_RATE_CACHE_TTL: i64 = 60;
 /// Default quote lock window (seconds).
 pub const DEFAULT_QUOTE_TTL: i64 = 900;
 
-/// Default center-logo path served by gp-server when `GP_QR_LOGO` is unset.
-pub const DEFAULT_QR_LOGO: &str = "/static/goblinpay-mark.svg";
+/// Sentinel `qr_logo` value selecting the inlined Goblin mark (the default
+/// when `GP_QR_LOGO` is unset). Kept out of the `Href` space so it is never
+/// treated as a URL.
+pub const DEFAULT_QR_LOGO: &str = "builtin";
 
 impl Default for Config {
     fn default() -> Self {
@@ -372,7 +375,7 @@ impl Config {
         let webhook_url = get("GP_WEBHOOK_URL").filter(|s| !s.trim().is_empty());
         let webhook_secret = secret(get, "GP_WEBHOOK_SECRET")?;
         let qr_logo = match get("GP_QR_LOGO").as_deref() {
-            None => Some(DEFAULT_QR_LOGO.to_string()),
+            None | Some("builtin") | Some("goblin") => Some(DEFAULT_QR_LOGO.to_string()),
             Some("off") | Some("none") | Some("") => None,
             Some(other) => Some(other.to_string()),
         };
@@ -447,9 +450,14 @@ impl Config {
         Ok(cfg)
     }
 
-    /// The QR center-logo href to render, or `None` when disabled.
-    pub fn qr_logo_href(&self) -> Option<&str> {
-        self.qr_logo.as_deref()
+    /// The QR center logo to render: the inlined Goblin mark by default, an
+    /// external image when the operator sets a custom URL, or none.
+    pub fn qr_logo(&self) -> crate::qr::Logo<'_> {
+        match self.qr_logo.as_deref() {
+            None => crate::qr::Logo::None,
+            Some(DEFAULT_QR_LOGO) => crate::qr::Logo::Builtin,
+            Some(href) => crate::qr::Logo::Href(href),
+        }
     }
 
     /// The enabled checkout methods as a stable comma list, for the startup log.

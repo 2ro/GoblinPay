@@ -210,7 +210,7 @@ fn endpub_json(cfg: &Config, user_id: &str, epoch: i64, pubkey: &str) -> serde_j
         Ok(pk) => (
             gp_nostr::npub_of(pk),
             gp_nostr::nprofile(pk, &relays),
-            gp_core::qr::svg(&gp_nostr::nprofile(pk, &relays), cfg.qr_logo_href())
+            gp_core::qr::svg(&gp_nostr::nprofile(pk, &relays), cfg.qr_logo())
                 .unwrap_or_default(),
         ),
         Err(_) => (String::new(), String::new(), String::new()),

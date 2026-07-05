@@ -301,9 +301,11 @@ add_action('plugins_loaded', function () {
                 return;
             }
             if ($order->is_paid()) {
-                echo '<section class="goblinpay-panel goblinpay-paid"><p>'
+                echo '<section class="goblinpay-panel goblinpay-paid" style="margin:1.5em 0;max-width:420px;border:1px solid #33322a;border-radius:16px;overflow:hidden;background:#1e1e17;color:#f4f1e6;font-family:system-ui,-apple-system,\'Segoe UI\',Roboto,sans-serif">';
+                echo '<div style="background:#14140f;padding:0.9em 1.1em;display:flex;align-items:center">' . goblinpay_wc_wordmark() . '</div>';
+                echo '<div style="padding:1.1em 1.25em"><p style="margin:0;color:#57b894;font-weight:600">'
                     . esc_html__('Grin payment received. Thank you!', 'goblinpay-woocommerce')
-                    . '</p></section>';
+                    . '</p></div></section>';
                 return;
             }
 
@@ -312,23 +314,29 @@ add_action('plugins_loaded', function () {
             $pay_url  = (string) $order->get_meta('_goblinpay_pay_url');
             $amount   = (string) $order->get_meta('_goblinpay_amount');
 
-            echo '<section class="goblinpay-panel" style="margin:1.5em 0;padding:1em;border:1px solid #e0e0e0;border-radius:8px;max-width:420px">';
-            echo '<h2 style="margin-top:0">' . esc_html__('Pay with Goblin (GRIN)', 'goblinpay-woocommerce') . '</h2>';
-            echo '<p>' . esc_html__('Scan this code with your Goblin Wallet to pay.', 'goblinpay-woocommerce') . '</p>';
+            echo '<section class="goblinpay-panel" style="margin:1.5em 0;max-width:420px;border:1px solid #33322a;border-radius:16px;overflow:hidden;background:#1e1e17;color:#f4f1e6;font-family:system-ui,-apple-system,\'Segoe UI\',Roboto,sans-serif">';
+            // Branded header bar: the GoblinPay wordmark, Apple Pay style.
+            echo '<div class="goblinpay-header" style="background:#14140f;padding:0.9em 1.1em;display:flex;align-items:center">';
+            echo goblinpay_wc_wordmark();
+            echo '</div>';
+            echo '<div class="goblinpay-body" style="padding:1.1em 1.25em 1.35em">';
+            echo '<h2 style="margin:0 0 0.35em;font-size:1.2em;color:#f4f1e6">' . esc_html__('Pay with Goblin (GRIN)', 'goblinpay-woocommerce') . '</h2>';
+            echo '<p style="margin:0 0 0.75em;color:#a8a294;font-size:0.92em">' . esc_html__('Scan this code with your Goblin Wallet to pay.', 'goblinpay-woocommerce') . '</p>';
             if ('' !== $amount) {
-                echo '<p><strong>' . esc_html__('Amount:', 'goblinpay-woocommerce') . '</strong> ' . esc_html($amount) . '</p>';
+                echo '<p style="margin:0 0 0.75em;font-size:1.5em;font-weight:700;color:#e9c542">' . esc_html($amount) . '</p>';
             }
             if ('' !== $qr) {
-                echo '<div class="goblinpay-qr" style="max-width:280px">' . goblinpay_wc_kses_svg($qr) . '</div>';
+                echo '<div class="goblinpay-qr" style="background:#fff;border-radius:14px;padding:0.75em;max-width:280px;margin:0 auto 0.75em">' . goblinpay_wc_kses_svg($qr) . '</div>';
             }
             if ('' !== $nprofile) {
-                echo '<p style="word-break:break-all;font-family:monospace;font-size:12px">' . esc_html($nprofile) . '</p>';
+                echo '<p style="word-break:break-all;font-family:ui-monospace,monospace;font-size:12px;color:#a8a294;background:#14140f;border-radius:10px;padding:0.5em 0.65em">' . esc_html($nprofile) . '</p>';
             }
             if ('' !== $pay_url) {
-                echo '<p><a href="' . esc_url($pay_url) . '" target="_blank" rel="noopener">'
+                echo '<p style="margin:0.75em 0 0"><a href="' . esc_url($pay_url) . '" target="_blank" rel="noopener" style="color:#e9c542;font-weight:600">'
                     . esc_html__('Open the secure GoblinPay checkout', 'goblinpay-woocommerce') . '</a></p>';
             }
-            echo '<p class="goblinpay-status">' . esc_html__('Waiting for payment. This page refreshes automatically.', 'goblinpay-woocommerce') . '</p>';
+            echo '<p class="goblinpay-status" style="margin:0.9em 0 0;color:#a8a294;font-size:0.85em">' . esc_html__('Waiting for payment. This page refreshes automatically.', 'goblinpay-woocommerce') . '</p>';
+            echo '</div>';
             // Zero-JS live refresh while the order is unpaid (mirrors the hosted page).
             echo '<meta http-equiv="refresh" content="20">';
             echo '</section>';
@@ -499,18 +507,36 @@ function goblinpay_wc_maybe_expire_order($order_id) {
 }
 
 /**
+ * The GoblinPay wordmark, Apple Pay style: a gold Goblin "P" badge next to the
+ * "GoblinPay" name. Emitted as self-contained inline SVG so it renders on the
+ * order-received page with no external asset request (the GoblinPay static dir
+ * is not reachable from the shop's origin). Trusted, plugin-authored markup.
+ */
+function goblinpay_wc_wordmark() {
+    return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 168 32" height="22" role="img" aria-label="GoblinPay" style="display:block">'
+        . '<g transform="translate(0 2) scale(0.4375)">'
+        . '<rect width="64" height="64" rx="14" fill="#e9c542"/>'
+        . '<path fill="#201d09" fill-rule="evenodd" d="M22 14H35a12 12 0 0 1 0 24H30V50H22ZM30 21H34a6 6 0 0 1 0 12H30Z"/>'
+        . '</g>'
+        . '<text x="38" y="23" font-family="system-ui,-apple-system,\'Segoe UI\',Roboto,sans-serif" font-size="21" font-weight="700" letter-spacing="-0.5" fill="#f4f1e6">Goblin<tspan fill="#e9c542">Pay</tspan></text>'
+        . '</svg>';
+}
+
+/**
  * Sanitise a GoblinPay-generated QR SVG for safe output. Allows only the small
- * tag/attribute set the server emits (svg/g/rect/path/image), so a compromised
- * or misconfigured endpoint cannot inject script into the order-received page.
+ * tag/attribute set the server emits (svg/g/rect/path/circle/image), so a
+ * compromised or misconfigured endpoint cannot inject script into the
+ * order-received page. `g`/`circle` cover the inlined center Goblin mark.
  */
 function goblinpay_wc_kses_svg($svg) {
     $allowed = array(
-        'svg'   => array('xmlns' => true, 'width' => true, 'height' => true, 'viewbox' => true, 'viewBox' => true, 'role' => true, 'shape-rendering' => true, 'class' => true),
-        'g'     => array('fill' => true, 'transform' => true),
-        'rect'  => array('x' => true, 'y' => true, 'width' => true, 'height' => true, 'rx' => true, 'ry' => true, 'fill' => true),
-        'path'  => array('d' => true, 'fill' => true),
-        'image' => array('x' => true, 'y' => true, 'width' => true, 'height' => true, 'href' => true, 'xlink:href' => true, 'preserveaspectratio' => true),
-        'title' => array(),
+        'svg'    => array('xmlns' => true, 'width' => true, 'height' => true, 'viewbox' => true, 'viewBox' => true, 'role' => true, 'shape-rendering' => true, 'class' => true, 'aria-label' => true),
+        'g'      => array('fill' => true, 'fill-rule' => true, 'transform' => true),
+        'rect'   => array('x' => true, 'y' => true, 'width' => true, 'height' => true, 'rx' => true, 'ry' => true, 'fill' => true),
+        'path'   => array('d' => true, 'fill' => true, 'fill-rule' => true),
+        'circle' => array('cx' => true, 'cy' => true, 'r' => true, 'fill' => true),
+        'image'  => array('x' => true, 'y' => true, 'width' => true, 'height' => true, 'href' => true, 'xlink:href' => true, 'preserveaspectratio' => true),
+        'title'  => array(),
     );
     return wp_kses($svg, $allowed);
 }

@@ -79,7 +79,7 @@ pub fn build_info(inv: &Invoice, cfg: &Config, slatepack_addr: Option<&str>) -> 
     } else {
         pay_uri(&nprofile, inv)
     };
-    let qr_svg = qr::svg(&qr_payload, cfg.qr_logo_href()).unwrap_or_default();
+    let qr_svg = qr::svg(&qr_payload, cfg.qr_logo()).unwrap_or_default();
     // The Slatepack (grin1) address is stable and reused across invoices; its
     // QR carries the bare address (a Grin wallet reads no amount from it, so
     // the page states the amount to send in text next to it). No address means
@@ -88,7 +88,7 @@ pub fn build_info(inv: &Invoice, cfg: &Config, slatepack_addr: Option<&str>) -> 
     // and a loaded wallet: an enabled method that cannot work is simply hidden.
     let (slatepack_address, slatepack_qr_svg) = match slatepack_addr {
         Some(addr) if cfg.checkout_slatepack && !addr.is_empty() => {
-            let qr = qr::svg(addr, cfg.qr_logo_href()).unwrap_or_default();
+            let qr = qr::svg(addr, cfg.qr_logo()).unwrap_or_default();
             (Some(addr.to_string()), Some(qr))
         }
         _ => (None, None),

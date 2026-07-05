@@ -79,6 +79,12 @@ label { display: block; font-size: 0.85rem; color: var(--dim); margin: 0.75rem 0
   word-break: break-all;
 }
 
+/* The invoice slatepack must be fully visible without scrolling, ENDSLATEPACK.
+   included, and its length varies per invoice: auto-fit the box to its content
+   where field-sizing is supported; elsewhere the rows attribute (sized to a
+   measured real invoice at 390px) is the fallback. */
+#invoice-slatepack { field-sizing: content; }
+
 button {
   display: block;
   margin: 0.75rem auto 0;

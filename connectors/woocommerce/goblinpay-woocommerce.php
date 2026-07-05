@@ -132,8 +132,8 @@ add_action('plugins_loaded', function () {
                 'gp_url' => array(
                     'title'       => __('GoblinPay URL', 'goblinpay-woocommerce'),
                     'type'        => 'text',
-                    'default'     => 'http://127.0.0.1:8192',
-                    'placeholder' => 'http://127.0.0.1:8192',
+                    'default'     => 'http://127.0.0.1:8080',
+                    'placeholder' => 'http://127.0.0.1:8080',
                     'desc_tip'    => true,
                     'description' => __('Base URL of your GoblinPay server (no trailing slash).', 'goblinpay-woocommerce'),
                 ),

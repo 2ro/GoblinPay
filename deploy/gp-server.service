@@ -1,17 +1,23 @@
 # Hardened systemd unit for the GoblinPay server on bare metal.
 #
-# Install (or just run deploy/install.sh):
-#   sudo install -m0755 target/release/gp-server /usr/local/bin/
-#   sudo install -m0640 deploy/.env.example /etc/goblinpay.env   # then EDIT it
+# The recommended path is the setup wizard, which writes everything this unit
+# reads (the env file and the 0400 wallet-password credential) and creates the
+# encrypted wallet for you:
 #   sudo install -m0644 deploy/gp-server.service /etc/systemd/system/
-#   sudo mkdir -p /etc/goblinpay/secrets                          # 0400 secret files
+#   sudo gp-server setup            # writes /etc/goblinpay.env + the secret file
 #   sudo systemctl daemon-reload && sudo systemctl enable --now gp-server
 #
-# Unlike goblin-nip05d, this service holds MONEY secrets (the Grin seed and the
-# wallet password) and a wallet data directory. The seed and password are passed
-# as systemd credentials (read by PID1 as root, exposed read-only to the dynamic
-# service user) rather than left world-readable, and the config supports the
-# `*_FILE` mounted-secret variants for exactly this.
+# Unlike goblin-nip05d, this service holds a MONEY secret (the wallet password,
+# which decrypts the Grin seed at rest) and a wallet data directory. The
+# password is passed as a systemd credential (read by PID1 as root, exposed
+# read-only to the dynamic service user) rather than left world-readable.
+#
+# The Grin SEED is deliberately NOT a service credential: the wizard consumes it
+# once at setup to create the encrypted wallet, after which the wallet opens
+# with the password alone (init-once). The seed then lives only encrypted at
+# rest in the data dir and in the operator's written backup, never in this
+# service's environment. (To bootstrap a wallet WITHOUT the wizard, set
+# GP_MNEMONIC_FILE for the first boot only, then remove it.)
 
 [Unit]
 Description=GoblinPay — self-hostable, receive-only Grin payment server
@@ -28,13 +34,17 @@ DynamicUser=yes
 # as root, so a 0640 root:root file is fine even under DynamicUser.
 EnvironmentFile=/etc/goblinpay.env
 
-# Money/identity secrets as credentials: the source files stay root-owned 0400;
-# systemd exposes copies under $CREDENTIALS_DIRECTORY (%d), readable by the
-# dynamic service user. Point the wallet at them via the *_FILE variants.
-LoadCredential=gp_mnemonic:/etc/goblinpay/secrets/mnemonic
+# The wallet password as a credential: the source file stays root-owned 0400
+# (the wizard writes it there); systemd exposes a copy under
+# $CREDENTIALS_DIRECTORY (%d), readable by the dynamic service user. The wallet
+# is pointed at it via the *_FILE variant. This overrides any GP_WALLET_PASSWORD_FILE
+# in the env file above, so the service always reads the credential copy.
 LoadCredential=gp_wallet_password:/etc/goblinpay/secrets/wallet_password
-Environment=GP_MNEMONIC_FILE=%d/gp_mnemonic
 Environment=GP_WALLET_PASSWORD_FILE=%d/gp_wallet_password
+# First-boot-only seed bootstrap WITHOUT the wizard (remove after the wallet
+# exists). The wizard makes this unnecessary.
+#LoadCredential=gp_mnemonic:/etc/goblinpay/secrets/mnemonic
+#Environment=GP_MNEMONIC_FILE=%d/gp_mnemonic
 # Optional: a NIP-49 encrypted Nostr identity (else a random one is generated
 # and persisted under the data dir on first start). Uncomment with its file:
 #LoadCredential=gp_ncryptsec:/etc/goblinpay/secrets/ncryptsec

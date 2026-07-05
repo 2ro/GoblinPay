@@ -29,7 +29,7 @@ Plugins screen.
 Open WooCommerce, then Settings, then Payments, then GoblinPay (Grin), and set:
 
 - GoblinPay URL: the base URL of your GoblinPay server, for example
-  `http://127.0.0.1:8192` when GoblinPay runs on the same host. No trailing
+  `http://127.0.0.1:8080` when GoblinPay runs on the same host. No trailing
   slash.
 - API Token: the GoblinPay create-invoice bearer token (`GP_API_TOKEN`).
 - Webhook Secret: the shared HMAC secret (`GP_WEBHOOK_SECRET`).

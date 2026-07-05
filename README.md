@@ -120,6 +120,34 @@ ingest, drop `nostr` from `GP_CHECKOUT_METHODS`; if you advertise `nostr`, keep
 ingest on. The connector `POST /invoice` JSON response still returns the
 `nprofile` regardless of this setting, which affects only the hosted page.
 
+### The grin1 rail (optional)
+
+Off by default. `GP_GRIN1_RAIL=off` (the packaged default) runs no Tor code at
+all, and the hosted pay page shows only the Goblin (Nostr) rail: byte-for-byte
+the pre-rail behavior. An operator who wants the till to also accept payments
+from any Grin wallet, not just Goblin Wallet, sets `GP_GRIN1_RAIL=on`.
+
+With the rail on:
+
+- **One key, two encodings.** GoblinPay starts an in-process Tor onion service
+  whose address *is* the till's grin1 slatepack address: the same wallet key,
+  encoded two ways, so the grin1 address and the onion address are one and the
+  same. The onion serves the Grin Foreign API v2, which binds loopback on
+  `GP_GRIN1_FOREIGN_PORT` (default 3416) and is reached through `onion:80`.
+- **Two-rail pay page.** The hosted `/pay/<token>` page gains a rail switcher.
+  Goblin (Nostr) stays the default-selected tab; the Grin tab carries the grin1
+  address and a native Grin invoice slatepack.
+- **Native invoice flow, plain-send fallback.** The invoice is a Grin invoice
+  slatepack whose slate ID *is* the invoice ID, so a payer's Grin wallet pays it
+  directly over Tor and the response settles against the right invoice by that
+  slate ID. A wallet that only plain-sends still works: a plain-send slatepack
+  lands through the normal receive path and matches like any other payment.
+- **Manual paste-back (GRIM parity).** If a payer's wallet cannot deliver its
+  response back automatically over Tor, the pay page's paste box accepts it and
+  GoblinPay finishes the exchange server-side. Invoice responses settle by slate
+  ID; plain-send slatepacks go through the receive path. This works on both
+  sub-flows.
+
 ### Bundled relay
 
 `GP_RELAY_MODE=bundled` (the default) means GoblinPay runs against its own
@@ -166,7 +194,9 @@ which GoblinPay stores encrypted at rest under `GP_DATA_DIR` (mode 0600).
 After the encrypted seed exists, GoblinPay opens the wallet with the password
 alone; if `GP_MNEMONIC` is still set it is only checked against the seed at
 rest, never used to recreate anything, and the server logs a notice asking you
-to remove it. So the steady state is: password in, seed out.
+to remove it. So the steady state is: password in, seed out. Secrets read at
+startup are zeroized in memory once they have been consumed, so a decrypted seed
+or password does not linger in the process beyond the wallet open it performs.
 
 Deliver both secrets as files rather than plain environment variables:
 `GP_MNEMONIC_FILE`, `GP_WALLET_PASSWORD_FILE`, `GP_NSEC_FILE`, and
@@ -263,7 +293,8 @@ Store integrations live under `connectors/` and all speak the same
 create-invoice + signed-webhook contract:
 
 - `connectors/woocommerce` - a WordPress/WooCommerce gateway (classic + Blocks),
-  with a GoblinPay wordmark in the admin panel.
+  showing the black GoblinPay badge in the checkout payment-method row (Apple Pay
+  style) on both the classic and Blocks checkout.
 - `connectors/medusa` - a Medusa v2 payment-module provider.
 - The generic REST connector is built in: `POST /invoice` plus the webhook.
 

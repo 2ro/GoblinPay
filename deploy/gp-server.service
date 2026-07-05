@@ -9,8 +9,20 @@
 #
 # Unlike goblin-nip05d, this service holds a MONEY secret (the wallet password,
 # which decrypts the Grin seed at rest) and a wallet data directory. The
-# password is passed as a systemd credential (read by PID1 as root, exposed
-# read-only to the dynamic service user) rather than left world-readable.
+# operator CHOOSES that password at setup (grin-wallet-faithful; it is never
+# auto-generated). It is passed as a systemd credential (read by PID1 as root,
+# exposed read-only to the dynamic service user) rather than left world-readable.
+#
+# Restart mode (the wizard asks; default UNATTENDED):
+#   UNATTENDED — the chosen password is sealed to THIS host as the 0400 file
+#     below, so the service auto-restarts with no human. Honest trade-off: a
+#     full-machine compromise means wallet compromise; keep the till a small hot
+#     float and sweep to your own wallet regularly.
+#   MANUAL — nothing is stored on disk; the operator re-enters the password after
+#     every restart. The wizard drops in gp-server.service.d/manual.conf, which
+#     repoints LoadCredential to a tmpfs path (/run/goblinpay/wallet_password)
+#     the operator populates at each start via systemd-ask-password. Maximum
+#     protection against disk/machine theft, at the cost of hands-on restarts.
 #
 # The Grin SEED is deliberately NOT a service credential: the wizard consumes it
 # once at setup to create the encrypted wallet, after which the wallet opens
@@ -35,10 +47,12 @@ DynamicUser=yes
 EnvironmentFile=/etc/goblinpay.env
 
 # The wallet password as a credential: the source file stays root-owned 0400
-# (the wizard writes it there); systemd exposes a copy under
-# $CREDENTIALS_DIRECTORY (%d), readable by the dynamic service user. The wallet
-# is pointed at it via the *_FILE variant. This overrides any GP_WALLET_PASSWORD_FILE
-# in the env file above, so the service always reads the credential copy.
+# (in UNATTENDED mode the wizard writes the operator's CHOSEN password there);
+# systemd exposes a copy under $CREDENTIALS_DIRECTORY (%d), readable by the
+# dynamic service user. The wallet is pointed at it via the *_FILE variant. This
+# overrides any GP_WALLET_PASSWORD_FILE in the env file above, so the service
+# always reads the credential copy. In MANUAL mode the manual.conf drop-in resets
+# this line and reads /run/goblinpay/wallet_password (tmpfs) instead.
 LoadCredential=gp_wallet_password:/etc/goblinpay/secrets/wallet_password
 Environment=GP_WALLET_PASSWORD_FILE=%d/gp_wallet_password
 # First-boot-only seed bootstrap WITHOUT the wizard (remove after the wallet

@@ -14,9 +14,11 @@ sudo ./deploy/install.sh
 sudo gp-server setup
 ```
 
-The wizard asks a few questions (all with defaults) and does the rest: it makes
-your till wallet, generates every secret, picks a healthy Grin node, and writes
-the config. Two answers matter for WooCommerce:
+The wizard asks a few questions (all with defaults). You choose your wallet
+password (entered twice) and write down the 24-word seed it shows once; it
+generates the service tokens, creates your till wallet, picks a healthy Grin
+node, asks how the till should restart (default unattended), and writes the
+config. Two answers matter for WooCommerce:
 
 - **Your till URL** - either a subdomain like `https://pay.myshop.com`, or a
   path on your existing shop domain like `https://myshop.com/pay` if you would

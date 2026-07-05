@@ -73,19 +73,27 @@ you), then:
 sudo gp-server setup
 ```
 
-It asks five questions, each with a default:
+It asks a few questions, each with a default. It is grin-wallet-faithful about
+the two things that are yours to own — your wallet password and your seed:
 
 1. the public URL customers reach this till at,
 2. your shop's website URL (used to build the webhook URL),
-3. the Grin seed: press Enter to generate a fresh till seed (shown once, write
-   it down) or paste an existing 24 words,
-4. the currencies your shop prices in (default `usd`),
-5. an advanced yes/no for the grin1/Tor rail (default no).
+3. **your wallet password** — you choose it, entered twice and confirmed to
+   match (hidden input; it is never auto-generated). It encrypts the seed at
+   rest and is not recoverable, so if you forget it you restore from the seed;
+4. **the Grin seed** — press Enter to generate a fresh 24-word seed, which is
+   shown once and gated behind an acknowledgement that you wrote it down (exactly
+   like `grin-wallet init`), or paste your existing recovery phrase;
+5. **restart mode** — how the till comes back after a reboot (default
+   **unattended**; see below);
+6. the currencies your shop prices in (default `usd`),
+7. an advanced yes/no for the grin1/Tor rail (default no).
 
 Everything else it does for you:
 
-- generates the wallet password, the API token, the admin token, and the
-  webhook secret (you never invent or type a secret);
+- generates the *service* secrets — the API token, the admin token, and the
+  webhook secret (you never invent or type a bearer token); the wallet password
+  is the one secret you choose;
 - creates the encrypted wallet on the spot from the seed, so the seed is
   consumed once and never lives in the service environment afterwards (it
   exists only encrypted at rest and in your written backup);
@@ -93,17 +101,46 @@ Everything else it does for you:
   answers, falling back automatically;
 - defaults the relays to an external vetted pool (the wallet's proven relays);
 - writes `/etc/goblinpay.env` (mode 0640, holds the config plus the bearer
-  tokens) and `/etc/goblinpay/secrets/wallet_password` (mode 0400), exactly
-  where the shipped `gp-server.service` looks (`EnvironmentFile` +
-  `LoadCredential`);
+  tokens) exactly where the shipped `gp-server.service` looks (`EnvironmentFile`),
+  and — in unattended mode — `/etc/goblinpay/secrets/wallet_password` (mode 0400)
+  where its `LoadCredential` reads it;
 - prints the webhook URL and the three values to paste into WooCommerce
   (GoblinPay URL, API Token, Webhook Secret) plus the private admin token.
 
+### Restart mode: unattended (default) or manual
+
+The wizard asks how the till should restart after a reboot; press Enter for the
+default. Both are honest about their trade-off:
+
+- **Unattended (default).** Your chosen password is sealed to *this host* as a
+  systemd credential (the 0400 file above), so the service auto-restarts with no
+  human in the loop. Be clear-eyed about the trade-off: whoever fully controls
+  this machine controls the wallet. Treat the till as a small hot wallet — hold
+  only a working balance and sweep to your own wallet regularly (see *Secrets and
+  the wallet seed*).
+- **Manual.** The password lives only in your head; nothing sensitive is written
+  to disk. The wizard drops in `gp-server.service.d/manual.conf`, which repoints
+  the credential to a tmpfs path (`/run/goblinpay/wallet_password`). You supply
+  the password at each start (and after every reboot):
+
+  ```
+  sudo install -d -m0700 /run/goblinpay
+  systemd-ask-password "GoblinPay wallet password:" \
+    | sudo install -m0400 /dev/stdin /run/goblinpay/wallet_password
+  sudo systemctl daemon-reload && sudo systemctl start gp-server
+  ```
+
+  `/run` is tmpfs, so the password vanishes on reboot: a stolen or powered-off
+  disk holds no wallet key. The service will not come back on its own until you
+  re-enter it. Maximum protection against disk/machine theft, at the cost of
+  hands-on restarts.
+
 Re-running is safe: the wizard refuses to overwrite an existing wallet or config
-unless you pass `--reconfigure` (which keeps the existing seed and password and
-only rewrites the config/tokens). Flags: `--reconfigure`, `--prefix DIR` (write
-under a prefix instead of `/`), `--node URL` (skip the node probe), `--batch`
-(read scripted answers from a non-terminal stdin).
+unless you pass `--reconfigure` (which keeps the existing seed, password, and
+restart mode and only rewrites the config/tokens — it never re-prompts for them).
+Flags: `--reconfigure`, `--prefix DIR` (write under a prefix instead of `/`),
+`--node URL` (skip the node probe), `--batch` (read scripted answers from a
+non-terminal stdin).
 
 The env-var reference below is the advanced path for operators who want to
 configure GoblinPay by hand; the wizard hides all of it.
@@ -255,9 +292,17 @@ same user and root) for the life of the service; a file is not. The shipped
 `/run/secrets`, so with either deployment nothing sensitive is in the
 environment.
 
+You choose `GP_WALLET_PASSWORD` yourself (the wizard prompts for it twice and
+confirms the match; it is never auto-generated). How it reaches the service on
+restart is the restart-mode choice above: sealed to the host for unattended
+auto-restart, or re-entered by hand each start in manual mode.
+
 Treat the till as a small hot wallet. Grin receives are interactive, so the
 till must hold live keys; keep the risk small by giving it a seed of its own,
-holding only a working balance, and sweeping to your own wallet regularly.
+holding only a working balance, and sweeping to your own wallet regularly. This
+is the mitigation for unattended mode's honest trade-off (a full-machine
+compromise means wallet compromise); manual mode trades hands-on restarts for
+keeping nothing on disk.
 
 When neither identity variable is set, a fresh random Nostr identity is
 generated on first start and persisted NIP-49 encrypted at

@@ -36,6 +36,10 @@ log = "0.4"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 # Stderr logger for the gp-nostr `log` output; no regex filtering needed.
 env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
+# Terminal echo toggle for hidden wallet-password entry in the setup wizard
+# (grin-wallet-faithful). Already in the tree via the grin/tor stacks; the
+# wizard only calls tcgetattr/tcsetattr to hide the typed password.
+libc = "0.2"
 
 # grin1 rail onion transport (Phase 1): the GRIM tor stack, versions matched to
 # grim/Cargo.toml (grim/src/tor/tor.rs is the reference; its start_service /

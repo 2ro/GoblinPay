@@ -13,10 +13,11 @@ sudo ./deploy/install.sh     # installs, then offers the wizard
 sudo gp-server setup
 ```
 
-The wizard makes your till wallet, generates every secret, picks a healthy Grin
-node, and writes the config. Note the three values it prints at the end: the
-**till URL**, the **API Token** (`gp_live_…`), and the **Webhook Secret**
-(`whsec_…`).
+You choose your wallet password (entered twice) and write down the 24-word seed
+it shows once; the wizard generates the service tokens, makes your till wallet,
+picks a healthy Grin node, asks how the till should restart (default unattended),
+and writes the config. Note the three values it prints at the end: the **till
+URL**, the **API Token** (`gp_live_…`), and the **Webhook Secret** (`whsec_…`).
 
 > **One Medusa-specific step.** The wizard fills in a *WooCommerce* webhook URL
 > by default. Medusa uses a different route, so after setup, edit

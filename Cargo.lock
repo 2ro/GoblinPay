@@ -2750,6 +2750,7 @@ dependencies = [
  "http-body-util",
  "hyper 1.10.1",
  "hyper-util",
+ "libc",
  "log",
  "nip44",
  "nostr-sdk",

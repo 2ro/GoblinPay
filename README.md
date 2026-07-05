@@ -211,9 +211,8 @@ same user and root) for the life of the service; a file is not. The shipped
 environment.
 
 Treat the till as a small hot wallet. Grin receives are interactive, so the
-till must hold live keys; keep the risk small by giving it a seed of its own
-(separate from cold storage), holding only a working balance, and sweeping to
-cold storage regularly.
+till must hold live keys; keep the risk small by giving it a seed of its own,
+holding only a working balance, and sweeping to your own wallet regularly.
 
 When neither identity variable is set, a fresh random Nostr identity is
 generated on first start and persisted NIP-49 encrypted at

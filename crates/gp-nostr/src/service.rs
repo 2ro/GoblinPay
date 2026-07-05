@@ -9,13 +9,14 @@
 //! No UI, no contacts, no relay-pool gist (G10 is pending): the relay set is
 //! configuration plus defaults.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use log::{error, info, warn};
 use nostr_sdk::{
     Client, Event, EventBuilder, Filter, Keys, Kind, PublicKey, RelayPoolNotification, RelayUrl,
-    Tag, TagKind, Timestamp,
+    SubscriptionId, Tag, TagKind, Timestamp,
 };
 
 use crate::ingest::{Ingest, IngestOutcome, PendingReply};
@@ -32,6 +33,50 @@ const LOOKBACK_SECS: i64 = 3 * 86_400;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Send dispatch timeout.
 const SEND_TIMEOUT: Duration = Duration::from_secs(40);
+/// How often the live watch set is diffed against the active subscription and
+/// re-subscribed on change. Matched to the directory's snapshot-rebuild cadence
+/// (`REFRESH_INTERVAL` in gp-server) so a newly derived invoice key is picked up
+/// within roughly one rebuild + one refresh tick, without a service restart.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+/// Stable subscription id for the gift-wrap watch, so each refresh REPLACES the
+/// prior filter (rather than piling up subscriptions) and reconnects resend the
+/// latest key set.
+const WATCH_SUB_ID: &str = "gp-watch";
+
+/// The re-subscribe decision for one refresh tick: whether the watched set
+/// changed at all, and which keys are newly added (so only those need a
+/// catch-up fetch). Pure and unit-tested — no relay I/O.
+#[derive(Debug, PartialEq, Eq)]
+struct RefreshPlan {
+    /// The set changed (added and/or retired keys): re-issue the REQ.
+    changed: bool,
+    /// Keys present now but not at the last subscribe: fetch their backlog.
+    added: Vec<PublicKey>,
+}
+
+/// Diff the last-subscribed set against the current watched set. A pure grow
+/// yields `changed` with the new keys in `added`; a pure shrink yields
+/// `changed` with `added` empty (re-subscribe to drop retired keys, no fetch);
+/// an unchanged set yields `changed == false` (no relay traffic at all).
+fn plan_refresh(last: &HashSet<PublicKey>, current: &HashSet<PublicKey>) -> RefreshPlan {
+    let mut added: Vec<PublicKey> = current.difference(last).copied().collect();
+    // Deterministic order so logs and tests are stable.
+    added.sort_by_key(|k| k.to_hex());
+    RefreshPlan {
+        changed: last != current,
+        added,
+    }
+}
+
+/// Build the gift-wrap watch filter for a set of watched pubkeys, bounded by the
+/// NIP-59 look-back window. Shared by the boot subscription, each live refresh,
+/// and the per-key catch-up fetch.
+fn watch_filter(watched: impl IntoIterator<Item = PublicKey>, since_secs: u64) -> Filter {
+    Filter::new()
+        .kind(Kind::GiftWrap)
+        .pubkeys(watched)
+        .since(Timestamp::from_secs(since_secs))
+}
 
 /// Service configuration (already resolved from the environment).
 #[derive(Debug, Clone)]
@@ -145,14 +190,16 @@ pub async fn run<R: SlatepackReceiver>(
     // watch: the master, plus per-invoice (matching mode 2) and per-user (5b)
     // derived children the directory currently holds. Targeted at our OWN
     // advertised set only (a pool-wide subscription would leak the listener
-    // filter to relays added later for reply fan-out). The watched set is
-    // snapshotted here; rotation refreshes it on the next service restart or
-    // re-subscribe (a live refresh tick is the multi-tenant follow-up).
+    // filter to relays added later for reply fan-out).
+    //
+    // The watched set is NOT frozen here. `directory.watched()` reads the live,
+    // periodically rebuilt snapshot, and the refresh tick below re-issues the
+    // REQ whenever that set changes — so an invoice (and its one-time derived
+    // key) created after boot is subscribed and back-filled without a restart.
+    let sub_id = SubscriptionId::new(WATCH_SUB_ID);
+    let mut last_watched: HashSet<PublicKey> = ingest.watched().into_iter().collect();
     let since = (unix_time() - LOOKBACK_SECS).max(0) as u64;
-    let filter = Filter::new()
-        .kind(Kind::GiftWrap)
-        .pubkeys(ingest.watched())
-        .since(Timestamp::from_secs(since));
+    let filter = watch_filter(last_watched.iter().copied(), since);
     match client
         .fetch_events_from(&opts.relays, filter.clone(), FETCH_TIMEOUT)
         .await
@@ -165,24 +212,105 @@ pub async fn run<R: SlatepackReceiver>(
         }
         Err(e) => warn!("nostr: catch-up fetch failed: {e}"),
     }
-    if let Err(e) = client.subscribe_to(&opts.relays, filter, None).await {
+    if let Err(e) = client
+        .subscribe_with_id_to(&opts.relays, sub_id.clone(), filter, None)
+        .await
+    {
         error!("nostr: subscribe failed: {e}");
     }
 
     let mut notifications = client.notifications();
+    let mut refresh = tokio::time::interval(REFRESH_INTERVAL);
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The first interval tick fires immediately; the no-change guard in
+    // `refresh_subscription` makes that a cheap no-op right after boot.
     loop {
-        match notifications.recv().await {
-            Ok(RelayPoolNotification::Event { event, .. }) => {
-                handle(&client, &ingest, &keys, &opts.notify, &event, &opts.relays).await;
+        tokio::select! {
+            notification = notifications.recv() => match notification {
+                Ok(RelayPoolNotification::Event { event, .. }) => {
+                    handle(&client, &ingest, &keys, &opts.notify, &event, &opts.relays).await;
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("nostr: notifications lagged by {n}");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            },
+            _ = refresh.tick() => {
+                refresh_subscription(
+                    &client,
+                    &ingest,
+                    &keys,
+                    &opts.notify,
+                    &opts.relays,
+                    &sub_id,
+                    &mut last_watched,
+                )
+                .await;
             }
-            Ok(_) => {}
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                warn!("nostr: notifications lagged by {n}");
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
     }
     error!("nostr: notification stream closed; service stopped");
+}
+
+/// One live refresh pass: diff the current watched set against the active
+/// subscription and, on change, re-issue the REQ with the updated filter, then
+/// back-fill the newly added keys.
+///
+/// Ordering is subscribe-then-fetch on purpose: the new REQ starts delivering
+/// live wraps for the added keys immediately, and the catch-up fetch then covers
+/// anything published in the gap before the REQ took effect (including the NIP-59
+/// look-back window). Ingest dedupe makes the overlap harmless, so a payment that
+/// lands mid-swap is picked up by exactly one of the two paths, never neither.
+async fn refresh_subscription<R: SlatepackReceiver>(
+    client: &Client,
+    ingest: &Ingest<R>,
+    keys: &Keys,
+    notify: &NotifyOptions,
+    relays: &[String],
+    sub_id: &SubscriptionId,
+    last_watched: &mut HashSet<PublicKey>,
+) {
+    let current: HashSet<PublicKey> = ingest.watched().into_iter().collect();
+    let plan = plan_refresh(last_watched, &current);
+    if !plan.changed {
+        return;
+    }
+
+    // Re-issue the watch REQ under the stable id with the full current set.
+    // This replaces the prior filter and drops any retired keys; a failed
+    // re-subscribe leaves `last_watched` unchanged so the next tick retries.
+    let since = (unix_time() - LOOKBACK_SECS).max(0) as u64;
+    let filter = watch_filter(current.iter().copied(), since);
+    if let Err(e) = client
+        .subscribe_with_id_to(relays, sub_id.clone(), filter, None)
+        .await
+    {
+        error!("nostr: re-subscribe failed: {e}");
+        return;
+    }
+
+    // Back-fill only the newly added keys (a pure shrink adds none).
+    if !plan.added.is_empty() {
+        let filter = watch_filter(plan.added.iter().copied(), since);
+        match client.fetch_events_from(relays, filter, FETCH_TIMEOUT).await {
+            Ok(events) => {
+                info!(
+                    "nostr: refresh added {} key(s), catch-up fetched {} wrap(s)",
+                    plan.added.len(),
+                    events.len()
+                );
+                for event in events.into_iter() {
+                    handle(client, ingest, keys, notify, &event, relays).await;
+                }
+            }
+            Err(e) => warn!("nostr: refresh catch-up fetch failed: {e}"),
+        }
+    } else {
+        info!("nostr: refresh retired keys, watch set now {}", current.len());
+    }
+
+    *last_watched = current;
 }
 
 /// Handle one incoming event end to end: ingest, dispatch the reply, then
@@ -449,6 +577,8 @@ async fn connect_relays(client: &Client, urls: &[String]) {
 
 #[cfg(test)]
 mod tests {
+    use nostr_sdk::JsonUtil;
+
     use super::*;
 
     #[test]
@@ -461,5 +591,84 @@ mod tests {
             payer_receipt_text(1_000_000_000),
             "[GoblinPay] Payment of 1 GRIN received. Thank you."
         );
+    }
+
+    fn set(keys: &[&Keys]) -> HashSet<PublicKey> {
+        keys.iter().map(|k| k.public_key()).collect()
+    }
+
+    #[test]
+    fn refresh_is_a_noop_when_the_watched_set_is_unchanged() {
+        let master = Keys::generate();
+        let child = Keys::generate();
+        let s = set(&[&master, &child]);
+        let plan = plan_refresh(&s, &s.clone());
+        assert!(!plan.changed, "identical sets must not re-subscribe");
+        assert!(plan.added.is_empty());
+    }
+
+    #[test]
+    fn a_key_added_after_boot_is_reported_for_catch_up() {
+        // "Boot" watched only the master; an invoice then derived `child`.
+        let master = Keys::generate();
+        let child = Keys::generate();
+        let last = set(&[&master]);
+        let current = set(&[&master, &child]);
+
+        let plan = plan_refresh(&last, &current);
+        assert!(plan.changed, "a grown set must trigger a re-subscribe");
+        assert_eq!(
+            plan.added,
+            vec![child.public_key()],
+            "only the new key is back-filled, not the master"
+        );
+    }
+
+    #[test]
+    fn a_retired_key_re_subscribes_without_a_catch_up_fetch() {
+        let master = Keys::generate();
+        let child = Keys::generate();
+        let last = set(&[&master, &child]);
+        let current = set(&[&master]);
+
+        let plan = plan_refresh(&last, &current);
+        assert!(plan.changed, "a shrunk set must re-subscribe to drop the key");
+        assert!(
+            plan.added.is_empty(),
+            "a shrink adds no keys, so nothing is fetched"
+        );
+    }
+
+    #[test]
+    fn refresh_reports_multiple_added_keys_in_a_stable_order() {
+        let master = Keys::generate();
+        let a = Keys::generate();
+        let b = Keys::generate();
+        let plan = plan_refresh(&set(&[&master]), &set(&[&master, &a, &b]));
+        assert!(plan.changed);
+        let mut expected = vec![a.public_key(), b.public_key()];
+        expected.sort_by_key(|k| k.to_hex());
+        assert_eq!(plan.added, expected);
+    }
+
+    #[test]
+    fn watch_filter_carries_every_watched_key() {
+        // The re-subscribe filter must ask each connected relay for the newly
+        // added key, or wraps to it stay invisible until a restart (the bug).
+        let master = Keys::generate();
+        let child = Keys::generate();
+        let filter = watch_filter([master.public_key(), child.public_key()], 1_700_000_000);
+        let json = filter.as_json();
+        assert!(
+            json.contains(&master.public_key().to_hex()),
+            "filter missing the master key: {json}"
+        );
+        assert!(
+            json.contains(&child.public_key().to_hex()),
+            "filter missing the newly added key: {json}"
+        );
+        // Gift wraps only, look-back honoured.
+        assert!(json.contains("1059"), "filter must be scoped to kind 1059");
+        assert!(json.contains("1700000000"), "filter must carry `since`");
     }
 }

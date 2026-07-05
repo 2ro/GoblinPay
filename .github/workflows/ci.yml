@@ -1,15 +1,20 @@
-# CI gate for GoblinPay. Mirror of .gitea/workflows/ci.yml.
+# CI gate for GoblinPay. Mirror of .gitea/workflows/ci.yml, plus the workspace
+# trim below (this hosted runner can't reach the private siblings; a deploy-host
+# runner with the siblings present does not need it).
 #
 # What runs where:
-#   - fmt + the gp-core clippy/test gate run on ANY runner: gp-core is
-#     self-contained (no out-of-repo deps), and it holds the domain logic
-#     (config, invoices, matching, webhooks, rates, the connector seam).
-#   - The FULL gate (gp-wallet + gp-nostr + gp-server, via ./ci.sh) needs the
-#     sibling checkouts next to the repo: nip44/ (the Nostr path) and goblin/
-#     (the gp-goblin-sender round-trip gate). Where the workspace is
-#     laid out like the deploy host, it runs too; otherwise it is skipped with a
-#     note. `-p` scoping always keeps the goblin-tree dev crate off the money
-#     path build.
+#   - fmt + the gp-core clippy/test gate run on ANY runner — BUT every cargo
+#     command runs `cargo metadata` over the whole workspace first, and
+#     gp-nostr/gp-server/gp-goblin-sender have path deps into out-of-repo
+#     siblings (nip44/ and the private goblin/ tree) that a hosted runner
+#     can't check out. `-p` scoping does NOT skip that resolution, so the trim
+#     step drops those members before any cargo command. What's left (gp-core,
+#     gp-wallet) is self-contained and holds the domain logic (config, invoices,
+#     matching, webhooks, rates, the connector seam).
+#   - The FULL gate (gp-nostr + gp-server + the gp-goblin-sender round-trip, via
+#     ./ci.sh) needs the sibling checkouts next to the repo: nip44/ (the Nostr
+#     path) and goblin/ (the round-trip gate). It runs where the workspace is
+#     laid out like the deploy host; otherwise it is skipped below.
 name: ci
 on:
   push:
@@ -38,7 +43,17 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Format check (whole workspace)
+      - name: Scope workspace to hosted-runnable crates
+        # gp-nostr/gp-server/gp-goblin-sender have path deps into out-of-repo
+        # siblings (nip44, the private goblin tree) this hosted runner
+        # can't check out, so `cargo metadata` can't resolve them here — and it
+        # runs before any `-p` scoping. Drop them from the members list so the
+        # self-contained core gate (gp-core, gp-wallet) can run. The full
+        # workspace is unchanged in the repo and still builds on the deploy
+        # host, where the siblings exist.
+        run: sed -i '/crates\/gp-goblin-sender\|crates\/gp-nostr\|crates\/gp-server/d' Cargo.toml
+
+      - name: Format check (self-contained crates)
         run: cargo fmt --all -- --check
 
       - name: Clippy (gp-core, deny warnings)

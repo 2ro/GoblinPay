@@ -41,6 +41,49 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.route("/v2/foreign", web::post().to(handle));
 }
 
+/// How often the grin1 expiry sweep runs. A cancel only matters before a late
+/// I2 arrives, and finalize also rechecks the invoice status, so a slow sweep is
+/// plenty.
+const EXPIRY_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Spawn the grin1 expiry sweep: periodically expire due grin1 invoices and
+/// `cancel_tx` their stored wallet contexts, so a late payer I2 for an expired
+/// invoice fails cleanly instead of settling. `cancel` contacts the node and
+/// blocks, so it runs off the async workers.
+pub fn spawn_expiry_cancel(pool: SqlitePool, wallet: GpWallet) {
+    actix_web::rt::spawn(async move {
+        log::info!("grin1: expiry-cancel sweep every {EXPIRY_SWEEP_INTERVAL:?}");
+        loop {
+            actix_web::rt::time::sleep(EXPIRY_SWEEP_INTERVAL).await;
+            let due = match invoice::due_grin1_slates(&pool).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("grin1 expiry sweep: {e}");
+                    continue;
+                }
+            };
+            for (inv_id, slate_id) in due {
+                let w = wallet.clone();
+                let sid = slate_id.clone();
+                // Cancel first; only expire the invoice once its context is gone,
+                // so a node hiccup leaves it open and the next pass retries.
+                let res = actix_web::rt::task::spawn_blocking(move || w.cancel(&sid)).await;
+                match res {
+                    Ok(Ok(())) => {
+                        if let Err(e) = invoice::mark_expired(&pool, &inv_id).await {
+                            warn!("grin1: mark_expired {inv_id} failed: {e}");
+                        } else {
+                            log::info!("grin1: cancelled expired invoice slate {slate_id}");
+                        }
+                    }
+                    Ok(Err(e)) => warn!("grin1: cancel {slate_id} failed (retries next pass): {e}"),
+                    Err(e) => warn!("grin1: cancel task panicked for {slate_id}: {e}"),
+                }
+            }
+        }
+    });
+}
+
 /// A JSON-RPC success envelope.
 fn ok(id: Value, result: Value) -> HttpResponse {
     HttpResponse::Ok().json(json!({"jsonrpc": "2.0", "id": id, "result": result}))

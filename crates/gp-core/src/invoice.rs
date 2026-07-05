@@ -439,6 +439,33 @@ pub async fn expire_due(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
     Ok(result.rows_affected())
 }
 
+/// The still-open grin1-rail invoices whose expiry has passed, as
+/// `(invoice_id, slate_id)`. These need their stored wallet context cancelled
+/// before being expired: the caller `cancel_tx`s each, then calls
+/// [`mark_expired`] on success. Deliberately does NOT flip status here, so a
+/// cancel that fails (e.g. the node is briefly unreachable) leaves the invoice
+/// open and is retried on the next sweep rather than silently un-cancelled.
+pub async fn due_grin1_slates(pool: &SqlitePool) -> Result<Vec<(String, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT id, slate_id FROM invoice \
+         WHERE rail = ?1 AND status = 'open' AND slate_id IS NOT NULL \
+           AND expiry IS NOT NULL AND expiry <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
+    )
+    .bind(RAIL_GRIN1)
+    .fetch_all(pool)
+    .await
+}
+
+/// Flip a still-open invoice to `expired` (used by the grin1 sweep after its
+/// context is cancelled). Idempotent: only an `open` invoice transitions.
+pub async fn mark_expired(pool: &SqlitePool, invoice_id: &str) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("UPDATE invoice SET status = 'expired' WHERE id = ?1 AND status = 'open'")
+        .bind(invoice_id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 async fn expire_if_due_id(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE invoice SET status = 'expired' \
@@ -642,6 +669,45 @@ mod tests {
         mark_paid(&pool, &first.id, "pay-x").await.unwrap();
         let second = get(&pool, &second.id).await.unwrap().unwrap();
         assert!(plain_send_allowed(&pool, &second).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn due_grin1_slates_lists_then_mark_expired_clears_them() {
+        let pool = pool().await;
+        // A grin1 invoice, then force it to a due-but-still-open state (a real
+        // sweep sees a live invoice whose expiry has just passed; create()'s
+        // lazy expiry would otherwise flip a negative expiry immediately).
+        let inv = create(&pool, grin(1_000_000_000), &MASTER, MASTER_PUB, MatchMode::Amount)
+            .await
+            .unwrap();
+        attach_grin1(&pool, &inv.id, "slate-exp", "BEGINSLATEPACK.x.ENDSLATEPACK.")
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE invoice SET status = 'open', \
+             expiry = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-10 seconds') WHERE id = ?1",
+        )
+        .bind(&inv.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Listed while still open (not yet flipped), so a failed cancel retries.
+        let due = due_grin1_slates(&pool).await.unwrap();
+        assert_eq!(due, vec![(inv.id.clone(), "slate-exp".to_string())]);
+        // Still open until we explicitly expire it after a successful cancel.
+        // (get() would lazily expire it, so read status directly.)
+        let raw: String = sqlx::query_scalar("SELECT status FROM invoice WHERE id = ?1")
+            .bind(&inv.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(raw, "open");
+
+        // After cancel succeeds, expire it; the next sweep then lists nothing.
+        assert!(mark_expired(&pool, &inv.id).await.unwrap());
+        assert!(due_grin1_slates(&pool).await.unwrap().is_empty());
+        assert!(!mark_expired(&pool, &inv.id).await.unwrap(), "idempotent");
     }
 
     #[tokio::test]

@@ -258,7 +258,11 @@ async fn main() -> io::Result<()> {
     // deploy/ and the grim tor.rs port); the wallet's index-0 slatepack address
     // key IS the onion identity, so grin1 address == onion address.
     if cfg.grin1_rail {
-        if wallet_data.get_ref().is_some() {
+        if let Some(wallet) = wallet_data.get_ref().as_ref() {
+            // Expiry sweep: cancel the stored context of expired grin1 invoices
+            // so a late payer I2 cannot settle an expired invoice.
+            foreign::spawn_expiry_cancel(pool.clone(), wallet.clone());
+
             let foreign_bind = format!("127.0.0.1:{}", cfg.grin1_foreign_port);
             let pool_f = pool.clone();
             let cfg_f = cfg_data.clone();

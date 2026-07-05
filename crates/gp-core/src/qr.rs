@@ -2,13 +2,12 @@
 //!
 //! The QR is always generated at error-correction level **H** (tolerates
 //! ~30% occlusion) so an optional centered logo, sized to ~22% of the code,
-//! never breaks scannability. The default logo is the Goblin mark, drawn as
-//! inline vector shapes (not a referenced `<image>`) so the whole QR is
-//! self-contained: it renders identically wherever the SVG is embedded,
-//! including cross-origin connector pages (WooCommerce, Medusa) where a
-//! `/static/...` href would 404. An operator may instead point `GP_QR_LOGO`
-//! at their own image URL, or disable the logo entirely. With no logo it is a
-//! plain black-on-white QR.
+//! never breaks scannability. The default is a plain black-on-white QR. An
+//! operator may opt in to a center logo (`GP_QR_LOGO`): the built-in Goblin
+//! mark is drawn as inline vector shapes (not a referenced `<image>`) so the
+//! whole QR is self-contained and renders identically wherever the SVG is
+//! embedded, including cross-origin connector pages (WooCommerce, Medusa)
+//! where a `/static/...` href would 404; a custom image URL is also accepted.
 //!
 //! Rendering is hand-rolled (one `<path>` of the dark modules) so the crate
 //! needs only the `qrcode` matrix, not its image/SVG feature or any raster
@@ -27,7 +26,7 @@ pub enum Logo<'a> {
     /// No center logo: a plain black-on-white QR.
     None,
     /// The built-in Goblin mark, inlined as vector shapes. Self-contained, so
-    /// it renders on any origin (this is the default).
+    /// it renders on any origin (opt-in via `GP_QR_LOGO=builtin`).
     Builtin,
     /// An operator-supplied image referenced by URL (`GP_QR_LOGO=<url>`). The
     /// operator is responsible for it being reachable from wherever the QR is

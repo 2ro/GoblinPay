@@ -192,9 +192,10 @@ pub struct Config {
     /// HMAC secret for signing webhooks (`GP_WEBHOOK_SECRET`).
     #[serde(skip)]
     pub webhook_secret: Option<Secret>,
-    /// Center-logo source for checkout QR codes (`GP_QR_LOGO`): unset or
-    /// `builtin`/`goblin` = the inlined Goblin mark (self-contained, the
-    /// default), `off`/`none` = no logo, else a URL used as an external image.
+    /// Center-logo source for checkout QR codes (`GP_QR_LOGO`): unset (or
+    /// `off`/`none`) = a plain QR, the default; `builtin`/`goblin` = the
+    /// inlined Goblin mark (self-contained, opt-in); else a URL used as an
+    /// external image.
     pub qr_logo: Option<String>,
     /// Merchant npub for confirmed-payment DMs (`GP_MERCHANT_NPUB`).
     pub merchant_npub: Option<String>,
@@ -235,10 +236,10 @@ pub const DEFAULT_RATE_CACHE_TTL: i64 = 60;
 /// Default quote lock window (seconds).
 pub const DEFAULT_QUOTE_TTL: i64 = 900;
 
-/// Sentinel `qr_logo` value selecting the inlined Goblin mark (the default
-/// when `GP_QR_LOGO` is unset). Kept out of the `Href` space so it is never
-/// treated as a URL.
-pub const DEFAULT_QR_LOGO: &str = "builtin";
+/// Sentinel `qr_logo` value selecting the inlined Goblin mark
+/// (`GP_QR_LOGO=builtin`, opt-in; the default is a plain QR). Kept out of the
+/// `Href` space so it is never treated as a URL.
+pub const QR_LOGO_BUILTIN: &str = "builtin";
 
 impl Default for Config {
     fn default() -> Self {
@@ -265,7 +266,7 @@ impl Default for Config {
             admin_token: None,
             webhook_url: None,
             webhook_secret: None,
-            qr_logo: Some(DEFAULT_QR_LOGO.into()),
+            qr_logo: None,
             merchant_npub: None,
             notify_merchant_dm: false,
             notify_payer_receipt: false,
@@ -375,8 +376,8 @@ impl Config {
         let webhook_url = get("GP_WEBHOOK_URL").filter(|s| !s.trim().is_empty());
         let webhook_secret = secret(get, "GP_WEBHOOK_SECRET")?;
         let qr_logo = match get("GP_QR_LOGO").as_deref() {
-            None | Some("builtin") | Some("goblin") => Some(DEFAULT_QR_LOGO.to_string()),
-            Some("off") | Some("none") | Some("") => None,
+            None | Some("off") | Some("none") | Some("") => None,
+            Some("builtin") | Some("goblin") => Some(QR_LOGO_BUILTIN.to_string()),
             Some(other) => Some(other.to_string()),
         };
         let merchant_npub = get("GP_MERCHANT_NPUB").filter(|s| !s.trim().is_empty());
@@ -455,7 +456,7 @@ impl Config {
     pub fn qr_logo(&self) -> crate::qr::Logo<'_> {
         match self.qr_logo.as_deref() {
             None => crate::qr::Logo::None,
-            Some(DEFAULT_QR_LOGO) => crate::qr::Logo::Builtin,
+            Some(QR_LOGO_BUILTIN) => crate::qr::Logo::Builtin,
             Some(href) => crate::qr::Logo::Href(href),
         }
     }
@@ -819,7 +820,7 @@ mod tests {
     fn m5_m6_defaults_and_overrides() {
         let cfg = load(&[]).unwrap();
         assert_eq!(cfg.public_url, format!("http://{DEFAULT_BIND}"));
-        assert_eq!(cfg.qr_logo.as_deref(), Some(DEFAULT_QR_LOGO));
+        assert!(cfg.qr_logo.is_none(), "plain QR by default");
         assert!(!cfg.notify_merchant_dm);
         assert!(!cfg.notify_payer_receipt);
         assert_eq!(cfg.endpub_rotate_interval, 0);
@@ -842,6 +843,16 @@ mod tests {
         assert!(cfg.notify_merchant_dm);
         assert_eq!(cfg.endpub_rotate_interval, 3600);
         assert_eq!(cfg.endpub_overlap_epochs, 2);
+
+        // The center logo is opt-in: builtin sentinel or a custom image URL.
+        let cfg = load(&[("GP_QR_LOGO", "builtin")]).unwrap();
+        assert_eq!(cfg.qr_logo.as_deref(), Some(QR_LOGO_BUILTIN));
+        assert_eq!(cfg.qr_logo(), crate::qr::Logo::Builtin);
+        let cfg = load(&[("GP_QR_LOGO", "https://cdn.example/logo.svg")]).unwrap();
+        assert_eq!(
+            cfg.qr_logo(),
+            crate::qr::Logo::Href("https://cdn.example/logo.svg")
+        );
     }
 
     #[test]

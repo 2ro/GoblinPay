@@ -42,9 +42,16 @@ final class GoblinPay_WC_Blocks_Support extends AbstractPaymentMethodType {
     }
 
     public function get_payment_method_data() {
+        // The black GoblinPay badge as a data URI so the Blocks checkout row
+        // shows it next to the method title with no external asset request.
+        $icon = function_exists('goblinpay_wc_badge_black')
+            ? 'data:image/svg+xml;base64,' . base64_encode(goblinpay_wc_badge_black())
+            : '';
+
         return array(
             'title'       => !empty($this->gw_settings['title']) ? $this->gw_settings['title'] : 'Grin (GRIN)',
             'description' => isset($this->gw_settings['description']) ? $this->gw_settings['description'] : '',
+            'icon'        => $icon,
             'supports'    => array('products'),
         );
     }

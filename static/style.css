@@ -101,6 +101,29 @@ details.manual ol { color: var(--dim); font-size: 0.9rem; padding-left: 1.2rem; 
 .pay-method:first-of-type { border-top: none; padding-top: 0; }
 .pay-method ol { color: var(--dim); font-size: 0.9rem; padding-left: 1.2rem; }
 
+/* Two-rail switcher (CSS only, no JavaScript): hidden radios drive which
+   panel shows; the tab labels are the control. Radios precede the panels so the
+   general-sibling combinator can target them. */
+.rails { margin-top: 1.25rem; }
+.rail-radio { position: absolute; width: 0; height: 0; opacity: 0; pointer-events: none; }
+.rail-tabs { display: flex; gap: 0.4rem; margin-bottom: 1rem; }
+.rail-tab {
+  flex: 1; text-align: center; cursor: pointer;
+  padding: 0.55rem 0.5rem; border: 1px solid var(--line); border-radius: var(--radius);
+  color: var(--dim); font-size: 0.9rem; font-weight: 600; background: var(--panel);
+}
+.rail-tab:only-child { flex: none; display: inline-block; }
+#rail-goblin:checked ~ .rail-tabs [for="rail-goblin"],
+#rail-grin:checked ~ .rail-tabs [for="rail-grin"] {
+  color: var(--bg); background: var(--accent); border-color: var(--accent);
+}
+.rail-panel { display: none; }
+#rail-goblin:checked ~ #panel-goblin,
+#rail-grin:checked ~ #panel-grin { display: block; }
+.grin-sub { margin-top: 1.5rem; border-top: 1px solid var(--line); padding-top: 1rem; }
+.grin-sub:first-child { margin-top: 0; border-top: none; padding-top: 0; }
+.grin-sub h3 { margin: 0 0 0.5rem; font-size: 1rem; }
+
 a { color: var(--accent); }
 
 .footer { margin-top: 2rem; color: var(--dim); font-size: 0.78rem; text-align: center; }

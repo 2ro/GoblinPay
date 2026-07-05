@@ -24,40 +24,61 @@
   {% else %}
     <p class="status open">Waiting for payment&#8230;</p>
 
-    {% if !info.nprofile.is_empty() %}
-    <section class="pay-method">
-      <h2>Pay with Goblin Wallet</h2>
-      <div class="qr">{{ info.qr_svg|safe }}</div>
-      <p class="hint">Scan with your Goblin Wallet, or copy the address below.</p>
-      <label for="nprofile">Payment address (nprofile)</label>
-      <textarea id="nprofile" class="copybox" rows="3" readonly>{{ info.nprofile }}</textarea>
-    </section>
-    {% endif %}
+    {% let has_goblin = !info.nprofile.is_empty() %}
+    {% let has_grin = info.invoice_slatepack.is_some() || info.slatepack_address.is_some() %}
 
-    {% if let Some(grin1) = info.slatepack_address %}
-    <section class="pay-method">
-      <h2>Pay by Slatepack (grin1)</h2>
-      <p class="hint">Pay from any Grin wallet, no Nostr needed. Send <strong>{{ info.amount_display }}</strong> to the address below.</p>
-      {% if let Some(grin1_qr) = info.slatepack_qr_svg %}<div class="qr">{{ grin1_qr|safe }}</div>{% endif %}
-      <label for="grin1">Slatepack address (grin1)</label>
-      <textarea id="grin1" class="copybox" rows="3" readonly>{{ grin1 }}</textarea>
-      <ol>
-        <li>In your Grin wallet, send {{ info.amount_display }} to this address using the Slatepack / file method, then paste the Slatepack it produces below.</li>
-        <li>The pasted <strong>S1</strong> Slatepack is received here and a <strong>response</strong> Slatepack is returned.</li>
-        <li>Paste that response back into your wallet to finalize and broadcast it, which completes the payment.</li>
-      </ol>
-      <form method="post" action="/pay/{{ info.token }}/slatepack">
-        <label for="s1">Your Slatepack (S1)</label>
-        <textarea id="s1" name="slatepack" rows="6" required
-          placeholder="BEGINSLATEPACK. &#8230; ENDSLATEPACK."></textarea>
-        <button type="submit">Submit slatepack</button>
-      </form>
-    </section>
-    {% endif %}
+    <div class="rails">
+      {% if has_goblin %}<input class="rail-radio" type="radio" name="rail" id="rail-goblin" checked>{% endif %}
+      {% if has_grin %}<input class="rail-radio" type="radio" name="rail" id="rail-grin"{% if !has_goblin %} checked{% endif %}>{% endif %}
+
+      <div class="rail-tabs">
+        {% if has_goblin %}<label class="rail-tab" for="rail-goblin">Pay with Goblin</label>{% endif %}
+        {% if has_grin %}<label class="rail-tab" for="rail-grin">Pay with any Grin wallet</label>{% endif %}
+      </div>
+
+      {% if has_goblin %}
+      <section class="rail-panel" id="panel-goblin">
+        <div class="qr">{{ info.qr_svg|safe }}</div>
+        <p class="hint">Scan with your Goblin Wallet, or copy the address below.</p>
+        <label for="nprofile">Payment address (nprofile)</label>
+        <textarea id="nprofile" class="copybox" rows="3" readonly>{{ info.nprofile }}</textarea>
+      </section>
+      {% endif %}
+
+      {% if has_grin %}
+      <section class="rail-panel" id="panel-grin">
+        {% if let Some(pack) = info.invoice_slatepack %}
+        <div class="grin-sub">
+          <h3>Grin invoice</h3>
+          <p class="hint">Open your Grin wallet, import this invoice, and pay it. The response returns to us automatically over Tor, no copy-paste back needed.</p>
+          {% if let Some(pack_qr) = info.invoice_slatepack_qr_svg %}<div class="qr">{{ pack_qr|safe }}</div>{% endif %}
+          <label for="invoice-slatepack">Invoice slatepack</label>
+          <textarea id="invoice-slatepack" class="copybox" rows="6" readonly>{{ pack }}</textarea>
+        </div>
+        {% endif %}
+
+        {% if let Some(grin1) = info.slatepack_address %}
+        <div class="grin-sub">
+          <h3>Send to address</h3>
+          <p class="hint">Prefer sending yourself? Send exactly <strong>{{ info.amount_display }}</strong> to the address below, then paste the slatepack your wallet produces.</p>
+          {% if let Some(grin1_qr) = info.slatepack_qr_svg %}<div class="qr">{{ grin1_qr|safe }}</div>{% endif %}
+          <label for="grin1">Slatepack address (grin1)</label>
+          <textarea id="grin1" class="copybox" rows="3" readonly>{{ grin1 }}</textarea>
+          <form method="post" action="/pay/{{ info.token }}/slatepack">
+            <label for="s1">Your slatepack (S1)</label>
+            <textarea id="s1" name="slatepack" rows="6" required
+              placeholder="BEGINSLATEPACK. &#8230; ENDSLATEPACK."></textarea>
+            <button type="submit">Submit slatepack</button>
+          </form>
+        </div>
+        {% endif %}
+      </section>
+      {% endif %}
+    </div>
   {% endif %}
 
   {% if let Some(memo) = info.memo %}<p class="memo">{{ memo }}</p>{% endif %}
-  <p class="footer">Powered by GoblinPay &middot; receive-only Grin over Nostr</p>
+  <p class="footer">Powered by GoblinPay &middot; receive-only Grin over Nostr and Tor</p>
 </main>
 </body>
 </html>

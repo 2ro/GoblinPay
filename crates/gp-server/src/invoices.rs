@@ -6,10 +6,11 @@
 
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
 use gp_core::config::{Config, MatchMode};
-use gp_core::invoice::{self, AmountSpec, NewInvoice};
+use gp_core::invoice::{self, AmountSpec, Invoice, NewInvoice};
 use gp_core::rates::{Oracle, RateError};
 use gp_core::store::{CreateInvoiceRequest, RestConnector, StoreConnector};
 use gp_nostr::Keys;
+use gp_wallet::GpWallet;
 use log::error;
 use serde::Deserialize;
 use sqlx::SqlitePool;
@@ -84,6 +85,7 @@ async fn create_invoice(
     cfg: web::Data<Config>,
     signer: web::Data<ReceiptSigner>,
     oracle: web::Data<Oracle>,
+    wallet: web::Data<Option<GpWallet>>,
 ) -> impl Responder {
     if !authorized(&req, cfg.api_token.as_ref().map(|s| s.reveal())) {
         return HttpResponse::Unauthorized().json(serde_json::json!({"error": "unauthorized"}));
@@ -154,10 +156,17 @@ async fn create_invoice(
                 .json(serde_json::json!({"error": "internal error"}));
         }
     };
+
+    // grin1 rail (Phase 2): when armed and a wallet is loaded, an exact-amount
+    // invoice also issues a native Grin invoice slate (the primary "pay with any
+    // Grin wallet" path). The returning finalize is matched back by slate id.
+    // The node round trip in issue_invoice blocks, so it runs off the workers.
+    let inv = arm_grin1_rail(pool.get_ref(), cfg.get_ref(), wallet.get_ref(), inv).await;
+
     // The JSON connector API surfaces the Nostr checkout fields only; the
     // grin1 Slatepack option is presented on the hosted /pay page. A freshly
     // created invoice is `open`, so its confirmation depth is 0.
-    let info = build_info(&inv, cfg.get_ref(), None);
+    let info = build_info(&inv, cfg.get_ref(), None, None, false);
     HttpResponse::Ok().json(checkout_json(&info, 0, cfg.confirmations_required))
 }
 
@@ -176,7 +185,7 @@ async fn get_invoice(
             let confirmations = invoice::confirmations(pool.get_ref(), &inv.id)
                 .await
                 .unwrap_or(0);
-            let info = build_info(&inv, cfg.get_ref(), None);
+            let info = build_info(&inv, cfg.get_ref(), None, None, false);
             HttpResponse::Ok().json(checkout_json(
                 &info,
                 confirmations,
@@ -187,6 +196,54 @@ async fn get_invoice(
         Err(e) => {
             error!("get invoice: {e}");
             HttpResponse::InternalServerError().json(serde_json::json!({"error": "internal"}))
+        }
+    }
+}
+
+/// Arm a freshly created invoice on the grin1 rail: issue a native Grin invoice
+/// slate for its exact amount and store the slate id + armored slatepack. A
+/// no-op (returns the invoice unchanged) when the rail is off, no wallet is
+/// loaded, or the invoice has no positive exact amount (an unpriced fiat invoice
+/// has nothing to invoice for). Best-effort: an issue/attach failure is logged
+/// and the invoice still returns on its other rails, never failing the caller.
+async fn arm_grin1_rail(
+    pool: &SqlitePool,
+    cfg: &Config,
+    wallet: &Option<GpWallet>,
+    inv: Invoice,
+) -> Invoice {
+    if !cfg.grin1_rail {
+        return inv;
+    }
+    let (Some(wallet), Some(nano)) = (wallet.as_ref(), inv.expected_amount) else {
+        return inv;
+    };
+    if nano <= 0 {
+        return inv;
+    }
+    let nano = nano as u64;
+    let w = wallet.clone();
+    // issue_invoice reads the chain tip through the blocking grin node client;
+    // keep it off the async workers.
+    let issued = actix_web::rt::task::spawn_blocking(move || w.issue_invoice(nano)).await;
+    match issued {
+        Ok(Ok(issued)) => {
+            if let Err(e) =
+                invoice::attach_grin1(pool, &inv.id, &issued.slate_id, &issued.i1_armor).await
+            {
+                error!("grin1: attach failed for {}: {e}", inv.id);
+                return inv;
+            }
+            // Refetch so the returned row carries the rail fields.
+            invoice::get(pool, &inv.id).await.ok().flatten().unwrap_or(inv)
+        }
+        Ok(Err(e)) => {
+            error!("grin1: issue_invoice failed for {}: {e}", inv.id);
+            inv
+        }
+        Err(e) => {
+            error!("grin1: issue_invoice task panicked for {}: {e}", inv.id);
+            inv
         }
     }
 }

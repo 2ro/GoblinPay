@@ -34,12 +34,18 @@ pub struct CheckoutInfo {
     pub npub: String,
     pub nprofile: String,
     pub qr_svg: String,
-    /// The wallet's stable `grin1` Slatepack address, when a wallet is loaded.
-    /// `None` (and no Slatepack option shown) when the instance runs with no
-    /// wallet, mirroring how the manual receive handler degrades.
+    /// The wallet's stable `grin1` Slatepack address, when a wallet is loaded
+    /// AND the plain-send fallback is permitted for this invoice (the render
+    /// gate: an amount collision with an earlier open grin1 invoice hides it).
+    /// `None` (and no plain-send panel shown) otherwise.
     pub slatepack_address: Option<String>,
     /// QR SVG of the `grin1` Slatepack address (present with the address).
     pub slatepack_qr_svg: Option<String>,
+    /// The armored I1 invoice slatepack (grin1 rail, native invoice flow): the
+    /// PRIMARY "pay with any Grin wallet" method. `None` off the rail.
+    pub invoice_slatepack: Option<String>,
+    /// QR SVG of the armored I1 invoice slatepack (present with it).
+    pub invoice_slatepack_qr_svg: Option<String>,
     pub amount_display: String,
     pub status: String,
     pub memo: Option<String>,
@@ -55,7 +61,13 @@ pub struct CheckoutInfo {
 /// wallet without Nostr); pass `None` when no wallet is available or the
 /// caller does not surface the Slatepack option (e.g. the JSON connector API),
 /// in which case no Slatepack address or QR is produced.
-pub fn build_info(inv: &Invoice, cfg: &Config, slatepack_addr: Option<&str>) -> CheckoutInfo {
+pub fn build_info(
+    inv: &Invoice,
+    cfg: &Config,
+    slatepack_addr: Option<&str>,
+    invoice_slatepack: Option<&str>,
+    plain_send_allowed: bool,
+) -> CheckoutInfo {
     let relays = gp_nostr::relays::resolve(cfg.relay_mode, &cfg.bundled_relay_url, &cfg.relays);
     let recipient_pubkey = inv.recipient_pubkey.clone().unwrap_or_default();
     // The Nostr (Goblin Wallet) method is only surfaced when the operator has it
@@ -86,10 +98,24 @@ pub fn build_info(inv: &Invoice, cfg: &Config, slatepack_addr: Option<&str>) -> 
     // no wallet loaded: the page simply omits the Slatepack option.
     // The Slatepack method needs both operator opt-in (`GP_CHECKOUT_METHODS`)
     // and a loaded wallet: an enabled method that cannot work is simply hidden.
+    // The plain-send fallback (an exact-amount receive to the stable grin1
+    // address) shows only when the operator enabled the slatepack method, a
+    // wallet address is available, AND the render gate permits it (no amount
+    // collision with an earlier open grin1 invoice; Phase 3, no jitter).
     let (slatepack_address, slatepack_qr_svg) = match slatepack_addr {
-        Some(addr) if cfg.checkout_slatepack && !addr.is_empty() => {
+        Some(addr) if cfg.checkout_slatepack && plain_send_allowed && !addr.is_empty() => {
             let qr = qr::svg(addr, cfg.qr_logo()).unwrap_or_default();
             (Some(addr.to_string()), Some(qr))
+        }
+        _ => (None, None),
+    };
+    // The native invoice slatepack (I1) is the primary Grin-wallet method; it is
+    // shown whenever the invoice is armed on the grin1 rail and the slatepack
+    // method is enabled. Its QR carries the armored slatepack text verbatim.
+    let (invoice_slatepack, invoice_slatepack_qr_svg) = match invoice_slatepack {
+        Some(armor) if cfg.checkout_slatepack && !armor.is_empty() => {
+            let qr = qr::svg(armor, cfg.qr_logo()).unwrap_or_default();
+            (Some(armor.to_string()), Some(qr))
         }
         _ => (None, None),
     };
@@ -105,6 +131,8 @@ pub fn build_info(inv: &Invoice, cfg: &Config, slatepack_addr: Option<&str>) -> 
         qr_svg,
         slatepack_address,
         slatepack_qr_svg,
+        invoice_slatepack,
+        invoice_slatepack_qr_svg,
         amount_display,
         status: inv.status.clone(),
         memo: inv.memo.clone(),
@@ -239,8 +267,19 @@ async fn pay_page(
         .get_ref()
         .as_ref()
         .and_then(|w| w.slatepack_address().ok());
+    // Render gate for the plain-send fallback panel (Phase 3): an amount
+    // collision with an earlier open grin1 invoice hides this one's panel.
+    let plain_send_allowed = invoice::plain_send_allowed(pool.get_ref(), &inv)
+        .await
+        .unwrap_or(false);
     let page = PayPage {
-        info: build_info(&inv, cfg.get_ref(), slatepack_addr.as_deref()),
+        info: build_info(
+            &inv,
+            cfg.get_ref(),
+            slatepack_addr.as_deref(),
+            inv.slatepack.as_deref(),
+            plain_send_allowed,
+        ),
         is_open: status == InvoiceStatus::Open,
         is_paid: status == InvoiceStatus::Paid,
         is_confirmed: status == InvoiceStatus::Confirmed,
@@ -392,6 +431,9 @@ mod tests {
             quote_rate: None,
             quote_source: None,
             confirmed_at: None,
+            rail: None,
+            slate_id: None,
+            slatepack: None,
         }
     }
 
@@ -401,10 +443,37 @@ mod tests {
         // a QR for it, so the hosted page can show the Slatepack option.
         let inv = invoice(Some(1_500_000_000), None);
         let cfg = Config::default();
-        let info = build_info(&inv, &cfg, Some("grin1qtestaddress"));
+        // Plain-send permitted (render gate allowed): the address surfaces.
+        let info = build_info(&inv, &cfg, Some("grin1qtestaddress"), None, true);
         assert_eq!(info.slatepack_address.as_deref(), Some("grin1qtestaddress"));
         let qr = info.slatepack_qr_svg.expect("slatepack QR present");
         assert!(qr.contains("<svg"), "grin1 QR is an SVG");
+    }
+
+    #[test]
+    fn render_gate_hides_plain_send_address_but_keeps_invoice_slatepack() {
+        // The gate denies the plain-send address (amount collision), but the
+        // primary invoice slatepack still renders.
+        let inv = invoice(Some(1_500_000_000), None);
+        let cfg = Config::default();
+        let info = build_info(
+            &inv,
+            &cfg,
+            Some("grin1qtestaddress"),
+            Some("BEGINSLATEPACK.inv.ENDSLATEPACK."),
+            false,
+        );
+        assert!(info.slatepack_address.is_none(), "plain-send gated off");
+        assert!(info.slatepack_qr_svg.is_none());
+        assert_eq!(
+            info.invoice_slatepack.as_deref(),
+            Some("BEGINSLATEPACK.inv.ENDSLATEPACK.")
+        );
+        assert!(info
+            .invoice_slatepack_qr_svg
+            .as_deref()
+            .unwrap()
+            .contains("<svg"));
     }
 
     #[test]
@@ -413,10 +482,10 @@ mod tests {
         // the page simply does not show the Slatepack option.
         let inv = invoice(Some(1_500_000_000), None);
         let cfg = Config::default();
-        let info = build_info(&inv, &cfg, None);
+        let info = build_info(&inv, &cfg, None, None, true);
         assert!(info.slatepack_address.is_none());
         assert!(info.slatepack_qr_svg.is_none());
-        let blank = build_info(&inv, &cfg, Some(""));
+        let blank = build_info(&inv, &cfg, Some(""), None, true);
         assert!(blank.slatepack_address.is_none());
         assert!(blank.slatepack_qr_svg.is_none());
     }
@@ -432,7 +501,7 @@ mod tests {
             checkout_slatepack: true,
             ..Config::default()
         };
-        let info = build_info(&inv, &cfg, Some("grin1qtestaddress"));
+        let info = build_info(&inv, &cfg, Some("grin1qtestaddress"), None, true);
         assert!(info.nprofile.is_empty(), "nprofile empty when nostr off");
         assert!(info.npub.is_empty(), "npub empty when nostr off");
         assert_eq!(info.slatepack_address.as_deref(), Some("grin1qtestaddress"));
@@ -447,14 +516,16 @@ mod tests {
             confirmations_required: 10,
         };
         let html = page.render().unwrap();
+        // The Goblin rail (nprofile) is absent; the Grin rail is present.
         assert!(
-            !html.contains("Pay with Goblin Wallet"),
-            "Nostr section absent when checkout_nostr=false"
+            !html.contains("id=\"rail-goblin\""),
+            "Goblin rail absent when checkout_nostr=false"
         );
         assert!(
-            html.contains("Pay by Slatepack"),
-            "Slatepack section still present"
+            html.contains("id=\"panel-grin\""),
+            "Grin rail present"
         );
+        assert!(html.contains("Send to address"), "plain-send panel present");
     }
 
     #[test]
@@ -468,12 +539,22 @@ mod tests {
             checkout_slatepack: false,
             ..Config::default()
         };
-        let info = build_info(&inv, &cfg, Some("grin1qtestaddress"));
+        let info = build_info(
+            &inv,
+            &cfg,
+            Some("grin1qtestaddress"),
+            Some("BEGINSLATEPACK.inv.ENDSLATEPACK."),
+            true,
+        );
         assert!(
             info.slatepack_address.is_none(),
-            "slatepack dropped when method off"
+            "plain-send dropped when method off"
         );
         assert!(info.slatepack_qr_svg.is_none());
+        assert!(
+            info.invoice_slatepack.is_none(),
+            "invoice slatepack dropped when method off"
+        );
         assert!(!info.nprofile.is_empty(), "nprofile present when nostr on");
 
         let page = PayPage {
@@ -486,13 +567,10 @@ mod tests {
             confirmations_required: 10,
         };
         let html = page.render().unwrap();
+        assert!(html.contains("id=\"panel-goblin\""), "Goblin rail present");
         assert!(
-            html.contains("Pay with Goblin Wallet"),
-            "Nostr section present"
-        );
-        assert!(
-            !html.contains("Pay by Slatepack"),
-            "Slatepack section absent when checkout_slatepack=false"
+            !html.contains("id=\"panel-grin\""),
+            "Grin rail absent when checkout_slatepack=false"
         );
     }
 

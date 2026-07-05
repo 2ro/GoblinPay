@@ -113,7 +113,7 @@ fn new_receiver(dir: &Path) -> GpWallet {
     let mnemonic = grin_keychain::mnemonic::from_entropy(&entropy).unwrap();
     GpWallet::open_at(
         dir,
-        &mnemonic,
+        Some(mnemonic.as_str()),
         "receiver-pw",
         "http://127.0.0.1:3413",
         ChainTypes::Mainnet,

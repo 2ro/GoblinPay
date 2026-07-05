@@ -176,16 +176,19 @@ impl fmt::Debug for GpWallet {
 
 impl GpWallet {
     /// Open (or create on first run) the wallet described by the gp config.
-    /// Requires `GP_MNEMONIC` (or `_FILE`) and `GP_WALLET_PASSWORD` (or
-    /// `_FILE`); fails fast when either is missing.
+    ///
+    /// `GP_WALLET_PASSWORD` (or `_FILE`) is required on every boot: it decrypts
+    /// the seed at rest. `GP_MNEMONIC` (or `_FILE`) is required ONLY to create
+    /// the wallet on first run; once the encrypted seed file exists, boot needs
+    /// only the password (init-once). If a mnemonic is still supplied after the
+    /// wallet exists it is used only as a non-destructive cross-check that it
+    /// matches the seed at rest, never to re-create or re-derive anything (the
+    /// caller should drop it from the environment, see `gp-server`).
     pub fn open(cfg: &Config) -> Result<GpWallet, WalletError> {
-        let mnemonic = cfg.mnemonic.as_ref().ok_or_else(|| {
-            WalletError::Config("GP_MNEMONIC (or GP_MNEMONIC_FILE) is required".into())
-        })?;
         let password = cfg.wallet_password.as_ref().ok_or_else(|| {
             WalletError::Config(
                 "GP_WALLET_PASSWORD (or GP_WALLET_PASSWORD_FILE) is required to \
-                 encrypt the wallet seed at rest"
+                 open the wallet (it decrypts the seed at rest)"
                     .into(),
             )
         })?;
@@ -195,22 +198,29 @@ impl GpWallet {
         };
         Self::open_at(
             Path::new(&cfg.data_dir),
-            mnemonic.reveal(),
+            cfg.mnemonic.as_ref().map(|m| m.reveal()),
             password.reveal(),
             &cfg.node_url,
             chain,
         )
     }
 
-    /// Open (or create) a wallet under `data_dir` from a BIP-39 mnemonic.
-    /// The seed is written encrypted (with `password`) to
+    /// Open (or create) a wallet under `data_dir`. The seed is written
+    /// encrypted (with `password`) to
     /// `<data_dir>/wallet/wallet_data/wallet.seed`, mode 0600. The receive path
     /// is fully offline; `node_url` is used only for lightweight confirmation
     /// reads (a single `get_kernel` per pending payment), which go DIRECT over
     /// HTTP, never through the Nym tunnel.
+    ///
+    /// `mnemonic` is consumed only on first run (when no wallet exists yet):
+    /// - wallet absent + `Some(seed)`: create the wallet from `seed`.
+    /// - wallet absent + `None`: error (first-run creation needs the seed).
+    /// - wallet present + `Some(seed)`: cross-check `seed` matches the seed at
+    ///   rest, refusing on mismatch; never re-creates.
+    /// - wallet present + `None`: open with the password alone (init-once).
     pub fn open_at(
         data_dir: &Path,
-        mnemonic: &str,
+        mnemonic: Option<&str>,
         password: &str,
         node_url: &str,
         chain: ChainTypes,
@@ -238,16 +248,32 @@ impl GpWallet {
             let lc = wallet.lc_provider()?;
             lc.set_top_level_directory(top_dir_str)?;
             if lc.wallet_exists(None)? {
-                // The data dir already holds a wallet: refuse to run against
-                // a different seed than the configured one.
-                let existing = lc.get_mnemonic(None, ZeroingString::from(password))?;
-                if &*existing != mnemonic {
-                    return Err(WalletError::Config(format!(
-                        "data dir {top_dir:?} already holds a wallet created from a \
-                         different mnemonic; refusing to open"
-                    )));
+                // Init-once: the wallet already exists, so the password alone
+                // opens it. The mnemonic is neither required nor used to
+                // re-create it. When one IS still supplied, keep a
+                // non-destructive safety cross-check that it matches the seed
+                // at rest (catches a wrong-seed / wrong-data-dir misconfig);
+                // never re-derive or overwrite anything.
+                if let Some(mnemonic) = mnemonic {
+                    let existing = lc.get_mnemonic(None, ZeroingString::from(password))?;
+                    if &*existing != mnemonic {
+                        return Err(WalletError::Config(format!(
+                            "data dir {top_dir:?} already holds a wallet created from a \
+                             different mnemonic; refusing to open"
+                        )));
+                    }
                 }
             } else {
+                // First run: creating the wallet is the ONLY path that consumes
+                // the seed. Without it there is nothing to open.
+                let mnemonic = mnemonic.ok_or_else(|| {
+                    WalletError::Config(
+                        "first-run wallet creation requires GP_MNEMONIC (or \
+                         GP_MNEMONIC_FILE); none was provided and no wallet exists \
+                         yet at this data dir"
+                            .into(),
+                    )
+                })?;
                 lc.create_wallet(
                     None,
                     Some(ZeroingString::from(mnemonic)),
@@ -692,6 +718,10 @@ mod tests {
     }
 
     fn open(dir: &TempDir, mnemonic: &str) -> Result<GpWallet, WalletError> {
+        open_opt(dir, Some(mnemonic))
+    }
+
+    fn open_opt(dir: &TempDir, mnemonic: Option<&str>) -> Result<GpWallet, WalletError> {
         GpWallet::open_at(
             &dir.0,
             mnemonic,
@@ -794,10 +824,13 @@ mod tests {
     }
 
     #[test]
-    fn open_from_config_requires_both_secrets() {
+    fn open_from_config_requires_wallet_password() {
+        // The wallet password is the always-required secret (it decrypts the
+        // seed at rest on every boot), so it is what a bare config is missing
+        // first — even when a mnemonic is present.
         let cfg = Config::default();
         let err = GpWallet::open(&cfg).unwrap_err();
-        assert!(err.to_string().contains("GP_MNEMONIC"), "got {err}");
+        assert!(err.to_string().contains("GP_WALLET_PASSWORD"), "got {err}");
 
         let cfg = Config {
             mnemonic: Some(gp_core::config::Secret::new(random_mnemonic())),
@@ -805,5 +838,30 @@ mod tests {
         };
         let err = GpWallet::open(&cfg).unwrap_err();
         assert!(err.to_string().contains("GP_WALLET_PASSWORD"), "got {err}");
+    }
+
+    #[test]
+    fn first_run_without_mnemonic_is_refused() {
+        // No wallet on disk and no seed supplied: creation is impossible, so
+        // this must fail fast and name the missing secret.
+        let dir = TempDir::new("firstrun-noseed");
+        let err = open_opt(&dir, None).unwrap_err();
+        assert!(matches!(err, WalletError::Config(_)), "got {err}");
+        assert!(err.to_string().contains("GP_MNEMONIC"), "got {err}");
+    }
+
+    #[test]
+    fn reopen_without_mnemonic_succeeds_init_once() {
+        // Init-once: create the wallet with a seed, then reopen with the
+        // password alone (mnemonic dropped from the environment). The reopened
+        // wallet must be the same one (same slatepack address).
+        let dir = TempDir::new("initonce");
+        let mnemonic = random_mnemonic();
+        let created = open(&dir, &mnemonic).unwrap().slatepack_address().unwrap();
+        let reopened = open_opt(&dir, None).unwrap().slatepack_address().unwrap();
+        assert_eq!(
+            created, reopened,
+            "reopen without the seed must be the same wallet"
+        );
     }
 }

@@ -263,7 +263,7 @@ mod tests {
         let mnemonic = grin_keychain::mnemonic::from_entropy(&entropy).unwrap();
         let wallet = gp_wallet::GpWallet::open_at(
             &dir,
-            &mnemonic,
+            Some(&mnemonic),
             "test-password",
             "http://127.0.0.1:3413",
             grin_core::global::ChainTypes::Mainnet,

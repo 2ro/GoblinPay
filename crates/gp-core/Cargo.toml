@@ -23,6 +23,9 @@ subtle = "2"
 qrcode = { version = "0.14", default-features = false }
 # Random invoice ids and unguessable checkout tokens (same line as gp-nostr).
 rand = "0.9"
+# Zeroize secret buffers (mnemonic, wallet password, tokens) on drop. Already
+# in the tree via the grin/nostr stacks; pinned to that same 1.x line.
+zeroize = "1"
 # Host-only log line when a stale rate is served (matches the crate's
 # host-only logging posture).
 log = "0.4"

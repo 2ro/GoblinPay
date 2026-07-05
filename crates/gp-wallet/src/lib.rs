@@ -36,10 +36,25 @@ use grin_util::secp::key::SecretKey;
 use grin_util::{Mutex, ZeroingString};
 use grin_wallet_impls::{DefaultLCProvider, DefaultWalletImpl, HTTPNodeClient};
 use grin_wallet_libwallet::api_impl::{foreign, owner};
-use grin_wallet_libwallet::{IssueInvoiceTxArgs, SlateState, StatusMessage, WalletInst};
+use grin_wallet_libwallet::{
+    IssueInvoiceTxArgs, NodeClient, SlateState, StatusMessage, WalletInst,
+};
 use serde::Serialize;
 
 pub use confirm::{confirm_status, ConfirmStatus};
+
+/// Health-probe a Grin node URL: a fresh `HTTPNodeClient` `get_tip` round trip
+/// over DIRECT HTTP (never Nym), same read path the confirmation poll uses.
+/// Returns `true` if the node answered with a tip. Used by the setup wizard to
+/// pick the first healthy node from its curated list; a failed probe (down,
+/// unreachable, or a non-tip response) simply returns `false` so the wizard
+/// falls back to the next candidate.
+pub fn probe_node(node_url: &str) -> bool {
+    let Ok(client) = HTTPNodeClient::new(node_url, None) else {
+        return false;
+    };
+    client.get_chain_tip().is_ok()
+}
 pub use proof::{verify_receiver_proof, ReceiverProof};
 
 // Foreign API v2 slate types, re-exported so gp-server's `/v2/foreign`
@@ -50,6 +65,18 @@ pub use grin_wallet_libwallet::{Slate, VersionInfo, VersionedSlate};
 /// exactly like stock grin-wallet: `{ foreign_api_version, supported_slate_versions }`.
 pub fn check_version() -> VersionInfo {
     foreign::check_version()
+}
+
+/// Encode 32 bytes of entropy as a fresh 24-word BIP-39 mnemonic, using
+/// grin-wallet's own wordlist and checksum (never a reimplementation). The
+/// setup wizard uses this for the "generate a fresh till seed" default: the
+/// caller (gp-core) supplies CSPRNG entropy, this crate turns it into the seed
+/// phrase, so the randomness dependency stays out of the wallet crate. The
+/// returned string is the operator's money backup and must be shown once and
+/// then dropped.
+pub fn mnemonic_from_entropy(entropy: &[u8; 32]) -> Result<String, WalletError> {
+    grin_keychain::mnemonic::from_entropy(entropy)
+        .map_err(|e| WalletError::Wallet(format!("mnemonic generation failed: {e:?}")))
 }
 
 /// Decode a `grin1...` slatepack address into its ed25519 public key bytes
@@ -203,6 +230,25 @@ impl GpWallet {
             &cfg.node_url,
             chain,
         )
+    }
+
+    /// Open (or create) a wallet under `data_dir`, taking the gp [`Chain`]
+    /// directly (mapping it to grin's `ChainTypes`). A thin convenience over
+    /// [`GpWallet::open_at`] for callers that hold a gp config chain but not a
+    /// full [`Config`] (the setup wizard): keeps grin's node crates out of
+    /// their dependency set.
+    pub fn create_at(
+        data_dir: &Path,
+        mnemonic: Option<&str>,
+        password: &str,
+        node_url: &str,
+        chain: Chain,
+    ) -> Result<GpWallet, WalletError> {
+        let chain = match chain {
+            Chain::Mainnet => ChainTypes::Mainnet,
+            Chain::Testnet => ChainTypes::Testnet,
+        };
+        Self::open_at(data_dir, mnemonic, password, node_url, chain)
     }
 
     /// Open (or create) a wallet under `data_dir`. The seed is written

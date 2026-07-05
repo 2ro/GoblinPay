@@ -14,6 +14,7 @@ pub mod invoice;
 pub mod matching;
 pub mod qr;
 pub mod rates;
+pub mod setup;
 pub mod store;
 pub mod webhook;
 

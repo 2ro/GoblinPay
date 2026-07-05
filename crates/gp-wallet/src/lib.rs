@@ -36,7 +36,7 @@ use grin_util::secp::key::SecretKey;
 use grin_util::{Mutex, ZeroingString};
 use grin_wallet_impls::{DefaultLCProvider, DefaultWalletImpl, HTTPNodeClient};
 use grin_wallet_libwallet::api_impl::{foreign, owner};
-use grin_wallet_libwallet::{SlateState, StatusMessage, WalletInst};
+use grin_wallet_libwallet::{IssueInvoiceTxArgs, SlateState, StatusMessage, WalletInst};
 use serde::Serialize;
 
 pub use confirm::{confirm_status, ConfirmStatus};
@@ -97,6 +97,31 @@ pub struct Received {
     /// payer's S1 requested one (carried a proof address). `None` otherwise
     /// (today's Goblin senders do not request proofs).
     pub proof: Option<String>,
+}
+
+/// Result of issuing an invoice (native invoice flow, receiver-initiated): the
+/// I1 slatepack armor for the payer plus the slate id we key settlement on.
+#[derive(Debug, Clone)]
+pub struct Issued {
+    /// Slate UUID, shared by I1, I2, and the final transaction. Stored on the
+    /// invoice row so a returning I2 is matched back to this invoice.
+    pub slate_id: String,
+    /// The armored I1 invoice slatepack (standard armor) the payer imports to
+    /// pay. Plain armor, like the receive path; no custom transforms.
+    pub i1_armor: String,
+}
+
+/// Result of finalizing a returned invoice slate (I2): the completed tx has
+/// been posted to the node. Carries what the ledger records for the sale.
+#[derive(Debug, Clone)]
+pub struct FinalizedInvoice {
+    /// Slate UUID (matches the invoice's stored `slate_id`).
+    pub slate_id: String,
+    /// Amount in nanogrin the invoice was issued for.
+    pub amount: u64,
+    /// Tx kernel excess commitment, hex (33 bytes) — the on-chain anchor the
+    /// confirmation poll queries with `get_kernel`.
+    pub kernel_excess: String,
 }
 
 /// Cheap wallet balance snapshot (nanogrin), read from the local DB without a
@@ -271,25 +296,7 @@ impl GpWallet {
         // so it equals both the excess receive_tx signed into the payment proof
         // and the on-chain kernel excess the node returns — the single anchor
         // for confirmation and proof.
-        let kernel_excess = {
-            let channel: Option<Sender<StatusMessage>> = None;
-            let (_refreshed, txs) = owner::retrieve_txs(
-                self.instance.clone(),
-                self.mask.as_ref(),
-                &channel,
-                false, // local read only; the heavy updater stays disabled
-                None,
-                Some(slate.id),
-                None,
-            )?;
-            let excess = txs
-                .iter()
-                .find_map(|t| t.kernel_excess.as_ref())
-                .ok_or_else(|| {
-                    WalletError::Wallet("received tx has no recorded kernel excess".into())
-                })?;
-            proof::encode_hex(&excess.0)
-        };
+        let kernel_excess = self.slate_kernel_excess(slate.id)?;
 
         // If the payer's S1 requested a payment proof, receive_tx has filled in
         // the receiver signature on the returned slate; capture the full
@@ -313,6 +320,136 @@ impl GpWallet {
             kernel_excess,
             proof,
         })
+    }
+
+    /// Issue an invoice (native invoice flow, we are the receiver-initiator):
+    /// run `issue_invoice_tx` for `amount` nanogrin, storing the aggsig context
+    /// keyed by the slate id, and return the armored I1 slatepack for the payer
+    /// plus that slate id. The payer imports the I1, pays it (producing an I2),
+    /// and returns the I2 for [`GpWallet::finalize_invoice_slatepack`].
+    ///
+    /// This touches the node once (`issue_invoice_tx` reads the chain tip to
+    /// stamp the slate height); that read goes DIRECT over HTTP, like every
+    /// other node read here.
+    pub fn issue_invoice(&self, amount: u64) -> Result<Issued, WalletError> {
+        let args = IssueInvoiceTxArgs {
+            amount,
+            ..Default::default()
+        };
+        let i1 = {
+            let mut w_lock = self.instance.lock();
+            let lc = w_lock.lc_provider()?;
+            let w = lc.wallet_inst()?;
+            owner::issue_invoice_tx(&mut **w, self.mask.as_ref(), args, false)?
+        };
+        if i1.state != SlateState::Invoice1 {
+            return Err(WalletError::Wallet(format!(
+                "issue_invoice_tx produced unexpected slate state {:?}",
+                i1.state
+            )));
+        }
+        // Plain armor (like the receive path); the QR carries the same text.
+        let i1_armor = owner::create_slatepack_message(
+            self.instance.clone(),
+            self.mask.as_ref(),
+            &i1,
+            Some(0),
+            vec![],
+        )?;
+        Ok(Issued {
+            slate_id: i1.id.to_string(),
+            i1_armor,
+        })
+    }
+
+    /// Finalize a returned invoice slate (I2) and post the completed tx to the
+    /// node. Loads our stored context by slate id (saved at
+    /// [`GpWallet::issue_invoice`]), completes the tx, POSTS it, and returns the
+    /// slate id + kernel excess for the ledger. A returned slate that is not an
+    /// I2 (wrong state, garbage, or one whose context we never stored) errors
+    /// cleanly, so a late finalize after an expiry cancel fails rather than
+    /// double-posting.
+    pub fn finalize_invoice_slatepack(
+        &self,
+        i2_armor: &str,
+    ) -> Result<FinalizedInvoice, WalletError> {
+        let i2 = owner::slate_from_slatepack_message(
+            self.instance.clone(),
+            self.mask.as_ref(),
+            i2_armor.trim().to_string(),
+            vec![0],
+        )
+        .map_err(|e| WalletError::Slatepack(format!("cannot read invoice slatepack: {e}")))?;
+
+        if i2.state != SlateState::Invoice2 {
+            return Err(WalletError::Slatepack(format!(
+                "expected an I2 (invoice return) slatepack, got {:?}",
+                i2.state
+            )));
+        }
+        let slate_id = i2.id.to_string();
+        let amount = i2.amount;
+
+        // Complete the tx from our stored context (errors if we never issued
+        // this invoice or already cancelled it), then post it ourselves.
+        let final_slate = {
+            let mut w_lock = self.instance.lock();
+            let lc = w_lock.lc_provider()?;
+            let w = lc.wallet_inst()?;
+            owner::finalize_tx(&mut **w, self.mask.as_ref(), &i2)?
+        };
+        let client = HTTPNodeClient::new(&self.node_url, None).map_err(|e| {
+            WalletError::Config(format!("bad node URL `{}`: {e}", self.node_url))
+        })?;
+        owner::post_tx(&client, final_slate.tx_or_err()?, true)?;
+
+        // Kernel excess from the tx log (offset-independent, summed over both
+        // participants), same anchor the receive path records.
+        let kernel_excess = self.slate_kernel_excess(final_slate.id)?;
+        Ok(FinalizedInvoice {
+            slate_id,
+            amount,
+            kernel_excess,
+        })
+    }
+
+    /// Cancel the stored context for a slate id (invoice expiry): a subsequent
+    /// `finalize_invoice_slatepack` for the same slate then fails cleanly (no
+    /// stored context), so a late payer I2 cannot settle an expired invoice.
+    /// `cancel_tx` contacts the node to confirm state; a node hiccup surfaces as
+    /// an error the sweeper logs and retries.
+    pub fn cancel(&self, slate_id: &str) -> Result<(), WalletError> {
+        let uuid = uuid::Uuid::parse_str(slate_id)
+            .map_err(|e| WalletError::Wallet(format!("bad slate id `{slate_id}`: {e}")))?;
+        let channel: Option<Sender<StatusMessage>> = None;
+        owner::cancel_tx(
+            self.instance.clone(),
+            self.mask.as_ref(),
+            &channel,
+            None,
+            Some(uuid),
+        )?;
+        Ok(())
+    }
+
+    /// The tx kernel excess (hex) the wallet logged for `slate_id`, read from
+    /// the local tx log (no node scan). Shared by receive and invoice finalize.
+    fn slate_kernel_excess(&self, slate_id: uuid::Uuid) -> Result<String, WalletError> {
+        let channel: Option<Sender<StatusMessage>> = None;
+        let (_refreshed, txs) = owner::retrieve_txs(
+            self.instance.clone(),
+            self.mask.as_ref(),
+            &channel,
+            false,
+            None,
+            Some(slate_id),
+            None,
+        )?;
+        let excess = txs
+            .iter()
+            .find_map(|t| t.kernel_excess.as_ref())
+            .ok_or_else(|| WalletError::Wallet("tx has no recorded kernel excess".into()))?;
+        Ok(proof::encode_hex(&excess.0))
     }
 
     /// Extract the receiver-side payment proof from a post-`receive_tx` slate,
@@ -505,6 +642,25 @@ mod tests {
         let wallet = open(&dir, &random_mnemonic()).unwrap();
         let err = wallet.receive_slatepack("BEGINSLATEPACK. nope. ENDSLATEPACK.");
         assert!(matches!(err, Err(WalletError::Slatepack(_))));
+    }
+
+    #[test]
+    fn finalize_invoice_rejects_garbage_armor() {
+        // Parse-before-node: a malformed I2 armor is rejected without any node
+        // contact, so this runs offline.
+        let dir = TempDir::new("fin-garbage");
+        let wallet = open(&dir, &random_mnemonic()).unwrap();
+        let err = wallet.finalize_invoice_slatepack("BEGINSLATEPACK. nope. ENDSLATEPACK.");
+        assert!(matches!(err, Err(WalletError::Slatepack(_))), "got {err:?}");
+    }
+
+    #[test]
+    fn cancel_rejects_bad_slate_id() {
+        // A non-UUID slate id is rejected before any node contact.
+        let dir = TempDir::new("cancel-bad");
+        let wallet = open(&dir, &random_mnemonic()).unwrap();
+        let err = wallet.cancel("not-a-uuid");
+        assert!(matches!(err, Err(WalletError::Wallet(_))), "got {err:?}");
     }
 
     #[test]

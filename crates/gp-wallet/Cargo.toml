@@ -34,6 +34,11 @@ ed25519-dalek = "=1.0.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+# Slate id parsing for cancel_tx (invoice expiry). Pinned to the exact line
+# grin_wallet_libwallet uses (its `uuid = "0.8"`), so the `Uuid` type unifies
+# with the one cancel_tx / retrieve_txs accept.
+uuid = "0.8"
+
 [dev-dependencies]
 # The exact node API type HTTPNodeClient parses a get_kernel response into.
 # Used only to assert the confirmation parser against a recorded node fixture

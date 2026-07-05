@@ -86,7 +86,7 @@ Everything is environment variables, defaults are safe for local use.
 | `GP_GRIN1_RAIL` | `off` | Operator opt-in grin1/Tor rail. `on` = the till also accepts payments from any Grin wallet over Tor: an onion service (identity = the till's grin1 slatepack address key, so grin1 address == onion address) serves the Grin Foreign API v2, invoices carry a native Grin invoice slatepack, and the pay page gains a two-rail switcher (Goblin stays the default tab). Off/unset = Goblin/Nostr only, byte-for-byte the pre-rail behavior |
 | `GP_GRIN1_FOREIGN_PORT` | `3416` | Loopback port the Foreign API v2 binds; the onion service proxies `onion:80` to it (only used with `GP_GRIN1_RAIL=on`) |
 | `GP_MATCH_MODE` | `memo` | Default matching mode: `memo`, `derived`, `amount` |
-| `GP_MNEMONIC` | unset | Grin seed mnemonic (money secret) |
+| `GP_MNEMONIC` | unset | Grin seed mnemonic (money secret). Needed only to create the wallet on first run; once the encrypted seed exists, boot needs only `GP_WALLET_PASSWORD` and you should remove this |
 | `GP_WALLET_PASSWORD` | unset | Password encrypting the wallet seed and the Nostr identity at rest |
 | `GP_NSEC` | unset | Nostr identity key (payment identity secret) |
 | `GP_NCRYPTSEC` | unset | NIP-49 encrypted identity key (unlocked with the wallet password) |
@@ -158,15 +158,39 @@ unpriceable invoice; `GP_RATE_STALE_MAX` optionally permits serving the last
 cached rate within a bounded window instead. The oracle fetch goes DIRECT over
 normal HTTP, the same as the read-only node client.
 
-The secrets also accept mounted-file variants, `GP_MNEMONIC_FILE`,
-`GP_WALLET_PASSWORD_FILE`, `GP_NSEC_FILE`, and `GP_NCRYPTSEC_FILE`
-(mode 0400 recommended). Setting both the variable and its `_FILE` variant
-is an error, as is setting both `GP_NSEC` and `GP_NCRYPTSEC`. When neither
-identity variable is set, a fresh random identity is generated on first
-start and persisted NIP-49 encrypted at `<GP_DATA_DIR>/nostr/identity.json`
-(mode 0600). The mnemonic and the nsec are deliberately independent secrets:
-the mnemonic recovers the funds, the nsec recovers the payment identity, and
-the Grin seed is never used for anything Nostr.
+### Secrets and the wallet seed
+
+`GP_WALLET_PASSWORD` is required on every start: it decrypts the wallet seed,
+which GoblinPay stores encrypted at rest under `GP_DATA_DIR` (mode 0600).
+`GP_MNEMONIC` is used only once, to create that wallet on the first start.
+After the encrypted seed exists, GoblinPay opens the wallet with the password
+alone; if `GP_MNEMONIC` is still set it is only checked against the seed at
+rest, never used to recreate anything, and the server logs a notice asking you
+to remove it. So the steady state is: password in, seed out.
+
+Deliver both secrets as files rather than plain environment variables:
+`GP_MNEMONIC_FILE`, `GP_WALLET_PASSWORD_FILE`, `GP_NSEC_FILE`, and
+`GP_NCRYPTSEC_FILE` (mode 0400 recommended). Setting both a variable and its
+`_FILE` variant is an error, as is setting both `GP_NSEC` and `GP_NCRYPTSEC`.
+An environment variable is visible to the whole process (and via `/proc` to the
+same user and root) for the life of the service; a file is not. The shipped
+`deploy/gp-server.service` reads the seed and password with systemd
+`LoadCredential` (they land under `$CREDENTIALS_DIRECTORY`, pointed at by the
+`_FILE` variables), and `deploy/docker-compose.yml` mounts them under
+`/run/secrets`, so with either deployment nothing sensitive is in the
+environment.
+
+Treat the till as a small hot wallet. Grin receives are interactive, so the
+till must hold live keys; keep the risk small by giving it a seed of its own
+(separate from cold storage), holding only a working balance, and sweeping to
+cold storage regularly.
+
+When neither identity variable is set, a fresh random Nostr identity is
+generated on first start and persisted NIP-49 encrypted at
+`<GP_DATA_DIR>/nostr/identity.json` (mode 0600). The mnemonic and the nsec are
+deliberately independent secrets: the mnemonic recovers the funds, the nsec
+recovers the payment identity, and the Grin seed is never used for anything
+Nostr.
 
 ## REST API
 

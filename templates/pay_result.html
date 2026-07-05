@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Slatepack response</title>
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="{{ base }}/static/style.css">
 </head>
 <body>
 <main class="checkout">
@@ -21,7 +21,7 @@
     </ol>
   {% endif %}
 
-  <p><a href="/pay/{{ token }}">Back to the invoice</a></p>
+  <p><a href="{{ base }}/pay/{{ token }}">Back to the invoice</a></p>
   <p class="footer">Powered by GoblinPay</p>
 </main>
 </body>

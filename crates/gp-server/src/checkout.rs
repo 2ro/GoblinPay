@@ -29,6 +29,11 @@ use sqlx::SqlitePool;
 pub struct CheckoutInfo {
     pub invoice_id: String,
     pub token: String,
+    /// Path prefix the app is mounted under for building root-relative links in
+    /// the hosted page (empty for a subdomain/root, e.g. `/pay` for a
+    /// reverse-proxied path on the shop's existing domain). Derived from
+    /// `GP_PUBLIC_URL` so path hosting needs zero new DNS records.
+    pub base: String,
     pub pay_url: String,
     pub recipient_pubkey: String,
     pub npub: String,
@@ -127,6 +132,7 @@ pub fn build_info(
     let token = inv.token.clone().unwrap_or_default();
     CheckoutInfo {
         invoice_id: inv.id.clone(),
+        base: gp_core::setup::base_path(&cfg.public_url),
         pay_url: format!("{}/pay/{}", cfg.public_url, token),
         token,
         recipient_pubkey,
@@ -231,6 +237,8 @@ struct PayPage {
 #[derive(Template)]
 #[template(path = "pay_result.html")]
 struct PayResultPage {
+    /// Mount path prefix for root-relative links (see `CheckoutInfo::base`).
+    base: String,
     token: String,
     ok: bool,
     message: String,
@@ -400,8 +408,14 @@ async fn manual_slatepack(
         }
     };
 
+    // The path prefix the app is mounted under (empty for a subdomain/root,
+    // `/pay` for path hosting), so the result page's links stay correct under a
+    // reverse-proxied path.
+    let base = gp_core::setup::base_path(&cfg.public_url);
+
     let Some(wallet) = wallet.get_ref().as_ref() else {
         return render(PayResultPage {
+            base,
             token,
             ok: false,
             message: "Manual receive is unavailable on this instance (wallet not loaded).".into(),
@@ -415,13 +429,11 @@ async fn manual_slatepack(
         Err(e) => PasteRoute::Reject(format!("That slatepack could not be read: {e}")),
     };
 
-    let page = match route {
-        PasteRoute::Reject(message) => PayResultPage {
-            token,
-            ok: false,
-            message,
-            s2_armor: String::new(),
-        },
+    // Compute the outcome (ok, message, S2-to-copy) once, then render a single
+    // PayResultPage; this keeps the money-path branches focused on the receive/
+    // finalize logic rather than repeating the page shell.
+    let (ok, message, s2_armor): (bool, String, String) = match route {
+        PasteRoute::Reject(message) => (false, message, String::new()),
         PasteRoute::ReceiveS1 => {
             // Offline receive_tx (no node), exactly the wallet path the Nostr
             // flow uses; persist + match + webhook via the shared helper.
@@ -438,21 +450,19 @@ async fn manual_slatepack(
                         webhook.as_ref(),
                     )
                     .await;
-                    PayResultPage {
-                        token,
-                        ok: true,
-                        message: "Payment received. Copy the response slatepack below back \
-                                  into your wallet to finalize and post it to the chain."
+                    (
+                        true,
+                        "Payment received. Copy the response slatepack below back \
+                         into your wallet to finalize and post it to the chain."
                             .into(),
-                        s2_armor: received.s2_armor,
-                    }
+                        received.s2_armor,
+                    )
                 }
-                Err(e) => PayResultPage {
-                    token,
-                    ok: false,
-                    message: format!("That slatepack could not be received: {e}"),
-                    s2_armor: String::new(),
-                },
+                Err(e) => (
+                    false,
+                    format!("That slatepack could not be received: {e}"),
+                    String::new(),
+                ),
             }
         }
         PasteRoute::FinalizeI2 => {
@@ -473,35 +483,38 @@ async fn manual_slatepack(
                     let webhook = crate::foreign::webhook_pair(cfg.get_ref());
                     crate::foreign::settle_finalized(pool.get_ref(), &finalized, webhook.as_ref())
                         .await;
-                    PayResultPage {
-                        token,
-                        ok: true,
-                        message: "Invoice response received: the payment has been finalized \
-                                  and posted to the chain. Nothing more to paste; this page \
-                                  will show confirmations as they arrive."
+                    (
+                        true,
+                        "Invoice response received: the payment has been finalized \
+                         and posted to the chain. Nothing more to paste; this page \
+                         will show confirmations as they arrive."
                             .into(),
-                        s2_armor: String::new(),
-                    }
+                        String::new(),
+                    )
                 }
-                Ok(Err(e)) => PayResultPage {
-                    token,
-                    ok: false,
-                    message: format!("That invoice response could not be finalized: {e}"),
-                    s2_armor: String::new(),
-                },
+                Ok(Err(e)) => (
+                    false,
+                    format!("That invoice response could not be finalized: {e}"),
+                    String::new(),
+                ),
                 Err(e) => {
                     error!("manual finalize task panicked: {e}");
-                    PayResultPage {
-                        token,
-                        ok: false,
-                        message: "Internal error while finalizing; please try again.".into(),
-                        s2_armor: String::new(),
-                    }
+                    (
+                        false,
+                        "Internal error while finalizing; please try again.".into(),
+                        String::new(),
+                    )
                 }
             }
         }
     };
-    render(page)
+    render(PayResultPage {
+        base,
+        token,
+        ok,
+        message,
+        s2_armor,
+    })
 }
 
 /// Render an Askama template to an HTML response.

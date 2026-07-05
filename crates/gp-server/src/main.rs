@@ -18,10 +18,18 @@ use gp_wallet::GpWallet;
 /// Landing page ("GoblinPay").
 #[derive(Template)]
 #[template(path = "index.html")]
-struct IndexPage;
+struct IndexPage {
+    /// Mount path prefix for root-relative asset links, so the landing page
+    /// works when the till is reverse-proxied on a path (zero new DNS records).
+    base: String,
+}
 
-async fn index() -> impl Responder {
-    match IndexPage.render() {
+async fn index(cfg: web::Data<Config>) -> impl Responder {
+    match (IndexPage {
+        base: gp_core::setup::base_path(&cfg.public_url),
+    })
+    .render()
+    {
         Ok(html) => HttpResponse::Ok()
             .content_type("text/html; charset=utf-8")
             .body(html),
@@ -221,8 +229,80 @@ fn tls_server_config(cert_path: &str, key_path: &str) -> Result<rustls::ServerCo
         .map_err(|e| format!("TLS config rejected: {e}"))
 }
 
+/// Run the interactive setup wizard (`gp-server setup [flags]`) and exit,
+/// before any of the async server machinery starts. Argv is parsed by hand (no
+/// clap), matching `gp-goblin-sender`'s convention. Returns the process exit
+/// code.
+fn run_setup(args: &[String]) -> i32 {
+    use std::io::IsTerminal;
+    use std::path::PathBuf;
+
+    use gp_server::setup::{self, SetupOptions};
+
+    let mut opts = SetupOptions {
+        reconfigure: false,
+        prefix: None,
+        node_override: None,
+        force_run: false,
+        stdin_is_tty: std::io::stdin().is_terminal(),
+    };
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--reconfigure" => opts.reconfigure = true,
+            "--batch" => opts.force_run = true,
+            "--prefix" => {
+                i += 1;
+                match args.get(i) {
+                    Some(p) => opts.prefix = Some(PathBuf::from(p)),
+                    None => {
+                        eprintln!("--prefix needs a directory argument");
+                        return 2;
+                    }
+                }
+            }
+            "--node" => {
+                i += 1;
+                match args.get(i) {
+                    Some(u) => opts.node_override = Some(u.clone()),
+                    None => {
+                        eprintln!("--node needs a URL argument");
+                        return 2;
+                    }
+                }
+            }
+            other => {
+                eprintln!("unknown setup flag `{other}`");
+                eprintln!(
+                    "usage: gp-server setup [--reconfigure] [--prefix DIR] [--node URL] [--batch]"
+                );
+                return 2;
+            }
+        }
+        i += 1;
+    }
+
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+    match setup::run(stdin.lock(), &mut stdout, &opts) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("setup: {e}");
+            1
+        }
+    }
+}
+
 #[actix_web::main]
 async fn main() -> io::Result<()> {
+    // Subcommand branch (manual argv, no clap): `gp-server setup` runs the
+    // onboarding wizard and exits before the Actix server boots. Any other
+    // invocation falls through to the normal server startup below.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("setup") {
+        std::process::exit(run_setup(&argv[2..]));
+    }
+
     // Install the rustls ring provider exactly once, before anything else
     // touches rustls. Shared by sqlx, nostr-sdk, tungstenite, and reqwest.
     rustls::crypto::ring::default_provider()
@@ -383,15 +463,44 @@ mod tests {
 
     #[actix_web::test]
     async fn index_renders_goblinpay() {
-        let app = test::init_service(App::new().configure(routes)).await;
+        // The index handler reads Config (for the mount-path prefix), so provide
+        // a default one as app data.
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(Config::default()))
+                .configure(routes),
+        )
+        .await;
         let req = test::TestRequest::get().uri("/").to_request();
         let resp = test::call_service(&app, req).await;
         assert!(resp.status().is_success());
         let body = test::read_body(resp).await;
         let html = std::str::from_utf8(&body).unwrap();
         assert!(html.contains("GoblinPay"));
+        // Default (root) mount: the prefix is empty, so assets stay root-relative.
         assert!(html.contains("/static/style.css"));
         assert!(!html.contains("<script"));
+    }
+
+    #[actix_web::test]
+    async fn index_respects_path_prefix() {
+        // Path hosting (GP_PUBLIC_URL with a path) prefixes asset links so a
+        // reverse-proxied path mount works with zero new DNS records.
+        let cfg = Config {
+            public_url: "https://myshop.com/pay".into(),
+            ..Config::default()
+        };
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(cfg))
+                .configure(routes),
+        )
+        .await;
+        let req = test::TestRequest::get().uri("/").to_request();
+        let resp = test::call_service(&app, req).await;
+        let body = test::read_body(resp).await;
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains("/pay/static/style.css"), "asset link is prefixed");
     }
 
     #[actix_web::test]

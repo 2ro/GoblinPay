@@ -70,6 +70,8 @@ struct BalanceRow {
 #[derive(Template)]
 #[template(path = "admin.html")]
 struct AdminPage {
+    /// Mount path prefix for root-relative asset links (see the checkout page).
+    base: String,
     payments: Vec<PaymentRow>,
     balances: Vec<BalanceRow>,
     node_url: String,
@@ -98,6 +100,7 @@ async fn dashboard(
             .await
             .unwrap_or(0);
     let page = AdminPage {
+        base: gp_core::setup::base_path(&cfg.public_url),
         payments,
         balances,
         node_url: cfg.node_url.clone(),

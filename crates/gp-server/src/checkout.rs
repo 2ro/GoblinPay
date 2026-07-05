@@ -179,14 +179,20 @@ fn percent_encode(s: &str) -> String {
     out
 }
 
-/// The checkout page template.
+/// The checkout page template. `is_paid` is the "received, confirming on chain"
+/// state (funds in hand, below the confirmation threshold); `is_confirmed` is
+/// the final settled state at/above the threshold. `confirmations` /
+/// `confirmations_required` drive the "n of N" progress shown while confirming.
 #[derive(Template)]
 #[template(path = "pay.html")]
 struct PayPage {
     info: CheckoutInfo,
     is_open: bool,
     is_paid: bool,
+    is_confirmed: bool,
     is_expired: bool,
+    confirmations: i64,
+    confirmations_required: i64,
 }
 
 /// The manual-slatepack result template (S2 to copy back).
@@ -223,6 +229,9 @@ async fn pay_page(
         }
     };
     let status = inv.status();
+    let confirmations = invoice::confirmations(pool.get_ref(), &inv.id)
+        .await
+        .unwrap_or(0);
     // Surface the wallet's stable grin1 Slatepack address (same wallet handle
     // the manual receive uses). No wallet loaded, or the address cannot be
     // derived, means no Slatepack option is shown.
@@ -234,21 +243,38 @@ async fn pay_page(
         info: build_info(&inv, cfg.get_ref(), slatepack_addr.as_deref()),
         is_open: status == InvoiceStatus::Open,
         is_paid: status == InvoiceStatus::Paid,
+        is_confirmed: status == InvoiceStatus::Confirmed,
         is_expired: status == InvoiceStatus::Expired,
+        confirmations,
+        confirmations_required: cfg.confirmations_required,
     };
     render(page)
 }
 
 /// GET /pay/{token}/status: status JSON for polling (public-by-token).
-async fn pay_status(path: web::Path<String>, pool: web::Data<SqlitePool>) -> impl Responder {
+/// `status` advances open -> paid -> confirmed (paid remains a real,
+/// backward-compatible state); `confirmations` is the paying kernel's live
+/// depth and `confirmations_required` is the house threshold.
+async fn pay_status(
+    path: web::Path<String>,
+    pool: web::Data<SqlitePool>,
+    cfg: web::Data<Config>,
+) -> impl Responder {
     let token = path.into_inner();
     match invoice::get_by_token(pool.get_ref(), &token).await {
-        Ok(Some(inv)) => HttpResponse::Ok().json(serde_json::json!({
-            "invoice_id": inv.id,
-            "status": inv.status,
-            "expected_amount": inv.expected_amount,
-            "paid_payment_id": inv.paid_payment_id,
-        })),
+        Ok(Some(inv)) => {
+            let confirmations = invoice::confirmations(pool.get_ref(), &inv.id)
+                .await
+                .unwrap_or(0);
+            HttpResponse::Ok().json(serde_json::json!({
+                "invoice_id": inv.id,
+                "status": inv.status,
+                "expected_amount": inv.expected_amount,
+                "paid_payment_id": inv.paid_payment_id,
+                "confirmations": confirmations,
+                "confirmations_required": cfg.confirmations_required,
+            }))
+        }
         Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
         Err(e) => {
             error!("pay status: {e}");
@@ -365,6 +391,7 @@ mod tests {
             paid_at: None,
             quote_rate: None,
             quote_source: None,
+            confirmed_at: None,
         }
     }
 
@@ -414,7 +441,10 @@ mod tests {
             info,
             is_open: true,
             is_paid: false,
+            is_confirmed: false,
             is_expired: false,
+            confirmations: 0,
+            confirmations_required: 10,
         };
         let html = page.render().unwrap();
         assert!(
@@ -450,7 +480,10 @@ mod tests {
             info,
             is_open: true,
             is_paid: false,
+            is_confirmed: false,
             is_expired: false,
+            confirmations: 0,
+            confirmations_required: 10,
         };
         let html = page.render().unwrap();
         assert!(

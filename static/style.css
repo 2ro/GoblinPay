@@ -47,6 +47,7 @@ h2 { font-size: 1.05rem; margin: 1.75rem 0 0.5rem; color: var(--dim); text-trans
 .status { font-weight: 600; margin: 0.5rem 0 1rem; }
 .status.open { color: var(--dim); }
 .status.paid, .status-confirmed, .status-replied { color: var(--green); }
+.status.confirming { color: var(--accent); }
 .status.expired { color: var(--red); }
 .status-received { color: var(--accent); }
 

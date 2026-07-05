@@ -231,8 +231,14 @@ async fn main() -> io::Result<()> {
     };
 
     // Confirmation poll (M4): advances received payments to `confirmed` when
-    // their kernel lands. Node reads go DIRECT (never Nym).
-    payments::spawn_confirm_poll(pool.clone(), cfg.node_url.clone());
+    // their kernel lands, and advances the paying invoice `paid` -> `confirmed`
+    // once it reaches GP_CONFIRMATIONS depth (firing a payment.confirmed
+    // webhook). Node reads go DIRECT (never Nym).
+    payments::spawn_confirm_poll(
+        pool.clone(),
+        cfg.node_url.clone(),
+        payments::ConfirmPolicy::from_config(&cfg),
+    );
 
     // Webhook dispatcher (M6): drains the persisted queue with backoff.
     if let Some(secret) = cfg.webhook_secret.as_ref() {

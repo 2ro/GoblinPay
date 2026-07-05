@@ -50,8 +50,15 @@ fn parse_mode(s: &str) -> Option<MatchMode> {
     }
 }
 
-/// JSON shape returned for a created/fetched invoice.
-fn checkout_json(info: &CheckoutInfo) -> serde_json::Value {
+/// JSON shape returned for a created/fetched invoice. `confirmations` is the
+/// paying kernel's live depth (0 until it lands) and `confirmations_required`
+/// is the house threshold (`GP_CONFIRMATIONS`); `status` advances
+/// open -> paid -> confirmed (paid stays a real, backward-compatible state).
+fn checkout_json(
+    info: &CheckoutInfo,
+    confirmations: i64,
+    confirmations_required: i64,
+) -> serde_json::Value {
     serde_json::json!({
         "invoice_id": info.invoice_id,
         "token": info.token,
@@ -62,6 +69,8 @@ fn checkout_json(info: &CheckoutInfo) -> serde_json::Value {
         "qr_svg": info.qr_svg,
         "amount": info.amount_display,
         "status": info.status,
+        "confirmations": confirmations,
+        "confirmations_required": confirmations_required,
         "order_ref": info.order_ref,
         "memo": info.memo,
     })
@@ -146,9 +155,10 @@ async fn create_invoice(
         }
     };
     // The JSON connector API surfaces the Nostr checkout fields only; the
-    // grin1 Slatepack option is presented on the hosted /pay page.
+    // grin1 Slatepack option is presented on the hosted /pay page. A freshly
+    // created invoice is `open`, so its confirmation depth is 0.
     let info = build_info(&inv, cfg.get_ref(), None);
-    HttpResponse::Ok().json(checkout_json(&info))
+    HttpResponse::Ok().json(checkout_json(&info, 0, cfg.confirmations_required))
 }
 
 /// GET /invoice/{id} (auth): the invoice's current checkout info + status.
@@ -163,8 +173,15 @@ async fn get_invoice(
     }
     match invoice::get(pool.get_ref(), &path.into_inner()).await {
         Ok(Some(inv)) => {
+            let confirmations = invoice::confirmations(pool.get_ref(), &inv.id)
+                .await
+                .unwrap_or(0);
             let info = build_info(&inv, cfg.get_ref(), None);
-            HttpResponse::Ok().json(checkout_json(&info))
+            HttpResponse::Ok().json(checkout_json(
+                &info,
+                confirmations,
+                cfg.confirmations_required,
+            ))
         }
         Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
         Err(e) => {

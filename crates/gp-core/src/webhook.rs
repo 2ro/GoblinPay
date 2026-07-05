@@ -8,15 +8,16 @@
 //! ```json
 //! {
 //!   "event_id": "5f3c…",              // 128-bit hex, the idempotency key
-//!   "event_type": "payment.received", // (payment.confirmed once node-confirmed)
+//!   "event_type": "payment.received", // or payment.confirmed (>= GP_CONFIRMATIONS)
 //!   "created_at": "2026-07-01T12:00:00Z",
 //!   "payment": {
 //!     "slate_id": "…",
 //!     "amount": 2000000000,           // nanogrin (integer)
 //!     "amount_grin": "2",             // human decimal string
-//!     "status": "received",
+//!     "status": "received",           // or "confirmed"
 //!     "payer": "…hex…",               // sender pubkey, or null
-//!     "confirmed_height": null        // set once confirmed on chain
+//!     "confirmed_height": null,       // block height, set once confirmed on chain
+//!     "confirmations": null           // depth at confirm time, null on received
 //!   },
 //!   "invoice_id": "…",                // or null
 //!   "order_ref": "order-42",          // or null
@@ -65,6 +66,8 @@ pub struct PaymentPayload {
     pub status: String,
     pub payer: Option<String>,
     pub confirmed_height: Option<u64>,
+    /// On-chain confirmation depth at confirm time; `None` on a received event.
+    pub confirmations: Option<u64>,
 }
 
 /// The full webhook payload (the JSON body).
@@ -113,6 +116,41 @@ impl WebhookPayload {
                 status: "received".into(),
                 payer,
                 confirmed_height: None,
+                confirmations: None,
+            },
+            invoice_id,
+            order_ref,
+            user_id,
+        }
+    }
+
+    /// Build a `payment.confirmed` payload with a fresh idempotency key. Fired
+    /// once the paying kernel reaches `GP_CONFIRMATIONS` confirmations (the
+    /// invoice `paid` -> `confirmed` transition). `confirmed_height` is the
+    /// block the kernel landed at and `confirmations` its depth at that time.
+    #[allow(clippy::too_many_arguments)]
+    pub fn confirmed(
+        slate_id: String,
+        amount: u64,
+        payer: Option<String>,
+        invoice_id: Option<String>,
+        order_ref: Option<String>,
+        user_id: Option<String>,
+        confirmed_height: Option<u64>,
+        confirmations: u64,
+    ) -> WebhookPayload {
+        WebhookPayload {
+            event_id: ids::random_id(),
+            event_type: "payment.confirmed".into(),
+            created_at: now_iso8601(),
+            payment: PaymentPayload {
+                slate_id,
+                amount,
+                amount_grin: nanogrin_to_grin(amount),
+                status: "confirmed".into(),
+                payer,
+                confirmed_height,
+                confirmations: Some(confirmations),
             },
             invoice_id,
             order_ref,
@@ -308,6 +346,29 @@ mod tests {
             sig,
             "sha256=f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
         );
+    }
+
+    #[test]
+    fn confirmed_payload_shape() {
+        let p = WebhookPayload::confirmed(
+            "slate-9".into(),
+            2_000_000_000,
+            Some("payerhex".into()),
+            Some("inv-9".into()),
+            Some("order-9".into()),
+            None,
+            Some(3_900_123),
+            10,
+        );
+        assert_eq!(p.event_type, "payment.confirmed");
+        assert_eq!(p.payment.status, "confirmed");
+        assert_eq!(p.payment.amount_grin, "2");
+        assert_eq!(p.payment.confirmed_height, Some(3_900_123));
+        assert_eq!(p.payment.confirmations, Some(10));
+        // The serialized body carries the additive fields.
+        let body = p.to_body();
+        assert!(body.contains("\"event_type\":\"payment.confirmed\""));
+        assert!(body.contains("\"confirmations\":10"));
     }
 
     #[test]

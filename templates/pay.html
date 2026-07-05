@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-{% if is_open %}<meta http-equiv="refresh" content="10">{% endif %}
+{% if is_open || is_paid %}<meta http-equiv="refresh" content="10">{% endif %}
 <title>Pay with Goblin (GRIN)</title>
 <link rel="stylesheet" href="/static/style.css">
 </head>
@@ -13,9 +13,12 @@
   <h1>Pay with Goblin</h1>
   <p class="amount">{{ info.amount_display }}</p>
 
-  {% if is_paid %}
+  {% if is_confirmed %}
     <p class="status paid">Paid &#10003;</p>
-    <p class="hint">This invoice has been settled. You can close this page.</p>
+    <p class="hint">Confirmed on chain ({{ confirmations }} of {{ confirmations_required }} confirmations). This invoice is settled. You can close this page.</p>
+  {% else if is_paid %}
+    <p class="status confirming">Payment received &#10003;</p>
+    <p class="hint">Confirming on chain: {{ confirmations }} of {{ confirmations_required }} confirmations&#8230; This page updates automatically.</p>
   {% else if is_expired %}
     <p class="status expired">This invoice has expired.</p>
   {% else %}

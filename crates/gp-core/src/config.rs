@@ -227,6 +227,11 @@ pub struct Config {
     /// = off): if a live fetch fails, a cached rate this recent is served
     /// rather than failing the checkout.
     pub rate_stale_max: i64,
+    /// On-chain confirmation depth at which an invoice is final
+    /// (`GP_CONFIRMATIONS`, default 10). Once the paying kernel reaches this
+    /// many confirmations the invoice advances `paid` -> `confirmed`. Must be
+    /// >= 1.
+    pub confirmations_required: i64,
 }
 
 /// Default supported fiat currency when `GP_RATE_CURRENCIES` is unset.
@@ -235,6 +240,10 @@ pub const DEFAULT_RATE_CURRENCY: &str = "usd";
 pub const DEFAULT_RATE_CACHE_TTL: i64 = 60;
 /// Default quote lock window (seconds).
 pub const DEFAULT_QUOTE_TTL: i64 = 900;
+/// Default on-chain confirmation depth at which a payment counts as final
+/// (house standard). An invoice advances `paid` -> `confirmed` once its
+/// kernel reaches this many confirmations.
+pub const DEFAULT_CONFIRMATIONS: i64 = 10;
 
 /// Sentinel `qr_logo` value selecting the inlined Goblin mark
 /// (`GP_QR_LOGO=builtin`, opt-in; the default is a plain QR). Kept out of the
@@ -277,6 +286,7 @@ impl Default for Config {
             rate_cache_ttl: DEFAULT_RATE_CACHE_TTL,
             quote_ttl: DEFAULT_QUOTE_TTL,
             rate_stale_max: 0,
+            confirmations_required: DEFAULT_CONFIRMATIONS,
         }
     }
 }
@@ -411,6 +421,7 @@ impl Config {
         let rate_cache_ttl = parse_i64(get, "GP_RATE_CACHE_TTL", DEFAULT_RATE_CACHE_TTL)?;
         let quote_ttl = parse_i64(get, "GP_QUOTE_TTL", DEFAULT_QUOTE_TTL)?;
         let rate_stale_max = parse_i64(get, "GP_RATE_STALE_MAX", 0)?;
+        let confirmations_required = parse_i64(get, "GP_CONFIRMATIONS", DEFAULT_CONFIRMATIONS)?;
 
         let cfg = Config {
             bind,
@@ -446,6 +457,7 @@ impl Config {
             rate_cache_ttl,
             quote_ttl,
             rate_stale_max,
+            confirmations_required,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -522,6 +534,9 @@ impl Config {
         if self.rate_stale_max < 0 {
             return Err("GP_RATE_STALE_MAX must be >= 0 (0 = off)".into());
         }
+        if self.confirmations_required < 1 {
+            return Err("GP_CONFIRMATIONS must be >= 1".into());
+        }
         Ok(())
     }
 
@@ -537,7 +552,7 @@ impl Config {
              webhook_secret={} qr_logo={} merchant_npub={} notify_merchant_dm={} \
              notify_payer_receipt={} endpub_rotate_interval={} endpub_overlap_epochs={} \
              rate_source={} rate_currencies={:?} rate_cache_ttl={} quote_ttl={} \
-             rate_stale_max={}",
+             rate_stale_max={} confirmations_required={}",
             self.bind,
             match &self.tls {
                 Tls::Off => "off".to_string(),
@@ -577,6 +592,7 @@ impl Config {
             self.rate_cache_ttl,
             self.quote_ttl,
             self.rate_stale_max,
+            self.confirmations_required,
         )
     }
 }
@@ -890,6 +906,24 @@ mod tests {
         assert_eq!(cfg.rate_cache_ttl, 30);
         assert_eq!(cfg.quote_ttl, 600);
         assert_eq!(cfg.rate_stale_max, 1800);
+    }
+
+    #[test]
+    fn confirmations_default_is_ten_and_overridable() {
+        // House standard: 10 confirmations by default.
+        let cfg = load(&[]).unwrap();
+        assert_eq!(cfg.confirmations_required, DEFAULT_CONFIRMATIONS);
+        assert_eq!(cfg.confirmations_required, 10);
+
+        let cfg = load(&[("GP_CONFIRMATIONS", "3")]).unwrap();
+        assert_eq!(cfg.confirmations_required, 3);
+    }
+
+    #[test]
+    fn confirmations_must_be_at_least_one() {
+        assert!(load(&[("GP_CONFIRMATIONS", "0")]).is_err());
+        assert!(load(&[("GP_CONFIRMATIONS", "-1")]).is_err());
+        assert!(load(&[("GP_CONFIRMATIONS", "notanumber")]).is_err());
     }
 
     #[test]

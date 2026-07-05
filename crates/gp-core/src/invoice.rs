@@ -7,9 +7,14 @@
 //! amount matching) or a per-invoice derived child (matching mode 2); only the
 //! public key is stored, the child secret is recomputed on demand.
 //!
-//! Lifecycle: `open` -> `paid` (a received payment matched it) or `expired`
-//! (its expiry passed while still open). Expiry is evaluated lazily on read
-//! and by a periodic sweep, never by a background per-invoice timer.
+//! Lifecycle: `open` -> `paid` (a received payment matched it) -> `confirmed`
+//! (the paying kernel reached `GP_CONFIRMATIONS` on-chain confirmations), or
+//! `expired` (its expiry passed while still open). `paid` remains a real,
+//! backward-compatible state; `confirmed` is additive. Expiry is evaluated
+//! lazily on read and by a periodic sweep, never by a background per-invoice
+//! timer; the `paid` -> `confirmed` transition is driven by the confirmation
+//! poll (see gp-server::payments), which advances the invoice once its paying
+//! payment's kernel crosses the configured depth.
 
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -23,8 +28,11 @@ use crate::{derive, ids};
 pub enum InvoiceStatus {
     /// Awaiting a matching payment.
     Open,
-    /// A received payment matched this invoice.
+    /// A received payment matched this invoice (funds in hand, not yet final).
     Paid,
+    /// The paying kernel reached `GP_CONFIRMATIONS` on-chain confirmations.
+    /// The final, settled state; reached only from `paid`.
+    Confirmed,
     /// Expiry passed before a payment matched.
     Expired,
 }
@@ -34,6 +42,7 @@ impl InvoiceStatus {
         match self {
             InvoiceStatus::Open => "open",
             InvoiceStatus::Paid => "paid",
+            InvoiceStatus::Confirmed => "confirmed",
             InvoiceStatus::Expired => "expired",
         }
     }
@@ -41,6 +50,7 @@ impl InvoiceStatus {
     pub fn parse(s: &str) -> InvoiceStatus {
         match s {
             "paid" => InvoiceStatus::Paid,
+            "confirmed" => InvoiceStatus::Confirmed,
             "expired" => InvoiceStatus::Expired,
             _ => InvoiceStatus::Open,
         }
@@ -115,6 +125,9 @@ pub struct Invoice {
     pub quote_rate: Option<String>,
     /// The oracle source the quote came from (e.g. `coingecko`), else NULL.
     pub quote_source: Option<String>,
+    /// When the invoice crossed the confirmation threshold (paid -> confirmed),
+    /// else NULL.
+    pub confirmed_at: Option<String>,
 }
 
 impl Invoice {
@@ -232,7 +245,7 @@ pub async fn create(
 
 const COLUMNS: &str = "id, ref, expected_amount, expiry, status, created_at, token, memo, \
      recipient_pubkey, fiat_amount, fiat_currency, match_mode, paid_payment_id, paid_at, \
-     quote_rate, quote_source";
+     quote_rate, quote_source, confirmed_at";
 
 /// Fetch an invoice by id, marking it expired first if its expiry has passed.
 pub async fn get(pool: &SqlitePool, id: &str) -> Result<Option<Invoice>, sqlx::Error> {
@@ -290,6 +303,39 @@ pub async fn mark_paid(
     .execute(pool)
     .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// Mark an invoice confirmed: the terminal `paid` -> `confirmed` transition,
+/// driven by the confirmation poll once the paying kernel reaches the
+/// configured depth. Idempotent: only a `paid` invoice transitions, so a
+/// replayed threshold crossing (or a second poll pass) is a no-op and returns
+/// `false`. Never touches `open` or `expired` invoices.
+pub async fn mark_confirmed(pool: &SqlitePool, invoice_id: &str) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE invoice SET status = 'confirmed', \
+         confirmed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') \
+         WHERE id = ?1 AND status = 'paid'",
+    )
+    .bind(invoice_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// The live confirmation depth of the payment that paid this invoice (the
+/// count the confirmation poll last recorded on that payment), or 0 when the
+/// invoice is unpaid or its kernel has not yet landed. This is the value the
+/// status APIs expose as `confirmations`.
+pub async fn confirmations(pool: &SqlitePool, invoice_id: &str) -> Result<i64, sqlx::Error> {
+    let n: Option<i64> = sqlx::query_scalar(
+        "SELECT p.confirmations FROM invoice i \
+         JOIN payment p ON p.slate_id = i.paid_payment_id \
+         WHERE i.id = ?1",
+    )
+    .bind(invoice_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(n.unwrap_or(0))
 }
 
 /// Sweep: mark every open invoice whose expiry has passed as expired.
@@ -426,5 +472,60 @@ mod tests {
         let fetched = get(&pool, &inv.id).await.unwrap().unwrap();
         assert_eq!(fetched.status(), InvoiceStatus::Paid);
         assert_eq!(fetched.paid_payment_id.as_deref(), Some("pay-1"));
+    }
+
+    #[test]
+    fn status_string_roundtrips_confirmed() {
+        assert_eq!(InvoiceStatus::Confirmed.as_str(), "confirmed");
+        assert_eq!(InvoiceStatus::parse("confirmed"), InvoiceStatus::Confirmed);
+        // Backward compatibility: the existing states are untouched.
+        assert_eq!(InvoiceStatus::parse("paid"), InvoiceStatus::Paid);
+        assert_eq!(InvoiceStatus::parse("open"), InvoiceStatus::Open);
+        assert_eq!(InvoiceStatus::parse("expired"), InvoiceStatus::Expired);
+    }
+
+    #[tokio::test]
+    async fn mark_confirmed_only_transitions_from_paid() {
+        let pool = pool().await;
+        let inv = create(&pool, grin(10), &MASTER, MASTER_PUB, MatchMode::Memo)
+            .await
+            .unwrap();
+        // An open invoice does not confirm.
+        assert!(!mark_confirmed(&pool, &inv.id).await.unwrap());
+        assert_eq!(
+            get(&pool, &inv.id).await.unwrap().unwrap().status(),
+            InvoiceStatus::Open
+        );
+
+        // Paid -> confirmed transitions exactly once.
+        assert!(mark_paid(&pool, &inv.id, "pay-1").await.unwrap());
+        assert!(mark_confirmed(&pool, &inv.id).await.unwrap());
+        let fetched = get(&pool, &inv.id).await.unwrap().unwrap();
+        assert_eq!(fetched.status(), InvoiceStatus::Confirmed);
+        assert!(fetched.confirmed_at.is_some());
+        // Idempotent: a replay is a no-op.
+        assert!(!mark_confirmed(&pool, &inv.id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn confirmations_reads_the_paying_payments_depth() {
+        let pool = pool().await;
+        let inv = create(&pool, grin(10), &MASTER, MASTER_PUB, MatchMode::Memo)
+            .await
+            .unwrap();
+        // Unpaid: no paying payment, so zero.
+        assert_eq!(confirmations(&pool, &inv.id).await.unwrap(), 0);
+
+        // A payment with a recorded confirmation depth, linked as the payer.
+        sqlx::query(
+            "INSERT INTO payment (id, amount, slate_id, status, confirmations, created_at) \
+             VALUES ('pay-1', 10, 'pay-1', 'confirmed', 4, \
+                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        mark_paid(&pool, &inv.id, "pay-1").await.unwrap();
+        assert_eq!(confirmations(&pool, &inv.id).await.unwrap(), 4);
     }
 }

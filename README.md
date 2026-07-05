@@ -63,6 +63,51 @@ mandatory baseline.
 Supporting directories: `migrations/` (raw sqlx SQL), `templates/` (Askama,
 zero JS), `static/` (one hand-written CSS file, no build step).
 
+## Setup (recommended path)
+
+The fastest way to stand up a till is the built-in wizard. Install the binary
+and unit (`deploy/install.sh` does this and then offers to run the wizard for
+you), then:
+
+```
+sudo gp-server setup
+```
+
+It asks five questions, each with a default:
+
+1. the public URL customers reach this till at,
+2. your shop's website URL (used to build the webhook URL),
+3. the Grin seed: press Enter to generate a fresh till seed (shown once, write
+   it down) or paste an existing 24 words,
+4. the currencies your shop prices in (default `usd`),
+5. an advanced yes/no for the grin1/Tor rail (default no).
+
+Everything else it does for you:
+
+- generates the wallet password, the API token, the admin token, and the
+  webhook secret (you never invent or type a secret);
+- creates the encrypted wallet on the spot from the seed, so the seed is
+  consumed once and never lives in the service environment afterwards (it
+  exists only encrypted at rest and in your written backup);
+- probes a curated list of healthy mainnet Grin nodes and picks the first that
+  answers, falling back automatically;
+- defaults the relays to an external vetted pool (the wallet's proven relays);
+- writes `/etc/goblinpay.env` (mode 0640, holds the config plus the bearer
+  tokens) and `/etc/goblinpay/secrets/wallet_password` (mode 0400), exactly
+  where the shipped `gp-server.service` looks (`EnvironmentFile` +
+  `LoadCredential`);
+- prints the webhook URL and the three values to paste into WooCommerce
+  (GoblinPay URL, API Token, Webhook Secret) plus the private admin token.
+
+Re-running is safe: the wizard refuses to overwrite an existing wallet or config
+unless you pass `--reconfigure` (which keeps the existing seed and password and
+only rewrites the config/tokens). Flags: `--reconfigure`, `--prefix DIR` (write
+under a prefix instead of `/`), `--node URL` (skip the node probe), `--batch`
+(read scripted answers from a non-terminal stdin).
+
+The env-var reference below is the advanced path for operators who want to
+configure GoblinPay by hand; the wizard hides all of it.
+
 ## Configuration
 
 Everything is environment variables, defaults are safe for local use.
@@ -301,15 +346,33 @@ Both the WooCommerce and Medusa connectors act on the `payment.confirmed`
 webhook idempotently: they complete the order if it is not already complete,
 and otherwise just note the confirmation.
 
+Quick starts and the integrator guide live in `docs/`:
+
+- [`docs/woocommerce-quickstart.md`](docs/woocommerce-quickstart.md) - install
+  the plugin, run `gp-server setup`, paste three values, test a payment.
+- [`docs/medusa-quickstart.md`](docs/medusa-quickstart.md) - the same for a
+  Medusa v2 store (note: set `GP_WEBHOOK_URL` to the Medusa route after setup).
+- [`docs/api-integration.md`](docs/api-integration.md) - integrate directly
+  (the way magick.market does): your service calls create-invoice, the customer
+  pays the till wallet-to-till over the encrypted Nostr rail (no coins pass
+  through the API or your service), and you grant on confirmed status. Covers
+  `POST /invoice`, `GET /invoice/{id}`, bearer auth, and the `payment.confirmed`
+  webhook payload + retry semantics.
+
 Refunds are unsupported/manual everywhere (GoblinPay is receive-only).
 
 ## Deploy
 
 `deploy/` holds a reproducible deployment: a hardened systemd unit
-(`gp-server.service`) with `deploy/install.sh` for bare metal, and a
-`docker-compose.yml` that brings up the server, the bundled relay, and an
-auto-HTTPS Caddy proxy. CI (`.github` / `.gitea` workflows) runs fmt, clippy,
-and tests. See `deploy/` for details.
+(`gp-server.service`) with `deploy/install.sh` for bare metal (which ends by
+offering to run `gp-server setup`), and a `docker-compose.yml` that brings up
+the server, the bundled relay, and an auto-HTTPS Caddy proxy. CI (`.github` /
+`.gitea` workflows) runs fmt, clippy, and tests. See `deploy/` for details.
+
+`deploy/package-woocommerce.sh` builds `goblinpay-woocommerce.zip` (a single
+top-level `goblinpay-woocommerce/` folder) for a WooCommerce release, so the
+shop owner's step is Upload Plugin -> Activate -> paste the three values the
+wizard printed.
 
 ## Credits
 

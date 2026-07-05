@@ -57,7 +57,7 @@
           <p class="hint">Open your Grin wallet, import this invoice, and pay it. The response returns to us automatically over Tor, no copy-paste back needed.</p>
           {% if let Some(pack_qr) = info.invoice_slatepack_qr_svg %}<div class="qr">{{ pack_qr|safe }}</div>{% endif %}
           <label for="invoice-slatepack">Invoice slatepack</label>
-          <textarea id="invoice-slatepack" class="copybox" rows="6" readonly>{{ pack }}</textarea>
+          <textarea id="invoice-slatepack" class="copybox" rows="7" readonly>{{ pack }}</textarea>
         </div>
         {% endif %}
 

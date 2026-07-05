@@ -3,8 +3,10 @@
 A self-hostable, receive-only Grin payment server. A merchant runs it, a
 customer pays from Goblin Wallet by scanning a QR code, and the payment
 travels as a gift-wrapped slatepack over Nostr. GoblinPay auto-receives,
-returns the S2 reply so the payer can
-finalize, confirms the transaction on chain, and signals paid.
+returns the S2 reply so the payer can finalize, then confirms the
+transaction on chain. An invoice moves through three states: `open` ->
+`paid` (the payment has been received) -> `confirmed` (the paying kernel
+reaches the house standard of 10 confirmations, set by `GP_CONFIRMATIONS`).
 
 Beyond the core wallet + transport + on-chain confirmation path, GoblinPay
 carries the full merchant surface:
@@ -16,20 +18,18 @@ carries the full merchant surface:
   runs inside the ingest pipeline, so a gift-wrapped payment resolves to its
   invoice automatically.
 - **Hosted checkout:** a zero-JS `/pay/<token>` page (server-rendered
-  Askama + one CSS file + a server-generated QR SVG at ECC level H with an
-  optional GoblinPay-mark center logo) with live status via
-  `<meta http-equiv=refresh>`. It offers two first-class ways to pay:
+  Askama + one CSS file + a server-generated QR SVG at ECC level H) with a
+  GoblinPay wordmark header and live status via `<meta http-equiv=refresh>`.
+  The QR is plain by default; a center logo can be overlaid opt-in via
+  `GP_QR_LOGO`. As a payment settles, the page shows its live confirmation
+  progress ("Confirming n of 10"). It offers two ways to pay:
   - **Goblin Wallet (Nostr):** scan the `nprofile` QR (or copy it) and the
     payment auto-receives over Nostr.
-  - **Slatepack (`grin1`):** pay from any Grin wallet, no Nostr needed. The
-    page shows the wallet's stable index-0 Slatepack address (`grin1...`) plus
-    its QR and the exact amount to send. The payer sends that amount to the
-    address using their wallet's Slatepack/file method, pastes the resulting S1
-    into the page (offline `receive_tx`), then copies the returned S2 back into
-    their wallet to finalize and broadcast it. There is no Tor listener; the
-    `grin1` address is stable and reused across invoices, and the existing
-    invoice matcher and on-chain confirmation handle the received payment like
-    any other. The Slatepack option only appears when a wallet is loaded.
+  - **Slatepack (manual paste):** an address-less offline fallback, no Nostr
+    needed. Create an S1 for the invoice amount in any Grin wallet, paste it
+    into the page (offline `receive_tx`), then copy the returned S2 back into
+    your wallet to finalize and broadcast it. The existing invoice matcher and
+    on-chain confirmation handle the received payment like any other.
 
   The same renderer serves embedded and hosted use.
 - **Per-user endpubs:** an admin assigns one receiving identity per user
@@ -79,9 +79,10 @@ Everything is environment variables, defaults are safe for local use.
 | `GP_CHAIN` | `mainnet` | Grin network: `mainnet` or `testnet` |
 | `GP_RELAY_MODE` | `bundled` | `bundled` (GoblinPay runs its own co-located relay) or `external` |
 | `GP_BUNDLED_RELAY_URL` | `ws://127.0.0.1:7777` | In `bundled` mode, the self-contained relay GoblinPay dials AND advertises in the checkout `nprofile`; set to the relay's public `wss://` URL in production |
-| `GP_RELAYS` | unset | Extra relay URLs (comma separated): redundancy in `bundled` mode, the whole set in `external` mode |
+| `GP_RELAYS` | `relay.floonet.dev, relay.0xchat.com, offchain.pub` | Relay URLs (comma separated): redundancy in `bundled` mode, the whole set in `external` mode. Ships defaulted to the live wallet relay pool |
 | `GP_INGEST` | `on` | Nostr ingest service (`off` = HTTP surface only, for debugging) |
-| `GP_CHECKOUT_METHODS` | `nostr,slatepack` | Which payment methods the hosted `/pay/<token>` page shows: comma list of `nostr` (Goblin Wallet) and `slatepack` (`grin1`). Unset = both. Unknown tokens are ignored; an empty result falls back to both |
+| `GP_CHECKOUT_METHODS` | `nostr,slatepack` | Which payment methods the hosted `/pay/<token>` page shows: comma list of `nostr` (Goblin Wallet) and `slatepack` (manual paste). Unset = both. Unknown tokens are ignored; an empty result falls back to both |
+| `GP_CONFIRMATIONS` | `10` | House standard: on-chain depth the paying kernel must reach before an invoice flips from `paid` to `confirmed` |
 | `GP_MATCH_MODE` | `memo` | Default matching mode: `memo`, `derived`, `amount` |
 | `GP_MNEMONIC` | unset | Grin seed mnemonic (money secret) |
 | `GP_WALLET_PASSWORD` | unset | Password encrypting the wallet seed and the Nostr identity at rest |
@@ -108,8 +109,8 @@ Everything is environment variables, defaults are safe for local use.
 
 `GP_CHECKOUT_METHODS` only controls what the hosted `/pay/<token>` page
 advertises to a payer; it does not turn any payment processing on or off. The
-Slatepack (`grin1`) method also needs a loaded wallet to appear, so an enabled
-method that cannot work is simply hidden. Keep this consistent with `GP_INGEST`:
+Slatepack method also needs a loaded wallet to appear (it runs `receive_tx`), so
+an enabled method that cannot work is simply hidden. Keep this consistent with `GP_INGEST`:
 `GP_INGEST` runs the Nostr ingest service that actually receives and matches
 Goblin Wallet payments, so `GP_INGEST=off` with `GP_CHECKOUT_METHODS=nostr`
 would advertise a Nostr method that nothing is listening for. If you disable
@@ -177,9 +178,9 @@ variant works for `GP_API_TOKEN`, `GP_ADMIN_TOKEN`, and `GP_WEBHOOK_SECRET` too.
 | POST | `/invoice` | api | Create an invoice, returns checkout info (pay_url, nprofile, QR SVG) |
 | GET | `/invoice/{id}` | api | Invoice checkout info + status |
 | GET | `/pay/{token}` | token | Hosted zero-JS checkout page |
-| GET | `/pay/{token}/status` | token | Invoice status JSON (for polling) |
+| GET | `/pay/{token}/status` | token | Invoice status JSON (for polling); includes `confirmations` and `confirmations_required` |
 | POST | `/pay/{token}/slatepack` | token | Manual fallback: paste S1, returns the S2 page |
-| GET | `/payment/{id}` | token | Payment status JSON |
+| GET | `/payment/{id}` | token | Payment status JSON; includes `confirmations` and `confirmations_required` |
 | GET | `/payment/{id}/receipt` | token | Server-signed verifiable receipt |
 | GET | `/admin` | admin | Dashboard (payments, balances, config) |
 | GET | `/admin/payments` | admin | Recent payments JSON |
@@ -193,7 +194,11 @@ variant works for `GP_API_TOKEN`, `GP_ADMIN_TOKEN`, and `GP_WEBHOOK_SECRET` too.
 
 ## Webhook contract
 
-On a received payment, GoblinPay POSTs `application/json` to `GP_WEBHOOK_URL`:
+GoblinPay POSTs `application/json` to `GP_WEBHOOK_URL` twice over a payment's
+life: `payment.received` when the payment first lands (status `received`), then
+`payment.confirmed` once the paying kernel reaches `GP_CONFIRMATIONS` depth
+(status `confirmed`, with `confirmed_height` populated). Both share the same
+envelope:
 
 ```json
 {
@@ -231,9 +236,14 @@ curl http://127.0.0.1:8080/health
 Store integrations live under `connectors/` and all speak the same
 create-invoice + signed-webhook contract:
 
-- `connectors/woocommerce` — a WordPress/WooCommerce gateway (classic + Blocks).
-- `connectors/medusa` — a Medusa v2 payment-module provider.
+- `connectors/woocommerce` - a WordPress/WooCommerce gateway (classic + Blocks),
+  with a GoblinPay wordmark in the admin panel.
+- `connectors/medusa` - a Medusa v2 payment-module provider.
 - The generic REST connector is built in: `POST /invoice` plus the webhook.
+
+Both the WooCommerce and Medusa connectors act on the `payment.confirmed`
+webhook idempotently: they complete the order if it is not already complete,
+and otherwise just note the confirmation.
 
 Refunds are unsupported/manual everywhere (GoblinPay is receive-only).
 

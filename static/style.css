@@ -80,7 +80,8 @@ label { display: block; font-size: 0.85rem; color: var(--dim); margin: 0.75rem 0
 }
 
 button {
-  margin-top: 0.75rem;
+  display: block;
+  margin: 0.75rem auto 0;
   background: var(--accent);
   color: #201d09;
   border: 0;

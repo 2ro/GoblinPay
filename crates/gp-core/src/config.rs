@@ -232,6 +232,16 @@ pub struct Config {
     /// many confirmations the invoice advances `paid` -> `confirmed`. Must be
     /// >= 1.
     pub confirmations_required: i64,
+    /// Arm the native grin1 payment rail (`GP_GRIN1_RAIL`, default on). When on
+    /// and a wallet is loaded, an exact-amount invoice also issues a Grin
+    /// invoice slate (the "pay with any Grin wallet" primary path) and the Tor
+    /// foreign endpoint is served. Off (or with no wallet) the invoice flow is
+    /// not armed and only the existing rails show.
+    pub grin1_rail: bool,
+    /// Loopback port the Grin Foreign API v2 (`/v2/foreign`) binds, which the
+    /// onion service proxies to (`GP_GRIN1_FOREIGN_PORT`, default 3416). Only
+    /// used when `grin1_rail` is on.
+    pub grin1_foreign_port: u16,
 }
 
 /// Default supported fiat currency when `GP_RATE_CURRENCIES` is unset.
@@ -244,6 +254,9 @@ pub const DEFAULT_QUOTE_TTL: i64 = 900;
 /// (house standard). An invoice advances `paid` -> `confirmed` once its
 /// kernel reaches this many confirmations.
 pub const DEFAULT_CONFIRMATIONS: i64 = 10;
+/// Default loopback port for the Grin Foreign API v2 the onion service proxies
+/// to. 3416 sits just past the stock wallet listener (3415) / owner (3420).
+pub const DEFAULT_GRIN1_FOREIGN_PORT: u16 = 3416;
 
 /// Sentinel `qr_logo` value selecting the inlined Goblin mark
 /// (`GP_QR_LOGO=builtin`, opt-in; the default is a plain QR). Kept out of the
@@ -287,6 +300,8 @@ impl Default for Config {
             quote_ttl: DEFAULT_QUOTE_TTL,
             rate_stale_max: 0,
             confirmations_required: DEFAULT_CONFIRMATIONS,
+            grin1_rail: true,
+            grin1_foreign_port: DEFAULT_GRIN1_FOREIGN_PORT,
         }
     }
 }
@@ -422,6 +437,14 @@ impl Config {
         let quote_ttl = parse_i64(get, "GP_QUOTE_TTL", DEFAULT_QUOTE_TTL)?;
         let rate_stale_max = parse_i64(get, "GP_RATE_STALE_MAX", 0)?;
         let confirmations_required = parse_i64(get, "GP_CONFIRMATIONS", DEFAULT_CONFIRMATIONS)?;
+        let grin1_rail = parse_bool(get, "GP_GRIN1_RAIL", true)?;
+        let grin1_foreign_port = match get("GP_GRIN1_FOREIGN_PORT") {
+            None => DEFAULT_GRIN1_FOREIGN_PORT,
+            Some(v) => v
+                .trim()
+                .parse::<u16>()
+                .map_err(|_| format!("GP_GRIN1_FOREIGN_PORT must be a port 1-65535 (got `{v}`)"))?,
+        };
 
         let cfg = Config {
             bind,
@@ -458,6 +481,8 @@ impl Config {
             quote_ttl,
             rate_stale_max,
             confirmations_required,
+            grin1_rail,
+            grin1_foreign_port,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -552,7 +577,7 @@ impl Config {
              webhook_secret={} qr_logo={} merchant_npub={} notify_merchant_dm={} \
              notify_payer_receipt={} endpub_rotate_interval={} endpub_overlap_epochs={} \
              rate_source={} rate_currencies={:?} rate_cache_ttl={} quote_ttl={} \
-             rate_stale_max={} confirmations_required={}",
+             rate_stale_max={} confirmations_required={} grin1_rail={} grin1_foreign_port={}",
             self.bind,
             match &self.tls {
                 Tls::Off => "off".to_string(),
@@ -593,6 +618,8 @@ impl Config {
             self.quote_ttl,
             self.rate_stale_max,
             self.confirmations_required,
+            if self.grin1_rail { "on" } else { "off" },
+            self.grin1_foreign_port,
         )
     }
 }
@@ -917,6 +944,21 @@ mod tests {
 
         let cfg = load(&[("GP_CONFIRMATIONS", "3")]).unwrap();
         assert_eq!(cfg.confirmations_required, 3);
+    }
+
+    #[test]
+    fn grin1_rail_defaults_on_and_overridable() {
+        let cfg = load(&[]).unwrap();
+        assert!(cfg.grin1_rail, "grin1 rail on by default");
+        assert_eq!(cfg.grin1_foreign_port, DEFAULT_GRIN1_FOREIGN_PORT);
+
+        let cfg = load(&[("GP_GRIN1_RAIL", "off"), ("GP_GRIN1_FOREIGN_PORT", "3999")]).unwrap();
+        assert!(!cfg.grin1_rail);
+        assert_eq!(cfg.grin1_foreign_port, 3999);
+
+        assert!(load(&[("GP_GRIN1_RAIL", "yes")]).is_err());
+        assert!(load(&[("GP_GRIN1_FOREIGN_PORT", "notaport")]).is_err());
+        assert!(load(&[("GP_GRIN1_FOREIGN_PORT", "70000")]).is_err());
     }
 
     #[test]

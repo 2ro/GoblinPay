@@ -128,6 +128,14 @@ pub struct Invoice {
     /// When the invoice crossed the confirmation threshold (paid -> confirmed),
     /// else NULL.
     pub confirmed_at: Option<String>,
+    /// Payment rail: `None` (Nostr-only / legacy) or `Some("grin1")` when the
+    /// native Grin invoice flow is armed for this invoice.
+    pub rail: Option<String>,
+    /// The issued I1 invoice-slate UUID (grin1 rail); the settlement key a
+    /// returning finalize is matched on. `None` off the grin1 rail.
+    pub slate_id: Option<String>,
+    /// The armored I1 invoice slatepack the pay page renders (grin1 rail).
+    pub slatepack: Option<String>,
 }
 
 impl Invoice {
@@ -245,7 +253,17 @@ pub async fn create(
 
 const COLUMNS: &str = "id, ref, expected_amount, expiry, status, created_at, token, memo, \
      recipient_pubkey, fiat_amount, fiat_currency, match_mode, paid_payment_id, paid_at, \
-     quote_rate, quote_source, confirmed_at";
+     quote_rate, quote_source, confirmed_at, rail, slate_id, slatepack";
+
+/// The grin1 rail marker value stored in `invoice.rail`.
+pub const RAIL_GRIN1: &str = "grin1";
+
+impl Invoice {
+    /// Whether this invoice is armed on the native grin1 invoice-flow rail.
+    pub fn is_grin1(&self) -> bool {
+        self.rail.as_deref() == Some(RAIL_GRIN1)
+    }
+}
 
 /// Fetch an invoice by id, marking it expired first if its expiry has passed.
 pub async fn get(pool: &SqlitePool, id: &str) -> Result<Option<Invoice>, sqlx::Error> {
@@ -303,6 +321,77 @@ pub async fn mark_paid(
     .execute(pool)
     .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// Arm an invoice on the grin1 rail: record the issued I1 slate id and its
+/// armored slatepack, and mark the invoice `rail = 'grin1'`. Called right after
+/// the till wallet issues the invoice slate at creation.
+pub async fn attach_grin1(
+    pool: &SqlitePool,
+    invoice_id: &str,
+    slate_id: &str,
+    slatepack: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE invoice SET rail = ?2, slate_id = ?3, slatepack = ?4 WHERE id = ?1",
+    )
+    .bind(invoice_id)
+    .bind(RAIL_GRIN1)
+    .bind(slate_id)
+    .bind(slatepack)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Fetch a grin1-rail invoice by its issued I1 slate id (the settlement key a
+/// returning finalize is matched on). Does not touch expiry lazily: settlement
+/// is decided against the invoice's live status by the caller.
+pub async fn get_by_slate_id(
+    pool: &SqlitePool,
+    slate_id: &str,
+) -> Result<Option<Invoice>, sqlx::Error> {
+    let sql = format!("SELECT {COLUMNS} FROM invoice WHERE slate_id = ?1");
+    sqlx::query_as::<_, Invoice>(&sql)
+        .bind(slate_id)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Render gate for the plain-send fallback panel (Phase 3, no jitter). The
+/// plain-send `grin1` address matches by exact amount, so two OPEN grin1
+/// invoices sharing an `expected_amount` would be ambiguous. The gate lets only
+/// the *earliest* open grin1 invoice for a given amount render the plain-send
+/// panel; a newer collision hides it (the invoice-flow panel always shows).
+///
+/// Returns `true` when `invoice` may render the plain-send panel: it is grin1,
+/// has a positive exact amount, and no earlier open grin1 invoice holds the
+/// same amount. An amountless invoice never shows plain-send (nothing to match).
+pub async fn plain_send_allowed(pool: &SqlitePool, invoice: &Invoice) -> Result<bool, sqlx::Error> {
+    if !invoice.is_grin1() {
+        return Ok(false);
+    }
+    let Some(amount) = invoice.expected_amount else {
+        return Ok(false);
+    };
+    if amount <= 0 {
+        return Ok(false);
+    }
+    // Any earlier-inserted open grin1 invoice with the same amount claims the
+    // plain-send panel; the newer collision hides it. Order by SQLite rowid
+    // (monotonic with insertion), which reflects true creation order even when
+    // `created_at` (second resolution) ties.
+    let earlier: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM invoice \
+         WHERE rail = ?1 AND status = 'open' AND expected_amount = ?2 AND id <> ?3 \
+           AND rowid < (SELECT rowid FROM invoice WHERE id = ?3)",
+    )
+    .bind(RAIL_GRIN1)
+    .bind(amount)
+    .bind(&invoice.id)
+    .fetch_one(pool)
+    .await?;
+    Ok(earlier == 0)
 }
 
 /// Mark an invoice confirmed: the terminal `paid` -> `confirmed` transition,
@@ -505,6 +594,85 @@ mod tests {
         assert!(fetched.confirmed_at.is_some());
         // Idempotent: a replay is a no-op.
         assert!(!mark_confirmed(&pool, &inv.id).await.unwrap());
+    }
+
+    async fn open_grin1(pool: &SqlitePool, nano: u64) -> Invoice {
+        let inv = create(pool, grin(nano), &MASTER, MASTER_PUB, MatchMode::Amount)
+            .await
+            .unwrap();
+        attach_grin1(pool, &inv.id, &format!("slate-{}", inv.id), "BEGINSLATEPACK.x.ENDSLATEPACK.")
+            .await
+            .unwrap();
+        get(pool, &inv.id).await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn attach_grin1_arms_the_rail_and_is_lookupable_by_slate() {
+        let pool = pool().await;
+        let inv = open_grin1(&pool, 1_000_000_000).await;
+        assert!(inv.is_grin1());
+        assert_eq!(inv.slate_id.as_deref(), Some(format!("slate-{}", inv.id).as_str()));
+        assert!(inv.slatepack.as_deref().unwrap().starts_with("BEGINSLATEPACK"));
+
+        let by_slate = get_by_slate_id(&pool, &format!("slate-{}", inv.id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_slate.id, inv.id);
+    }
+
+    #[tokio::test]
+    async fn render_gate_shows_plain_send_only_for_the_earliest_amount_collision() {
+        let pool = pool().await;
+        // First open grin1 invoice for 2 GRIN: plain-send allowed.
+        let first = open_grin1(&pool, 2_000_000_000).await;
+        assert!(plain_send_allowed(&pool, &first).await.unwrap());
+
+        // A second open grin1 invoice at the SAME amount: gate hides its panel,
+        // the first still shows.
+        let second = open_grin1(&pool, 2_000_000_000).await;
+        assert!(!plain_send_allowed(&pool, &second).await.unwrap());
+        assert!(plain_send_allowed(&pool, &first).await.unwrap());
+
+        // A different amount is unaffected.
+        let other = open_grin1(&pool, 3_000_000_000).await;
+        assert!(plain_send_allowed(&pool, &other).await.unwrap());
+
+        // Once the first is no longer open, the second becomes the earliest.
+        mark_paid(&pool, &first.id, "pay-x").await.unwrap();
+        let second = get(&pool, &second.id).await.unwrap().unwrap();
+        assert!(plain_send_allowed(&pool, &second).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn plain_send_gate_off_rail_and_amountless_is_false() {
+        let pool = pool().await;
+        // A non-grin1 invoice never shows plain-send.
+        let plain = create(&pool, grin(5), &MASTER, MASTER_PUB, MatchMode::Amount)
+            .await
+            .unwrap();
+        assert!(!plain_send_allowed(&pool, &plain).await.unwrap());
+
+        // A grin1 invoice with no expected amount never shows plain-send.
+        let p = NewInvoice {
+            order_ref: None,
+            amount: AmountSpec::Fiat {
+                amount: "9.99".into(),
+                currency: "USD".into(),
+            },
+            memo: None,
+            match_mode: None,
+            expiry_secs: None,
+        };
+        let inv = create(&pool, p, &MASTER, MASTER_PUB, MatchMode::Amount)
+            .await
+            .unwrap();
+        attach_grin1(&pool, &inv.id, "slate-amountless", "BEGINSLATEPACK.x.ENDSLATEPACK.")
+            .await
+            .unwrap();
+        let inv = get(&pool, &inv.id).await.unwrap().unwrap();
+        assert!(inv.is_grin1() && inv.expected_amount.is_none());
+        assert!(!plain_send_allowed(&pool, &inv).await.unwrap());
     }
 
     #[tokio::test]

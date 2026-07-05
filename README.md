@@ -83,6 +83,8 @@ Everything is environment variables, defaults are safe for local use.
 | `GP_INGEST` | `on` | Nostr ingest service (`off` = HTTP surface only, for debugging) |
 | `GP_CHECKOUT_METHODS` | `nostr,slatepack` | Which payment methods the hosted `/pay/<token>` page shows: comma list of `nostr` (Goblin Wallet) and `slatepack` (manual paste). Unset = both. Unknown tokens are ignored; an empty result falls back to both |
 | `GP_CONFIRMATIONS` | `10` | House standard: on-chain depth the paying kernel must reach before an invoice flips from `paid` to `confirmed` |
+| `GP_GRIN1_RAIL` | `off` | Operator opt-in grin1/Tor rail. `on` = the till also accepts payments from any Grin wallet over Tor: an onion service (identity = the till's grin1 slatepack address key, so grin1 address == onion address) serves the Grin Foreign API v2, invoices carry a native Grin invoice slatepack, and the pay page gains a two-rail switcher (Goblin stays the default tab). Off/unset = Goblin/Nostr only, byte-for-byte the pre-rail behavior |
+| `GP_GRIN1_FOREIGN_PORT` | `3416` | Loopback port the Foreign API v2 binds; the onion service proxies `onion:80` to it (only used with `GP_GRIN1_RAIL=on`) |
 | `GP_MATCH_MODE` | `memo` | Default matching mode: `memo`, `derived`, `amount` |
 | `GP_MNEMONIC` | unset | Grin seed mnemonic (money secret) |
 | `GP_WALLET_PASSWORD` | unset | Password encrypting the wallet seed and the Nostr identity at rest |

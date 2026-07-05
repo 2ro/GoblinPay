@@ -269,7 +269,7 @@ impl Invoice {
 pub async fn get(pool: &SqlitePool, id: &str) -> Result<Option<Invoice>, sqlx::Error> {
     expire_if_due_id(pool, id).await?;
     let sql = format!("SELECT {COLUMNS} FROM invoice WHERE id = ?1");
-    sqlx::query_as::<_, Invoice>(&sql)
+    sqlx::query_as::<_, Invoice>(sqlx::AssertSqlSafe(sql))
         .bind(id)
         .fetch_optional(pool)
         .await
@@ -288,7 +288,7 @@ pub async fn get_by_token(pool: &SqlitePool, token: &str) -> Result<Option<Invoi
     .execute(pool)
     .await?;
     let sql = format!("SELECT {COLUMNS} FROM invoice WHERE token = ?1");
-    sqlx::query_as::<_, Invoice>(&sql)
+    sqlx::query_as::<_, Invoice>(sqlx::AssertSqlSafe(sql))
         .bind(token)
         .fetch_optional(pool)
         .await
@@ -298,7 +298,7 @@ pub async fn get_by_token(pool: &SqlitePool, token: &str) -> Result<Option<Invoi
 pub async fn list(pool: &SqlitePool, limit: i64) -> Result<Vec<Invoice>, sqlx::Error> {
     expire_due(pool).await?;
     let sql = format!("SELECT {COLUMNS} FROM invoice ORDER BY created_at DESC LIMIT ?1");
-    sqlx::query_as::<_, Invoice>(&sql)
+    sqlx::query_as::<_, Invoice>(sqlx::AssertSqlSafe(sql))
         .bind(limit)
         .fetch_all(pool)
         .await
@@ -352,7 +352,7 @@ pub async fn get_by_slate_id(
     slate_id: &str,
 ) -> Result<Option<Invoice>, sqlx::Error> {
     let sql = format!("SELECT {COLUMNS} FROM invoice WHERE slate_id = ?1");
-    sqlx::query_as::<_, Invoice>(&sql)
+    sqlx::query_as::<_, Invoice>(sqlx::AssertSqlSafe(sql))
         .bind(slate_id)
         .fetch_optional(pool)
         .await

@@ -28,13 +28,17 @@
     {% let has_grin = info.invoice_slatepack.is_some() || info.slatepack_address.is_some() %}
 
     <div class="rails">
-      {% if has_goblin %}<input class="rail-radio" type="radio" name="rail" id="rail-goblin" checked>{% endif %}
-      {% if has_grin %}<input class="rail-radio" type="radio" name="rail" id="rail-grin"{% if !has_goblin %} checked{% endif %}>{% endif %}
-
+      {% if has_goblin && has_grin %}
+      {# The CSS-only switcher appears only when both rails are available; the
+         Goblin rail is the default-selected tab. A single available rail
+         renders its panel directly, with no switcher chrome at all. #}
+      <input class="rail-radio" type="radio" name="rail" id="rail-goblin" checked>
+      <input class="rail-radio" type="radio" name="rail" id="rail-grin">
       <div class="rail-tabs">
-        {% if has_goblin %}<label class="rail-tab" for="rail-goblin">Pay with Goblin</label>{% endif %}
-        {% if has_grin %}<label class="rail-tab" for="rail-grin">Pay with any Grin wallet</label>{% endif %}
+        <label class="rail-tab" for="rail-goblin">Pay with Goblin</label>
+        <label class="rail-tab" for="rail-grin">Pay with any Grin wallet</label>
       </div>
+      {% endif %}
 
       {% if has_goblin %}
       <section class="rail-panel" id="panel-goblin">
@@ -78,7 +82,7 @@
   {% endif %}
 
   {% if let Some(memo) = info.memo %}<p class="memo">{{ memo }}</p>{% endif %}
-  <p class="footer">Powered by GoblinPay &middot; receive-only Grin over Nostr and Tor</p>
+  <p class="footer">Powered by GoblinPay &middot; receive-only Grin over Nostr{% if info.invoice_slatepack.is_some() || info.slatepack_address.is_some() %} and Tor{% endif %}</p>
 </main>
 </body>
 </html>

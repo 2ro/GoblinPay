@@ -232,11 +232,14 @@ pub struct Config {
     /// many confirmations the invoice advances `paid` -> `confirmed`. Must be
     /// >= 1.
     pub confirmations_required: i64,
-    /// Arm the native grin1 payment rail (`GP_GRIN1_RAIL`, default on). When on
-    /// and a wallet is loaded, an exact-amount invoice also issues a Grin
-    /// invoice slate (the "pay with any Grin wallet" primary path) and the Tor
-    /// foreign endpoint is served. Off (or with no wallet) the invoice flow is
-    /// not armed and only the existing rails show.
+    /// Arm the native grin1 payment rail (`GP_GRIN1_RAIL`, packaged default
+    /// OFF, owner ruling). Off (or unset), GoblinPay behaves exactly as before
+    /// the rail existed: no Tor onion service or arti bootstrap, no loopback
+    /// Foreign API listener, no invoice slates issued, and the pay page shows
+    /// ONLY the "Pay with Goblin" (Nostr) method. On (and with a wallet
+    /// loaded), an exact-amount invoice also issues a Grin invoice slate, the
+    /// onion service + Foreign endpoint start, and the pay page gains the
+    /// two-rail switcher ("Pay with Goblin" stays the default tab).
     pub grin1_rail: bool,
     /// Loopback port the Grin Foreign API v2 (`/v2/foreign`) binds, which the
     /// onion service proxies to (`GP_GRIN1_FOREIGN_PORT`, default 3416). Only
@@ -300,7 +303,7 @@ impl Default for Config {
             quote_ttl: DEFAULT_QUOTE_TTL,
             rate_stale_max: 0,
             confirmations_required: DEFAULT_CONFIRMATIONS,
-            grin1_rail: true,
+            grin1_rail: false,
             grin1_foreign_port: DEFAULT_GRIN1_FOREIGN_PORT,
         }
     }
@@ -437,7 +440,9 @@ impl Config {
         let quote_ttl = parse_i64(get, "GP_QUOTE_TTL", DEFAULT_QUOTE_TTL)?;
         let rate_stale_max = parse_i64(get, "GP_RATE_STALE_MAX", 0)?;
         let confirmations_required = parse_i64(get, "GP_CONFIRMATIONS", DEFAULT_CONFIRMATIONS)?;
-        let grin1_rail = parse_bool(get, "GP_GRIN1_RAIL", true)?;
+        // Packaged default OFF (owner ruling): the grin1/Tor rail is operator
+        // opt-in; unset behaves exactly like the pre-rail server.
+        let grin1_rail = parse_bool(get, "GP_GRIN1_RAIL", false)?;
         let grin1_foreign_port = match get("GP_GRIN1_FOREIGN_PORT") {
             None => DEFAULT_GRIN1_FOREIGN_PORT,
             Some(v) => v
@@ -947,13 +952,18 @@ mod tests {
     }
 
     #[test]
-    fn grin1_rail_defaults_on_and_overridable() {
+    fn grin1_rail_defaults_off_and_is_operator_opt_in() {
+        // Packaged default OFF (owner ruling): unset and explicit off both
+        // behave like the pre-rail server; only an explicit `on` arms it.
         let cfg = load(&[]).unwrap();
-        assert!(cfg.grin1_rail, "grin1 rail on by default");
+        assert!(!cfg.grin1_rail, "grin1 rail must default OFF");
         assert_eq!(cfg.grin1_foreign_port, DEFAULT_GRIN1_FOREIGN_PORT);
 
-        let cfg = load(&[("GP_GRIN1_RAIL", "off"), ("GP_GRIN1_FOREIGN_PORT", "3999")]).unwrap();
+        let cfg = load(&[("GP_GRIN1_RAIL", "off")]).unwrap();
         assert!(!cfg.grin1_rail);
+
+        let cfg = load(&[("GP_GRIN1_RAIL", "on"), ("GP_GRIN1_FOREIGN_PORT", "3999")]).unwrap();
+        assert!(cfg.grin1_rail);
         assert_eq!(cfg.grin1_foreign_port, 3999);
 
         assert!(load(&[("GP_GRIN1_RAIL", "yes")]).is_err());

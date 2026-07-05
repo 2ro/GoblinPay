@@ -92,6 +92,10 @@ fn routes(cfg: &mut web::ServiceConfig) {
 /// fast on misconfiguration. Returns the identity keys (for receipts + invoice
 /// derivation) and a clone of the wallet (for the manual-slatepack handler).
 async fn start_ingest(cfg: &Config, pool: sqlx::SqlitePool) -> (Keys, GpWallet) {
+    // Init-once: whether the encrypted seed already exists decides if the
+    // mnemonic is still needed. Check before opening (open creates it on first
+    // run), so we can nudge the operator to remove a now-redundant seed.
+    let was_initialized = GpWallet::seed_path(std::path::Path::new(&cfg.data_dir)).exists();
     let wallet = match GpWallet::open(cfg) {
         Ok(wallet) => wallet,
         Err(e) => {
@@ -99,6 +103,15 @@ async fn start_ingest(cfg: &Config, pool: sqlx::SqlitePool) -> (Keys, GpWallet) 
             std::process::exit(2);
         }
     };
+    if was_initialized && cfg.mnemonic.is_some() {
+        eprintln!(
+            "warning: the wallet at {} is already initialized, so GP_MNEMONIC is \
+             no longer needed. Remove it (and GP_MNEMONIC_FILE) so the seed is not \
+             present in this service's environment on every boot; keep only \
+             GP_WALLET_PASSWORD. The seed lives encrypted at rest in the data dir.",
+            cfg.data_dir
+        );
+    }
     match wallet.slatepack_address() {
         Ok(addr) => println!("wallet ready (slatepack address {addr})"),
         Err(e) => {

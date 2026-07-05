@@ -317,6 +317,23 @@ impl GpWallet {
         Ok(d_skey.to_bytes())
     }
 
+    /// Decode a slatepack (plain or encrypted to our address) just far enough
+    /// to route it: returns `(slate_id, state)` where state is the compact
+    /// slate-state name ("S1", "I2", ...). No wallet state is touched; the
+    /// pay page's paste form uses this to send an S1 to the receive path and
+    /// an I2 (the invoice response arriving by browser instead of onion) to
+    /// the finalize path.
+    pub fn slatepack_kind(&self, armor: &str) -> Result<(String, String), WalletError> {
+        let slate = owner::slate_from_slatepack_message(
+            self.instance.clone(),
+            self.mask.as_ref(),
+            armor.trim().to_string(),
+            vec![0],
+        )
+        .map_err(|e| WalletError::Slatepack(format!("cannot read slatepack: {e}")))?;
+        Ok((slate.id.to_string(), slate.state.to_string()))
+    }
+
     /// Receive a payment: parse the S1 slatepack (plain or encrypted to our
     /// address), run `receive_tx` (offline), and return the S2 reply armor.
     pub fn receive_slatepack(&self, s1_armor: &str) -> Result<Received, WalletError> {
@@ -802,6 +819,40 @@ mod tests {
     fn bad_slatepack_address_is_rejected() {
         assert!(slatepack_address_pubkey("grin1notanaddress").is_err());
         assert!(slatepack_address_pubkey("").is_err());
+    }
+
+    #[test]
+    fn slatepack_kind_identifies_state_and_id() {
+        // Synthetic armored slates (no node needed): the paste-form router
+        // must see the slate id and compact state name, and reject garbage.
+        let dir = TempDir::new("kind");
+        let wallet = open(&dir, &random_mnemonic()).unwrap();
+
+        let armor_of = |state: SlateState, invoice: bool| {
+            let mut slate = grin_wallet_libwallet::Slate::blank(2, invoice);
+            slate.state = state;
+            let armor = owner::create_slatepack_message(
+                wallet.instance.clone(),
+                wallet.mask.as_ref(),
+                &slate,
+                Some(0),
+                vec![],
+            )
+            .unwrap();
+            (slate.id.to_string(), armor)
+        };
+
+        let (id, armor) = armor_of(SlateState::Invoice2, true);
+        let (got_id, got_state) = wallet.slatepack_kind(&armor).unwrap();
+        assert_eq!(got_id, id);
+        assert_eq!(got_state, "I2");
+
+        let (id, armor) = armor_of(SlateState::Standard1, false);
+        let (got_id, got_state) = wallet.slatepack_kind(&armor).unwrap();
+        assert_eq!(got_id, id);
+        assert_eq!(got_state, "S1");
+
+        assert!(wallet.slatepack_kind("BEGINSLATEPACK. nope. ENDSLATEPACK.").is_err());
     }
 
     #[test]

@@ -54,7 +54,7 @@
         {% if let Some(pack) = info.invoice_slatepack %}
         <div class="grin-sub">
           <h3>Grin invoice</h3>
-          <p class="hint">Open your Grin wallet, import this invoice, and pay it. The response returns to us automatically over Tor, no copy-paste back needed.</p>
+          <p class="hint">Open your Grin wallet, import this invoice, and pay it. The response returns to us automatically over Tor, no copy-paste back needed. If your wallet cannot send the response automatically, paste it in the box below.</p>
           {% if let Some(pack_qr) = info.invoice_slatepack_qr_svg %}<div class="qr">{{ pack_qr|safe }}</div>{% endif %}
           <label for="invoice-slatepack">Invoice slatepack</label>
           <textarea id="invoice-slatepack" class="copybox" rows="11" readonly>{{ pack }}</textarea>
@@ -68,14 +68,21 @@
           {% if let Some(grin1_qr) = info.slatepack_qr_svg %}<div class="qr">{{ grin1_qr|safe }}</div>{% endif %}
           <label for="grin1">Slatepack address (grin1)</label>
           <textarea id="grin1" class="copybox" rows="3" readonly>{{ grin1 }}</textarea>
+        </div>
+        {% endif %}
+
+        {# The manual fallback for BOTH grin sub-rails: a plain-send S1 is
+           received here, and an invoice response (I2) is finalized here when
+           the payer's wallet cannot reach us over Tor. #}
+        <div class="grin-sub">
+          <h3>Paste a slatepack</h3>
           <form method="post" action="/pay/{{ info.token }}/slatepack">
-            <label for="s1">Your slatepack (S1)</label>
+            <label for="s1">Your slatepack</label>
             <textarea id="s1" name="slatepack" rows="6" required
               placeholder="BEGINSLATEPACK. &#8230; ENDSLATEPACK."></textarea>
             <button type="submit">Submit slatepack</button>
           </form>
         </div>
-        {% endif %}
       </section>
       {% endif %}
     </div>

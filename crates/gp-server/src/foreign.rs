@@ -195,7 +195,7 @@ async fn finalize_tx(
 }
 
 /// The (url, secret) webhook pair when one is configured.
-fn webhook_pair(cfg: &Config) -> Option<(String, String)> {
+pub(crate) fn webhook_pair(cfg: &Config) -> Option<(String, String)> {
     match (cfg.webhook_url.clone(), cfg.webhook_secret.as_ref()) {
         (Some(url), Some(secret)) => Some((url, secret.reveal().to_string())),
         _ => None,
@@ -210,7 +210,7 @@ fn webhook_pair(cfg: &Config) -> Option<(String, String)> {
 /// The ledger amount is the invoice's own expected amount, never the slate's:
 /// an invoice-flow I2 carries a zeroed amount (the payer zeroes it), so the
 /// slate is not a trustworthy amount source here.
-async fn settle_finalized(
+pub(crate) async fn settle_finalized(
     pool: &SqlitePool,
     finalized: &FinalizedInvoice,
     webhook: Option<&(String, String)>,

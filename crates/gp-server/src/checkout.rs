@@ -332,7 +332,57 @@ struct ManualForm {
     slatepack: String,
 }
 
-/// POST /pay/{token}/slatepack: offline receive of a pasted S1, rendering S2.
+/// Where a pasted slatepack goes (GRIM-parity manual fallback: every rail is
+/// completable by copy-paste when the automatic Tor path fails).
+#[derive(Debug, PartialEq, Eq)]
+enum PasteRoute {
+    /// A plain-send S1: the existing offline receive path.
+    ReceiveS1,
+    /// The invoice response (I2) for THIS invoice, arriving by browser
+    /// instead of onion: finalize + post + settle by slate id.
+    FinalizeI2,
+    /// Neither: a clean, human-readable rejection.
+    Reject(String),
+}
+
+/// Route a decoded paste. Pure so the decision is unit-testable: `state` is
+/// the compact slate-state name ("S1"/"I2"/...), `slate_id` the pasted slate's
+/// id, `inv` the invoice whose pay page received the paste.
+fn route_paste(state: &str, slate_id: &str, inv: &Invoice) -> PasteRoute {
+    match state {
+        "S1" => PasteRoute::ReceiveS1,
+        "I2" => {
+            if inv.status() != InvoiceStatus::Open {
+                // Already settled (possibly by the Tor return of this same
+                // slate racing the paste): nothing to do, never settle twice.
+                return PasteRoute::Reject(
+                    "This invoice has already been paid or is no longer open; \
+                     nothing more to submit."
+                        .into(),
+                );
+            }
+            if inv.is_grin1() && inv.slate_id.as_deref() == Some(slate_id) {
+                PasteRoute::FinalizeI2
+            } else {
+                PasteRoute::Reject(
+                    "That looks like an invoice response, but it does not belong to \
+                     this invoice. Check you pasted the response for the invoice on \
+                     this page."
+                        .into(),
+                )
+            }
+        }
+        other => PasteRoute::Reject(format!(
+            "That slatepack is in state {other}; expected a payment (S1) or an \
+             invoice response (I2)."
+        )),
+    }
+}
+
+/// POST /pay/{token}/slatepack: the dual-purpose paste form. A plain-send S1
+/// runs the offline receive and renders the S2 to copy back; an invoice
+/// response (I2) matching this invoice's slate id is finalized + posted here
+/// (the manual fallback for a payer wallet that cannot reach the onion).
 async fn manual_slatepack(
     path: web::Path<String>,
     form: web::Form<ManualForm>,
@@ -359,41 +409,97 @@ async fn manual_slatepack(
         });
     };
 
-    // Offline receive_tx (no node), exactly the wallet path the Nostr flow
-    // uses. Then persist + match + webhook via the shared helper, so a manual
-    // payment lands in the ledger like any other.
-    let s1 = form.slatepack.trim().to_string();
-    let page = match wallet.receive_slatepack(&s1) {
-        Ok(received) => {
-            let webhook = match (cfg.webhook_url.clone(), cfg.webhook_secret.as_ref()) {
-                (Some(url), Some(secret)) => Some((url, secret.reveal().to_string())),
-                _ => None,
-            };
-            crate::record::persist_and_match(
-                pool.get_ref(),
-                &received,
-                None,
-                inv.recipient_pubkey.as_deref().unwrap_or_default(),
-                inv.order_ref.as_deref(),
-                cfg.match_mode,
-                webhook.as_ref(),
-            )
-            .await;
-            PayResultPage {
-                token,
-                ok: true,
-                message: "Payment received. Copy the response slatepack below back into your \
-                          wallet to finalize and post it to the chain."
-                    .into(),
-                s2_armor: received.s2_armor,
-            }
-        }
-        Err(e) => PayResultPage {
+    let armor = form.slatepack.trim().to_string();
+    let route = match wallet.slatepack_kind(&armor) {
+        Ok((slate_id, state)) => route_paste(&state, &slate_id, &inv),
+        Err(e) => PasteRoute::Reject(format!("That slatepack could not be read: {e}")),
+    };
+
+    let page = match route {
+        PasteRoute::Reject(message) => PayResultPage {
             token,
             ok: false,
-            message: format!("That slatepack could not be received: {e}"),
+            message,
             s2_armor: String::new(),
         },
+        PasteRoute::ReceiveS1 => {
+            // Offline receive_tx (no node), exactly the wallet path the Nostr
+            // flow uses; persist + match + webhook via the shared helper.
+            match wallet.receive_slatepack(&armor) {
+                Ok(received) => {
+                    let webhook = crate::foreign::webhook_pair(cfg.get_ref());
+                    crate::record::persist_and_match(
+                        pool.get_ref(),
+                        &received,
+                        None,
+                        inv.recipient_pubkey.as_deref().unwrap_or_default(),
+                        inv.order_ref.as_deref(),
+                        cfg.match_mode,
+                        webhook.as_ref(),
+                    )
+                    .await;
+                    PayResultPage {
+                        token,
+                        ok: true,
+                        message: "Payment received. Copy the response slatepack below back \
+                                  into your wallet to finalize and post it to the chain."
+                            .into(),
+                        s2_armor: received.s2_armor,
+                    }
+                }
+                Err(e) => PayResultPage {
+                    token,
+                    ok: false,
+                    message: format!("That slatepack could not be received: {e}"),
+                    s2_armor: String::new(),
+                },
+            }
+        }
+        PasteRoute::FinalizeI2 => {
+            // Same payload the onion endpoint would get, arriving by browser:
+            // finalize from our stored context, post the tx (blocking node
+            // I/O, so off the async workers), then settle by slate id. The
+            // settle is idempotent (payment id + open->paid transition) and a
+            // replayed finalize fails cleanly in the wallet (context already
+            // deleted), so racing the Tor return cannot double-settle or
+            // double-post.
+            let w = wallet.clone();
+            let a = armor.clone();
+            let finalized =
+                actix_web::rt::task::spawn_blocking(move || w.finalize_invoice_slatepack(&a))
+                    .await;
+            match finalized {
+                Ok(Ok(finalized)) => {
+                    let webhook = crate::foreign::webhook_pair(cfg.get_ref());
+                    crate::foreign::settle_finalized(pool.get_ref(), &finalized, webhook.as_ref())
+                        .await;
+                    PayResultPage {
+                        token,
+                        ok: true,
+                        message: "Invoice response received: the payment has been finalized \
+                                  and posted to the chain. Nothing more to paste; this page \
+                                  will show confirmations as they arrive."
+                            .into(),
+                        s2_armor: String::new(),
+                    }
+                }
+                Ok(Err(e)) => PayResultPage {
+                    token,
+                    ok: false,
+                    message: format!("That invoice response could not be finalized: {e}"),
+                    s2_armor: String::new(),
+                },
+                Err(e) => {
+                    error!("manual finalize task panicked: {e}");
+                    PayResultPage {
+                        token,
+                        ok: false,
+                        message: "Internal error while finalizing; please try again.".into(),
+                        s2_armor: String::new(),
+                    }
+                }
+            }
+        }
     };
     render(page)
 }
@@ -438,6 +544,60 @@ mod tests {
             rail: None,
             slate_id: None,
             slatepack: None,
+        }
+    }
+
+    /// An open grin1-rail invoice fixture with an issued slate id.
+    fn grin1_invoice(slate_id: &str) -> Invoice {
+        let mut inv = invoice(Some(1_000_000_000), None);
+        inv.rail = Some("grin1".into());
+        inv.slate_id = Some(slate_id.to_string());
+        inv.slatepack = Some("BEGINSLATEPACK.i1.ENDSLATEPACK.".into());
+        inv
+    }
+
+    #[test]
+    fn paste_router_sends_each_rail_to_its_path() {
+        let inv = grin1_invoice("slate-abc");
+        // A plain-send S1 always goes to the existing receive path.
+        assert_eq!(route_paste("S1", "any-id", &inv), PasteRoute::ReceiveS1);
+        // The invoice response with the matching slate id finalizes.
+        assert_eq!(route_paste("I2", "slate-abc", &inv), PasteRoute::FinalizeI2);
+        // An I2 for a DIFFERENT slate is rejected with a human message.
+        match route_paste("I2", "slate-other", &inv) {
+            PasteRoute::Reject(m) => assert!(m.contains("does not belong"), "{m}"),
+            other => panic!("expected reject, got {other:?}"),
+        }
+        // An I2 pasted on a non-grin1 invoice is rejected.
+        let plain = invoice(Some(1), None);
+        match route_paste("I2", "slate-abc", &plain) {
+            PasteRoute::Reject(m) => assert!(m.contains("does not belong"), "{m}"),
+            other => panic!("expected reject, got {other:?}"),
+        }
+        // Any other slate state is rejected, naming the state.
+        match route_paste("S2", "any-id", &inv) {
+            PasteRoute::Reject(m) => assert!(m.contains("state S2"), "{m}"),
+            other => panic!("expected reject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn paste_router_never_settles_a_non_open_invoice_twice() {
+        // The double-settle guard: once the Tor return (or a first paste) has
+        // flipped the invoice paid, a racing paste of the SAME slate is
+        // rejected before any wallet call, so it cannot double-settle or
+        // double-post. (The deeper backstops are settle_finalized's
+        // open->paid idempotency and the wallet deleting the context on the
+        // first finalize.)
+        for status in ["paid", "confirmed", "expired"] {
+            let mut inv = grin1_invoice("slate-abc");
+            inv.status = status.into();
+            match route_paste("I2", "slate-abc", &inv) {
+                PasteRoute::Reject(m) => {
+                    assert!(m.contains("already been paid"), "{status}: {m}")
+                }
+                other => panic!("{status}: expected reject, got {other:?}"),
+            }
         }
     }
 

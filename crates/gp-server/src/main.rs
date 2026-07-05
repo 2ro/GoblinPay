@@ -12,7 +12,7 @@ use gp_nostr::{KeyDirectory, Keys};
 use gp_server::directory::{self, DbKeyDirectory};
 use gp_server::ingest::WalletReceiver;
 use gp_server::payments::{self, ReceiptSigner};
-use gp_server::{admin, checkout, invoices, webhookd};
+use gp_server::{admin, checkout, foreign, invoices, webhookd};
 use gp_wallet::GpWallet;
 
 /// Landing page ("GoblinPay").
@@ -250,6 +250,38 @@ async fn main() -> io::Result<()> {
     let receipt_signer = ReceiptSigner(signer);
     let cfg_data = web::Data::new(cfg.clone());
     let wallet_data = web::Data::new(wallet_opt);
+
+    // grin1 rail (Phase 1): the Grin Foreign API v2 on loopback, which the onion
+    // service proxies (onion:80 -> 127.0.0.1:<port>). Only started when the rail
+    // is armed and a wallet is loaded; a stock Grin sender's receive/finalize
+    // lands here. The onion transport itself is provisioned at deploy time (see
+    // deploy/ and the grim tor.rs port); the wallet's index-0 slatepack address
+    // key IS the onion identity, so grin1 address == onion address.
+    if cfg.grin1_rail {
+        if wallet_data.get_ref().is_some() {
+            let foreign_bind = format!("127.0.0.1:{}", cfg.grin1_foreign_port);
+            let pool_f = pool.clone();
+            let cfg_f = cfg_data.clone();
+            let wallet_f = wallet_data.clone();
+            match HttpServer::new(move || {
+                App::new()
+                    .app_data(web::Data::new(pool_f.clone()))
+                    .app_data(cfg_f.clone())
+                    .app_data(wallet_f.clone())
+                    .configure(foreign::configure)
+            })
+            .bind(&foreign_bind)
+            {
+                Ok(srv) => {
+                    println!("grin1 Foreign API v2 listening on http://{foreign_bind}/v2/foreign");
+                    actix_web::rt::spawn(srv.run());
+                }
+                Err(e) => eprintln!("grin1 Foreign API bind {foreign_bind} failed: {e}"),
+            }
+        } else {
+            println!("grin1 rail armed but no wallet loaded: Foreign API not started");
+        }
+    }
     // The conversion-rate oracle (M7): shared across workers, prices fiat
     // invoices at create time over DIRECT HTTP (never Nym).
     let oracle_data = web::Data::new(gp_core::rates::Oracle::from_config(&cfg));

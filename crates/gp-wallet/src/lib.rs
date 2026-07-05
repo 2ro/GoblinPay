@@ -42,6 +42,16 @@ use serde::Serialize;
 pub use confirm::{confirm_status, ConfirmStatus};
 pub use proof::{verify_receiver_proof, ReceiverProof};
 
+// Foreign API v2 slate types, re-exported so gp-server's `/v2/foreign`
+// JSON-RPC handler speaks the exact wire shapes stock Grin senders use.
+pub use grin_wallet_libwallet::{Slate, VersionInfo, VersionedSlate};
+
+/// The Foreign API version info (`check_version` JSON-RPC method), byte-shaped
+/// exactly like stock grin-wallet: `{ foreign_api_version, supported_slate_versions }`.
+pub fn check_version() -> VersionInfo {
+    foreign::check_version()
+}
+
 /// The wallet instance type this crate drives (upstream grin-wallet stack).
 type Provider = DefaultLCProvider<'static, HTTPNodeClient, ExtKeychain>;
 type Instance = Arc<Mutex<Box<dyn WalletInst<'static, Provider, HTTPNodeClient, ExtKeychain>>>>;
@@ -483,6 +493,85 @@ impl GpWallet {
         serde_json::to_string(&receiver_proof)
             .map(Some)
             .map_err(|e| WalletError::Wallet(format!("serialize payment proof: {e}")))
+    }
+
+    /// Receive over the Foreign API JSON path (`receive_tx`): run `receive_tx`
+    /// on a slate object (not armor, unlike [`GpWallet::receive_slatepack`]) and
+    /// return the S2 slate in the sender's slate version plus the ledger bundle
+    /// (slate id, amount, kernel excess, optional proof) the caller persists.
+    /// Offline; no node contact.
+    pub fn receive_slate(
+        &self,
+        in_slate: VersionedSlate,
+    ) -> Result<(VersionedSlate, Received), WalletError> {
+        let version = in_slate.version();
+        let slate = Slate::from(in_slate);
+        if slate.state != SlateState::Standard1 {
+            return Err(WalletError::Slatepack(format!(
+                "expected an S1 (standard send) slate, got {:?}",
+                slate.state
+            )));
+        }
+        let amount = slate.amount;
+        let s2 = {
+            let mut w_lock = self.instance.lock();
+            let lc = w_lock.lc_provider()?;
+            let w = lc.wallet_inst()?;
+            foreign::receive_tx(&mut **w, self.mask.as_ref(), &slate, None, false)?
+        };
+        let kernel_excess = self.slate_kernel_excess(slate.id)?;
+        let proof = self.build_proof(&s2, amount, &kernel_excess)?;
+        // Armor stored for reply-recovery parity with the Nostr path; the JSON
+        // sender already holds the S2 it gets back below.
+        let s2_armor = owner::create_slatepack_message(
+            self.instance.clone(),
+            self.mask.as_ref(),
+            &s2,
+            Some(0),
+            vec![],
+        )?;
+        let received = Received {
+            slate_id: s2.id.to_string(),
+            amount,
+            s2_armor,
+            kernel_excess,
+            proof,
+        };
+        let out = VersionedSlate::into_version(s2, version)?;
+        Ok((out, received))
+    }
+
+    /// Finalize over the Foreign API JSON path (`finalize_tx`): complete the tx
+    /// from our stored context and POST it (both the invoice-flow I2 and a
+    /// standard S2 are handled by upstream `foreign::finalize_tx`), returning the
+    /// final slate plus the ledger bundle. `FinalizedInvoice::amount` is the
+    /// slate-reported amount, which is 0 for an invoice-flow I2 (the payer zeroes
+    /// it); the settlement side uses the matched invoice's expected amount.
+    pub fn finalize_slate(
+        &self,
+        in_slate: VersionedSlate,
+    ) -> Result<(VersionedSlate, FinalizedInvoice), WalletError> {
+        let version = in_slate.version();
+        let slate = Slate::from(in_slate);
+        let slate_id = slate.id.to_string();
+        let amount = slate.amount;
+        let final_slate = {
+            let mut w_lock = self.instance.lock();
+            let lc = w_lock.lc_provider()?;
+            let w = lc.wallet_inst()?;
+            // post_automatically = true: upstream posts the completed tx for us.
+            foreign::finalize_tx(&mut **w, self.mask.as_ref(), &slate, true)?
+        };
+        let kernel_excess = self.slate_kernel_excess(final_slate.id)?;
+        let out = VersionedSlate::into_version(final_slate, version)?;
+        Ok((
+            out,
+            FinalizedInvoice {
+                slate_id,
+                amount,
+                kernel_excess,
+            },
+        ))
     }
 
     /// Confirmation status for a received payment's kernel, via a DIRECT node

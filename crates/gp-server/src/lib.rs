@@ -6,6 +6,7 @@ pub mod admin;
 pub mod auth;
 pub mod checkout;
 pub mod directory;
+pub mod foreign;
 pub mod ingest;
 pub mod invoices;
 pub mod payments;

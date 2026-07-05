@@ -136,8 +136,9 @@ default. Both are honest about their trade-off:
   hands-on restarts.
 
 Re-running is safe: the wizard refuses to overwrite an existing wallet or config
-unless you pass `--reconfigure` (which keeps the existing seed, password, and
-restart mode and only rewrites the config/tokens — it never re-prompts for them).
+unless you pass `--reconfigure` (which keeps the existing seed and password — the
+money — untouched and never re-prompts for them, only rewriting the config/tokens).
+If you run manual restart mode, re-apply it after a reconfigure.
 Flags: `--reconfigure`, `--prefix DIR` (write under a prefix instead of `/`),
 `--node URL` (skip the node probe), `--batch` (read scripted answers from a
 non-terminal stdin).

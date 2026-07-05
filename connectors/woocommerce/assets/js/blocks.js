@@ -22,14 +22,25 @@
 	var data = getSetting( 'goblinpay_data', {} );
 	var title = decodeEntities( data.title || 'Pay with Grin (GRIN)' );
 	var description = decodeEntities( data.description || '' );
+	var icon = data.icon || '';
 
 	var Content = function () {
 		return createElement( 'div', { className: 'goblinpay-blocks-description' }, description );
 	};
 
+	// Label: the black GoblinPay badge (when present) followed by the method title.
+	var Label = icon
+		? createElement(
+			'span',
+			{ style: { display: 'inline-flex', alignItems: 'center', gap: '0.5em' } },
+			createElement( 'img', { src: icon, alt: 'GoblinPay', style: { height: '22px' } } ),
+			createElement( 'span', null, title )
+		)
+		: createElement( 'span', null, title );
+
 	registerPaymentMethod( {
 		name: 'goblinpay',
-		label: createElement( 'span', null, title ),
+		label: Label,
 		content: createElement( Content, null ),
 		edit: createElement( Content, null ),
 		canMakePayment: function () { return true; },

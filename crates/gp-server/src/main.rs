@@ -66,6 +66,15 @@ async fn goblinpay_wordmark() -> impl Responder {
         .body(include_str!("../../../static/goblinpay-wordmark.svg"))
 }
 
+/// The black GoblinPay badge (goblin mark + "Pay"), Apple Pay style. The
+/// light-surface counterpart to the white wordmark: a compact payment-method
+/// mark for connector checkout rows and light pay-page surfaces.
+async fn goblinpay_badge_black() -> impl Responder {
+    HttpResponse::Ok()
+        .content_type("image/svg+xml")
+        .body(include_str!("../../../static/goblinpay-badge-black.svg"))
+}
+
 /// Route table, shared by `main` and the tests.
 fn routes(cfg: &mut web::ServiceConfig) {
     cfg.route("/", web::get().to(index))
@@ -76,6 +85,10 @@ fn routes(cfg: &mut web::ServiceConfig) {
         .route(
             "/static/goblinpay-wordmark.svg",
             web::get().to(goblinpay_wordmark),
+        )
+        .route(
+            "/static/goblinpay-badge-black.svg",
+            web::get().to(goblinpay_badge_black),
         );
     // Payment status + signed-receipt reads (public-by-token, M4).
     payments::configure(cfg);

@@ -12,7 +12,7 @@ use gp_nostr::{KeyDirectory, Keys};
 use gp_server::directory::{self, DbKeyDirectory};
 use gp_server::ingest::WalletReceiver;
 use gp_server::payments::{self, ReceiptSigner};
-use gp_server::{admin, checkout, foreign, invoices, webhookd};
+use gp_server::{admin, checkout, foreign, invoices, tor, webhookd};
 use gp_wallet::GpWallet;
 
 /// Landing page ("GoblinPay").
@@ -251,12 +251,12 @@ async fn main() -> io::Result<()> {
     let cfg_data = web::Data::new(cfg.clone());
     let wallet_data = web::Data::new(wallet_opt);
 
-    // grin1 rail (Phase 1): the Grin Foreign API v2 on loopback, which the onion
-    // service proxies (onion:80 -> 127.0.0.1:<port>). Only started when the rail
-    // is armed and a wallet is loaded; a stock Grin sender's receive/finalize
-    // lands here. The onion transport itself is provisioned at deploy time (see
-    // deploy/ and the grim tor.rs port); the wallet's index-0 slatepack address
-    // key IS the onion identity, so grin1 address == onion address.
+    // grin1 rail (Phase 1): the Grin Foreign API v2 on loopback, plus the
+    // in-process arti onion service proxying onion:80 -> 127.0.0.1:<port>.
+    // Only started when the rail is armed and a wallet is loaded; a stock Grin
+    // sender's receive/finalize lands here over Tor. The wallet's index-0
+    // slatepack address key IS the onion identity, so grin1 address == onion
+    // address (one key, two encodings).
     if cfg.grin1_rail {
         if let Some(wallet) = wallet_data.get_ref().as_ref() {
             // Expiry sweep: cancel the stored context of expired grin1 invoices
@@ -279,6 +279,34 @@ async fn main() -> io::Result<()> {
                 Ok(srv) => {
                     println!("grin1 Foreign API v2 listening on http://{foreign_bind}/v2/foreign");
                     actix_web::rt::spawn(srv.run());
+
+                    // The onion transport: arti state/keystore under the data
+                    // dir, service identity = the wallet's index-0 address key.
+                    match wallet.slatepack_secret_seed() {
+                        Ok(seed) => {
+                            let onion = tor::onion_address_from_seed(&seed);
+                            println!(
+                                "grin1 onion identity: http://{onion}/v2/foreign \
+                                 (same key as the grin1 slatepack address; bootstrapping tor)"
+                            );
+                            let rx = tor::spawn(
+                                std::path::PathBuf::from(&cfg.data_dir),
+                                seed,
+                                cfg.grin1_foreign_port,
+                            );
+                            // Report the launch outcome without blocking boot.
+                            std::thread::spawn(move || match rx.recv() {
+                                Ok(Ok(addr)) => {
+                                    println!("grin1 onion service running at http://{addr}")
+                                }
+                                Ok(Err(e)) => eprintln!("grin1 onion service failed: {e}"),
+                                Err(_) => {
+                                    eprintln!("grin1 onion service exited before reporting")
+                                }
+                            });
+                        }
+                        Err(e) => eprintln!("grin1: cannot read onion identity key: {e}"),
+                    }
                 }
                 Err(e) => eprintln!("grin1 Foreign API bind {foreign_bind} failed: {e}"),
             }

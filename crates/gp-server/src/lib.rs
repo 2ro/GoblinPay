@@ -11,4 +11,5 @@ pub mod ingest;
 pub mod invoices;
 pub mod payments;
 pub mod record;
+pub mod tor;
 pub mod webhookd;

@@ -52,6 +52,16 @@ pub fn check_version() -> VersionInfo {
     foreign::check_version()
 }
 
+/// Decode a `grin1...` slatepack address into its ed25519 public key bytes
+/// (32), using grin-wallet's own bech32 decoder. This is the same key the
+/// onion service publishes as its identity, so the tor module can prove
+/// grin1 address == onion address.
+pub fn slatepack_address_pubkey(addr: &str) -> Result<[u8; 32], WalletError> {
+    let sp = grin_wallet_libwallet::SlatepackAddress::try_from(addr.trim())
+        .map_err(|e| WalletError::Slatepack(format!("bad slatepack address `{addr}`: {e}")))?;
+    Ok(sp.pub_key.to_bytes())
+}
+
 /// The wallet instance type this crate drives (upstream grin-wallet stack).
 type Provider = DefaultLCProvider<'static, HTTPNodeClient, ExtKeychain>;
 type Instance = Arc<Mutex<Box<dyn WalletInst<'static, Provider, HTTPNodeClient, ExtKeychain>>>>;
@@ -267,6 +277,18 @@ impl GpWallet {
     pub fn slatepack_address(&self) -> Result<String, WalletError> {
         let addr = owner::get_slatepack_address(self.instance.clone(), self.mask.as_ref(), 0)?;
         Ok(addr.to_string())
+    }
+
+    /// The ed25519 SEED of the index-0 slatepack address key (32 bytes). This
+    /// is the onion-service identity for the grin1 rail: the same key behind
+    /// the `grin1` slatepack address is injected into arti's keystore as the
+    /// HsIdKeypair, so grin1 address == onion address (the GRIM pattern).
+    /// Money-adjacent secret: callers hand it straight to the keystore and
+    /// never log or persist it anywhere else.
+    pub fn slatepack_secret_seed(&self) -> Result<[u8; 32], WalletError> {
+        let d_skey =
+            owner::get_slatepack_secret_key(self.instance.clone(), self.mask.as_ref(), 0)?;
+        Ok(d_skey.to_bytes())
     }
 
     /// Receive a payment: parse the S1 slatepack (plain or encrypted to our
@@ -731,6 +753,25 @@ mod tests {
         let wallet = open(&dir, &random_mnemonic()).unwrap();
         let err = wallet.receive_slatepack("BEGINSLATEPACK. nope. ENDSLATEPACK.");
         assert!(matches!(err, Err(WalletError::Slatepack(_))));
+    }
+
+    #[test]
+    fn slatepack_secret_seed_derives_the_address_pubkey() {
+        // The index-0 seed handed to the onion keystore must be the exact key
+        // behind the wallet's grin1 slatepack address (grin1 == onion identity).
+        use ed25519_dalek::{PublicKey as DalekPublicKey, SecretKey as DalekSecretKey};
+        let dir = TempDir::new("seed");
+        let wallet = open(&dir, &random_mnemonic()).unwrap();
+        let seed = wallet.slatepack_secret_seed().unwrap();
+        let derived = DalekPublicKey::from(&DalekSecretKey::from_bytes(&seed).unwrap());
+        let addr_pub = slatepack_address_pubkey(&wallet.slatepack_address().unwrap()).unwrap();
+        assert_eq!(derived.to_bytes(), addr_pub);
+    }
+
+    #[test]
+    fn bad_slatepack_address_is_rejected() {
+        assert!(slatepack_address_pubkey("grin1notanaddress").is_err());
+        assert!(slatepack_address_pubkey("").is_err());
     }
 
     #[test]

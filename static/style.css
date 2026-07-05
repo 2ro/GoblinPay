@@ -112,6 +112,10 @@ details.manual ol { color: var(--dim); font-size: 0.9rem; padding-left: 1.2rem; 
 .rail-tabs { display: flex; gap: 0.4rem; margin-bottom: 1rem; }
 .rail-tab {
   flex: 1; text-align: center; cursor: pointer;
+  /* Center the label within the tab: sibling tabs stretch to equal height, so
+     when one label wraps to two lines the single-line label stays vertically
+     centered instead of hugging the top. */
+  display: flex; align-items: center; justify-content: center;
   padding: 0.55rem 0.5rem; border: 1px solid var(--line); border-radius: var(--radius);
   color: var(--dim); font-size: 0.9rem; font-weight: 600; background: var(--panel);
 }

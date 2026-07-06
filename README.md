@@ -173,7 +173,7 @@ Everything is environment variables, defaults are safe for local use.
 | `GP_CHAIN` | `mainnet` | Grin network: `mainnet` or `testnet` |
 | `GP_RELAY_MODE` | `bundled` | `bundled` (GoblinPay runs its own co-located relay) or `external` |
 | `GP_BUNDLED_RELAY_URL` | `ws://127.0.0.1:7777` | In `bundled` mode, the self-contained relay GoblinPay dials AND advertises in the checkout `nprofile`; set to the relay's public `wss://` URL in production |
-| `GP_RELAYS` | `relay.floonet.dev, relay.0xchat.com, offchain.pub` | Relay URLs (comma separated): redundancy in `bundled` mode, the whole set in `external` mode. Ships defaulted to the live wallet relay pool |
+| `GP_RELAYS` | `relay.floonet.dev, offchain.pub` | Relay URLs (comma separated): redundancy in `bundled` mode, the whole set in `external` mode. The wizard writes this vetted pair; unset in the environment it defaults empty (fine in `bundled` mode, which uses the co-located relay) |
 | `GP_INGEST` | `on` | Nostr ingest service (`off` = HTTP surface only, for debugging) |
 | `GP_CHECKOUT_METHODS` | `nostr,slatepack` | Which payment methods the hosted `/pay/<token>` page shows: comma list of `nostr` (Goblin Wallet) and `slatepack` (manual paste). Unset = both. Unknown tokens are ignored; an empty result falls back to both |
 | `GP_CONFIRMATIONS` | `10` | House standard: on-chain depth the paying kernel must reach before an invoice flips from `paid` to `confirmed` |

@@ -28,6 +28,8 @@
 
 use rand::RngCore;
 
+use crate::config::DEFAULT_BIND;
+
 /// Curated known-good mainnet Grin nodes, in preference order. Every entry was
 /// verified to answer `get_tip` on its `/v2/foreign` endpoint at build time
 /// (2026-07-05, all three reporting the same tip height). GoblinPay only ever
@@ -57,6 +59,12 @@ pub const DEFAULT_CURRENCY: &str = "usd";
 /// webhook receiver at. The wizard turns the operator's shop URL into the full
 /// `GP_WEBHOOK_URL` by appending this.
 pub const WEBHOOK_PATH: &str = "/wp-json/goblinpay/v1/webhook";
+
+/// Where the shipped `gp-server.service` reads its `EnvironmentFile` from, and
+/// where the wizard writes the rendered config. Used both as the wizard's
+/// output path and as the "already configured" signal on a bare `gp-server`
+/// first run (its presence means an operator has set this instance up already).
+pub const DEFAULT_ENV_FILE: &str = "/etc/goblinpay.env";
 
 /// Fill `buf` with cryptographically-secure random bytes (the OS CSPRNG).
 pub fn fill_random(buf: &mut [u8]) {
@@ -144,15 +152,23 @@ impl RestartMode {
     }
 }
 
-/// Parse the restart-mode answer. Pressing Enter (empty) takes the default,
-/// UNATTENDED. Accepts `1`/`u`/`unattended` and `2`/`m`/`manual`
-/// (case-insensitive); anything else falls back to UNATTENDED rather than
-/// trapping the operator.
-pub fn parse_restart_mode(input: &str) -> RestartMode {
+/// Parse the restart-mode answer, falling back to `default` on an empty (Enter)
+/// or unrecognized answer rather than trapping the operator. Accepts
+/// `1`/`u`/`unattended` and `2`/`m`/`manual` (case-insensitive). Reconfigure
+/// passes the till's CURRENT mode as the default so pressing Enter preserves it;
+/// a fresh setup passes UNATTENDED.
+pub fn parse_restart_mode_default(input: &str, default: RestartMode) -> RestartMode {
     match input.trim().to_lowercase().as_str() {
+        "1" | "u" | "unattended" => RestartMode::Unattended,
         "2" | "m" | "manual" => RestartMode::Manual,
-        _ => RestartMode::Unattended,
+        _ => default,
     }
+}
+
+/// Parse the restart-mode answer with the fresh-setup default (UNATTENDED).
+/// Pressing Enter (empty) or an unknown answer takes UNATTENDED.
+pub fn parse_restart_mode(input: &str) -> RestartMode {
+    parse_restart_mode_default(input, RestartMode::Unattended)
 }
 
 /// Parse a seed-acknowledgement answer. Unlike `parse_yes_no`, there is no
@@ -236,6 +252,43 @@ pub fn base_path(public_url: &str) -> String {
     }
 }
 
+/// Normalize an operator-entered listen address: trim surrounding whitespace and
+/// fall back to the loopback default (`127.0.0.1:8080`) on an empty answer, so
+/// pressing Enter is a valid response. The address stays behind the reverse
+/// proxy, so no scheme or validation beyond non-empty is imposed here (the
+/// config layer rejects an empty bind).
+pub fn normalize_bind(input: &str) -> String {
+    let t = input.trim();
+    if t.is_empty() {
+        DEFAULT_BIND.to_string()
+    } else {
+        t.to_string()
+    }
+}
+
+/// Parse a rendered env file (the wizard's own `render_env` output, or an
+/// equivalent hand-written one) into `(KEY, VALUE)` pairs. Blank lines and
+/// `#`-comment lines are skipped; each remaining line is split on the FIRST `=`,
+/// with the key and value trimmed. This lets a bare `gp-server` first run boot
+/// directly from the file the wizard just wrote, without shelling out to a
+/// systemd `EnvironmentFile` reload.
+pub fn parse_env_file(contents: &str) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            let key = key.trim().to_string();
+            if !key.is_empty() {
+                pairs.push((key, value.trim().to_string()));
+            }
+        }
+    }
+    pairs
+}
+
 /// Parse a comma-separated currency answer into lowercased ISO codes, dropping
 /// blanks. An empty answer yields the default (`usd`), so pressing Enter is a
 /// valid response.
@@ -280,6 +333,9 @@ pub fn select_node<F: FnMut(&str) -> bool>(candidates: &[&str], mut probe: F) ->
 /// place they must be written out); callers zeroize/scope them.
 #[derive(Debug, Clone)]
 pub struct SetupParams {
+    /// Local listen address the server binds (`GP_BIND`); loopback by default,
+    /// kept behind the operator's reverse proxy.
+    pub bind: String,
     /// Public URL customers reach the till at (`GP_PUBLIC_URL`).
     pub public_url: String,
     /// Full webhook URL on the shop (`GP_WEBHOOK_URL`).
@@ -325,6 +381,9 @@ impl SetupParams {
         s.push_str(
             "# seed is NOT here (it lives encrypted at rest and in your written backup).\n\n",
         );
+
+        s.push_str("# --- local listen address (loopback; keep it behind your proxy) ---\n");
+        s.push_str(&format!("GP_BIND={}\n\n", self.bind));
 
         s.push_str("# --- public URL customers reach this till at ---\n");
         s.push_str(&format!("GP_PUBLIC_URL={}\n\n", self.public_url));
@@ -471,6 +530,83 @@ mod tests {
     }
 
     #[test]
+    fn restart_mode_with_default_preserves_on_empty() {
+        // Empty / unknown -> the caller's default (reconfigure preserves the
+        // current mode rather than silently forcing unattended).
+        assert_eq!(
+            parse_restart_mode_default("", RestartMode::Manual),
+            RestartMode::Manual
+        );
+        assert_eq!(
+            parse_restart_mode_default("  ", RestartMode::Manual),
+            RestartMode::Manual
+        );
+        assert_eq!(
+            parse_restart_mode_default("what", RestartMode::Manual),
+            RestartMode::Manual
+        );
+        // An explicit answer overrides the default in either direction.
+        assert_eq!(
+            parse_restart_mode_default("1", RestartMode::Manual),
+            RestartMode::Unattended
+        );
+        assert_eq!(
+            parse_restart_mode_default("unattended", RestartMode::Manual),
+            RestartMode::Unattended
+        );
+        assert_eq!(
+            parse_restart_mode_default("2", RestartMode::Unattended),
+            RestartMode::Manual
+        );
+    }
+
+    #[test]
+    fn normalize_bind_trims_and_defaults() {
+        assert_eq!(normalize_bind(""), "127.0.0.1:8080");
+        assert_eq!(normalize_bind("   "), "127.0.0.1:8080");
+        assert_eq!(normalize_bind("  0.0.0.0:9000 "), "0.0.0.0:9000");
+    }
+
+    #[test]
+    fn parse_env_file_skips_comments_and_splits_first_eq() {
+        let text = "\
+            # a comment\n\
+            \n\
+            GP_BIND=127.0.0.1:8080\n\
+            GP_PUBLIC_URL=https://pay.shop.com\n\
+            #GP_GRIN1_RAIL=on\n\
+            GP_RELAYS=wss://a,wss://b\n\
+            GP_WEBHOOK_URL=https://s/wp-json?x=1=2\n";
+        let pairs = parse_env_file(text);
+        assert_eq!(pairs.len(), 4);
+        assert!(pairs.contains(&("GP_BIND".to_string(), "127.0.0.1:8080".to_string())));
+        assert!(pairs.contains(&("GP_RELAYS".to_string(), "wss://a,wss://b".to_string())));
+        // Split on the FIRST '=' only, so values may contain '='.
+        assert!(pairs.contains(&(
+            "GP_WEBHOOK_URL".to_string(),
+            "https://s/wp-json?x=1=2".to_string()
+        )));
+        // The commented rail line is not a pair.
+        assert!(!pairs.iter().any(|(k, _)| k == "#GP_GRIN1_RAIL"));
+    }
+
+    #[test]
+    fn render_env_round_trips_through_parse_env_file() {
+        // The wizard's output parses back into the same non-secret values, which
+        // is exactly how a bare first run boots from what it just wrote.
+        let env = sample_params().render_env();
+        let pairs: std::collections::HashMap<String, String> =
+            parse_env_file(&env).into_iter().collect();
+        assert_eq!(pairs.get("GP_BIND").unwrap(), "127.0.0.1:8080");
+        assert_eq!(
+            pairs.get("GP_PUBLIC_URL").unwrap(),
+            "https://pay.myshop.com"
+        );
+        assert_eq!(pairs.get("GP_RELAY_MODE").unwrap(), "external");
+        assert_eq!(pairs.get("GP_NODE_URL").unwrap(), "https://main.gri.mw");
+    }
+
+    #[test]
     fn seed_ack_requires_explicit_yes() {
         // No affirmative default: only y/yes acknowledge the written backup.
         assert!(parse_ack("y"));
@@ -573,6 +709,7 @@ mod tests {
 
     fn sample_params() -> SetupParams {
         SetupParams {
+            bind: "127.0.0.1:8080".into(),
             public_url: "https://pay.myshop.com".into(),
             webhook_url: "https://myshop.com/wp-json/goblinpay/v1/webhook".into(),
             node_url: "https://main.gri.mw".into(),
@@ -592,6 +729,8 @@ mod tests {
     #[test]
     fn render_env_has_the_right_couplings_and_no_seed() {
         let env = sample_params().render_env();
+        // The listen address is written (loopback default).
+        assert!(env.contains("GP_BIND=127.0.0.1:8080"));
         // External relay pool, both relays present.
         assert!(env.contains("GP_RELAY_MODE=external"));
         assert!(env.contains("GP_RELAYS=wss://relay.floonet.dev,wss://offchain.pub"));

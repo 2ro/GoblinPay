@@ -28,7 +28,7 @@ use std::io::{BufRead, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use gp_core::config::Chain;
+use gp_core::config::{Chain, Config};
 use gp_core::setup as core_setup;
 use gp_core::setup::SetupParams;
 use gp_wallet::GpWallet;
@@ -224,38 +224,62 @@ pub fn run<R: BufRead, W: Write>(
         "2) Your shop's website URL (the WooCommerce site), e.g. https://myshop.com",
     )?;
 
+    // Q3: local listen address (default loopback). It stays behind the reverse
+    // proxy, so the default is right for almost everyone; pressing Enter takes
+    // it.
+    writeln!(
+        out,
+        "3) Local address the server listens on. Keep it loopback behind your\n\
+         \x20  reverse proxy unless you know you need otherwise. [127.0.0.1:8080]"
+    )
+    .map_err(io_err)?;
+    write!(out, "   > ").map_err(io_err)?;
+    out.flush().map_err(io_err)?;
+    let bind = core_setup::normalize_bind(&read_line(&mut input)?);
+
+    // Q4: Grin node URL (read-only: confirmations + balance). An explicit
+    // `--node` override skips the question; otherwise pressing Enter auto-picks a
+    // healthy node from the curated list, or the operator can name their own.
+    let node_url = resolve_node(&mut input, out, opts)?;
+
     // Hidden password entry only when stdin is a real terminal; scripted/batch
     // runs (and tests) read the password as plain lines from `input`.
     let hidden = opts.stdin_is_tty;
 
-    // Q3–Q5 concern the wallet secrets and the restart mode, and are only asked
-    // for a NEW wallet. On a --reconfigure with an existing wallet we keep the
-    // seed, password, and restart arrangement at rest untouched (that is the
-    // money), so prompting for any of them would be a trap.
+    // Q5-Q7 concern the wallet secrets and are only asked for a NEW wallet. On a
+    // --reconfigure with an existing wallet we keep the seed and password at rest
+    // untouched (that is the money), so prompting for them would be a trap. The
+    // restart mode IS still offered on reconfigure, defaulting to the till's
+    // current mode, so it is preserved unless the operator explicitly changes it.
     let wallet_exists = seed_path.exists();
     let (seed_plan, chosen_password, restart_mode) = if wallet_exists {
         writeln!(
             out,
-            "Existing till wallet found; keeping its seed, password, and restart \
-             mode unchanged."
+            "Existing till wallet found; keeping its seed and password."
         )
         .map_err(io_err)?;
-        (
-            SeedPlan::Existing,
-            None,
-            core_setup::RestartMode::Unattended,
-        )
+        // Detect the current restart mode from disk: the MANUAL-mode drop-in
+        // exists only when the till was set up manual. Prompt with it as the
+        // default so pressing Enter preserves it (this was previously hardcoded
+        // to unattended, which silently rewrote a manual till's config).
+        let current_mode = if paths.dropin_file.exists() {
+            core_setup::RestartMode::Manual
+        } else {
+            core_setup::RestartMode::Unattended
+        };
+        let mode = prompt_restart_mode(&mut input, out, None, current_mode)?;
+        (SeedPlan::Existing, None, mode)
     } else {
-        // Q3: the operator CHOOSES the wallet password (grin-wallet-faithful:
+        // Q5: the operator CHOOSES the wallet password (grin-wallet-faithful:
         // entered twice, must match). It encrypts the seed at rest.
         let password = prompt_wallet_password(&mut input, out, hidden)?;
 
-        // Q4: the seed. Fresh (generate, show ONCE, acknowledge) or paste an
+        // Q6: the seed. Fresh (generate, show ONCE, acknowledge) or paste an
         // existing recovery phrase (acknowledge the written backup). Both paths
         // are gated behind an explicit acknowledgement, like grin-wallet init.
         writeln!(
             out,
-            "4) Grin seed: press Enter to generate a FRESH 24-word till seed,\n\
+            "6) Grin seed: press Enter to generate a FRESH 24-word till seed,\n\
              \x20  or paste your existing recovery phrase."
         )
         .map_err(io_err)?;
@@ -292,35 +316,27 @@ pub fn run<R: BufRead, W: Write>(
             SeedPlan::Pasted(m)
         };
 
-        // Q5: restart mode (owner ruling: offer both, default UNATTENDED).
-        writeln!(
+        // Q7: restart mode (owner ruling: offer both, default UNATTENDED).
+        let mode = prompt_restart_mode(
+            &mut input,
             out,
-            "5) After a reboot, how should the till restart?\n\
-             \x20  [1] Unattended (default) — your password is sealed to THIS host, so\n\
-             \x20      the service auto-restarts. Honest trade-off: whoever fully\n\
-             \x20      controls this machine controls the wallet; keep it a small hot\n\
-             \x20      float and sweep to your own wallet regularly.\n\
-             \x20  [2] Manual — the password lives only in your head; you re-enter it\n\
-             \x20      after every restart. Maximum protection against disk/machine theft."
-        )
-        .map_err(io_err)?;
-        write!(out, "   > [1] ").map_err(io_err)?;
-        out.flush().map_err(io_err)?;
-        let mode = core_setup::parse_restart_mode(&read_line(&mut input)?);
+            Some(7),
+            core_setup::RestartMode::Unattended,
+        )?;
 
         (plan, Some(password), mode)
     };
 
-    // Q6: currencies (default usd).
-    writeln!(out, "6) Currencies your shop prices in? [usd]").map_err(io_err)?;
+    // Q8: currencies (default usd).
+    writeln!(out, "8) Currencies your shop prices in? [usd]").map_err(io_err)?;
     write!(out, "   > ").map_err(io_err)?;
     out.flush().map_err(io_err)?;
     let currencies = core_setup::parse_currencies(&read_line(&mut input)?);
 
-    // Q7: advanced grin1/Tor rail (default no).
+    // Q9: advanced grin1/Tor rail (default no).
     writeln!(
         out,
-        "7) (advanced) Also accept payments from any Grin wallet over Tor? [y/N]"
+        "9) (advanced) Also accept payments from any Grin wallet over Tor? [y/N]"
     )
     .map_err(io_err)?;
     write!(out, "   > ").map_err(io_err)?;
@@ -332,33 +348,6 @@ pub fn run<R: BufRead, W: Write>(
     let api_token = core_setup::gen_api_token();
     let admin_token = core_setup::gen_admin_token();
     let webhook_secret = core_setup::gen_webhook_secret();
-
-    // Pick a healthy Grin node: an explicit override, else probe the curated
-    // list and take the first that answers.
-    writeln!(out).map_err(io_err)?;
-    let node_url = match &opts.node_override {
-        Some(url) => {
-            writeln!(out, "Using Grin node {url} (override).").map_err(io_err)?;
-            url.clone()
-        }
-        None => {
-            writeln!(out, "Probing curated Grin nodes for a healthy one...").map_err(io_err)?;
-            let chosen = core_setup::select_node(core_setup::CURATED_NODES, gp_wallet::probe_node);
-            match chosen {
-                Some(url) => {
-                    writeln!(out, "Using Grin node {url}.").map_err(io_err)?;
-                    url
-                }
-                None => {
-                    return Err(
-                        "none of the curated Grin nodes answered. Check this host's \
-                         network, or pass --node <url> to use a node you trust."
-                            .into(),
-                    )
-                }
-            }
-        }
-    };
 
     // Create (or, on reconfigure, reopen) the encrypted wallet. Creating
     // consumes the seed once: it lives encrypted at rest afterwards, never in
@@ -380,8 +369,14 @@ pub fn run<R: BufRead, W: Write>(
                 .trim_end_matches(['\n', '\r'])
                 .to_string();
             writeln!(out, "Reopening the existing till wallet...").map_err(io_err)?;
-            GpWallet::create_at(&paths.data_dir, None, &password, &node_url, Chain::Mainnet)
-                .map_err(|e| format!("could not reopen the existing wallet: {e}"))?
+            let w =
+                GpWallet::create_at(&paths.data_dir, None, &password, &node_url, Chain::Mainnet)
+                    .map_err(|e| format!("could not reopen the existing wallet: {e}"))?;
+            // Re-apply the (possibly changed) restart mode. Preserving the mode
+            // leaves these files as they were; switching mode moves the password
+            // on/off disk accordingly.
+            apply_restart_persistence(&paths, restart_mode, &password)?;
+            w
         }
         SeedPlan::Fresh(m) | SeedPlan::Pasted(m) => {
             let password = chosen_password
@@ -396,23 +391,7 @@ pub fn run<R: BufRead, W: Write>(
                 Chain::Mainnet,
             )
             .map_err(|e| format!("wallet creation failed: {e}"))?;
-            // Persist per restart mode. UNATTENDED seals the chosen password to
-            // this host as a 0400 credential file (systemd LoadCredential reads
-            // it, so the service auto-restarts). MANUAL persists NOTHING: it
-            // writes only the drop-in that repoints the credential to a tmpfs
-            // path the operator populates by hand at each start.
-            match restart_mode {
-                core_setup::RestartMode::Unattended => {
-                    write_secret_file(&paths.wallet_password_file, password)?;
-                }
-                core_setup::RestartMode::Manual => {
-                    let runtime_pw = paths.runtime_password_file.display().to_string();
-                    write_dropin_file(
-                        &paths.dropin_file,
-                        &core_setup::render_manual_dropin(&runtime_pw),
-                    )?;
-                }
-            }
+            apply_restart_persistence(&paths, restart_mode, password)?;
             w
         }
     };
@@ -431,6 +410,7 @@ pub fn run<R: BufRead, W: Write>(
 
     // Render + write the env file (0640) the service loads.
     let params = SetupParams {
+        bind,
         public_url: public_url.clone(),
         webhook_url: webhook_url.clone(),
         node_url,
@@ -663,6 +643,153 @@ fn require_ack<R: BufRead, W: Write>(
     }
 }
 
+/// Resolve the Grin node URL. An explicit `--node` override is used as-is (no
+/// prompt, for deterministic/offline runs and tests). Otherwise the operator is
+/// asked: pressing Enter probes the curated list for the first healthy node (the
+/// sensible default), or they can name their own `http(s)://` node.
+fn resolve_node<R: BufRead, W: Write>(
+    input: &mut R,
+    out: &mut W,
+    opts: &SetupOptions,
+) -> Result<String, String> {
+    if let Some(url) = &opts.node_override {
+        writeln!(out, "Using Grin node {url} (override).").map_err(io_err)?;
+        return Ok(url.clone());
+    }
+    writeln!(
+        out,
+        "4) Grin node for confirmations and balance (read-only). Press Enter to\n\
+         \x20  auto-pick a healthy node from the curated list, or enter your own\n\
+         \x20  https:// node."
+    )
+    .map_err(io_err)?;
+    write!(out, "   > ").map_err(io_err)?;
+    out.flush().map_err(io_err)?;
+    let answer = read_line(input)?;
+    if answer.trim().is_empty() {
+        writeln!(out, "Probing curated Grin nodes for a healthy one...").map_err(io_err)?;
+        match core_setup::select_node(core_setup::CURATED_NODES, gp_wallet::probe_node) {
+            Some(url) => {
+                writeln!(out, "Using Grin node {url}.").map_err(io_err)?;
+                Ok(url)
+            }
+            None => Err(
+                "none of the curated Grin nodes answered. Check this host's \
+                 network, or pass --node <url> to use a node you trust."
+                    .into(),
+            ),
+        }
+    } else {
+        let url = core_setup::normalize_url(&answer)?;
+        writeln!(out, "Using Grin node {url}.").map_err(io_err)?;
+        Ok(url)
+    }
+}
+
+/// Prompt for the restart mode, offering both options and defaulting to `default`
+/// (UNATTENDED for a fresh setup; the till's current mode on reconfigure, so
+/// pressing Enter preserves it). `number`, when set, prefixes the question so it
+/// lines up with the numbered fresh-setup flow.
+fn prompt_restart_mode<R: BufRead, W: Write>(
+    input: &mut R,
+    out: &mut W,
+    number: Option<u8>,
+    default: core_setup::RestartMode,
+) -> Result<core_setup::RestartMode, String> {
+    let (u_tag, m_tag, hint) = match default {
+        core_setup::RestartMode::Unattended => (" (default)", "", "[1]"),
+        core_setup::RestartMode::Manual => ("", " (default)", "[2]"),
+    };
+    let lead = match number {
+        Some(n) => format!("{n}) "),
+        None => String::new(),
+    };
+    writeln!(
+        out,
+        "{lead}After a reboot, how should the till restart?\n\
+         \x20  [1] Unattended{u_tag}: your password is sealed to THIS host, so the\n\
+         \x20      service auto-restarts. Honest trade-off: whoever fully controls\n\
+         \x20      this machine controls the wallet; keep it a small hot float and\n\
+         \x20      sweep to your own wallet regularly.\n\
+         \x20  [2] Manual{m_tag}: the password lives only in your head; you re-enter\n\
+         \x20      it after every restart. Maximum protection against disk/machine theft."
+    )
+    .map_err(io_err)?;
+    write!(out, "   > {hint} ").map_err(io_err)?;
+    out.flush().map_err(io_err)?;
+    Ok(core_setup::parse_restart_mode_default(
+        &read_line(input)?,
+        default,
+    ))
+}
+
+/// Persist the wallet password per restart mode, idempotently, so this also
+/// handles a reconfigure that SWITCHES modes. UNATTENDED seals the chosen
+/// password to this host as a 0400 credential file (systemd LoadCredential reads
+/// it, so the service auto-restarts) and clears any stale manual drop-in. MANUAL
+/// keeps NOTHING sensitive on disk: it writes only the drop-in that repoints the
+/// credential to a tmpfs path the operator populates by hand, and removes the
+/// persistent password file if one was there.
+fn apply_restart_persistence(
+    paths: &Paths,
+    mode: core_setup::RestartMode,
+    password: &str,
+) -> Result<(), String> {
+    match mode {
+        core_setup::RestartMode::Unattended => {
+            write_secret_file(&paths.wallet_password_file, password)?;
+            remove_if_exists(&paths.dropin_file)?;
+        }
+        core_setup::RestartMode::Manual => {
+            let runtime_pw = paths.runtime_password_file.display().to_string();
+            write_dropin_file(
+                &paths.dropin_file,
+                &core_setup::render_manual_dropin(&runtime_pw),
+            )?;
+            remove_if_exists(&paths.wallet_password_file)?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove a file if it exists (ignoring a not-found race); used when a
+/// reconfigure switches restart mode and the other mode's artifact must go.
+fn remove_if_exists(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("cannot remove {}: {e}", path.display())),
+    }
+}
+
+/// Whether a bare `gp-server` invocation (no subcommand) should offer the
+/// first-run wizard. True only for a genuinely fresh, unconfigured install: the
+/// ingest service is on (the default) but there is no way to open a wallet yet
+/// (no seed at rest, no mnemonic and no wallet password in the environment) and
+/// no env file has been written. Every configured deploy fails at least one of
+/// these, so the headless boot path is taken exactly as before.
+pub fn needs_first_run_setup(cfg: &Config, env_file_exists: bool) -> bool {
+    cfg.ingest
+        && cfg.mnemonic.is_none()
+        && cfg.wallet_password.is_none()
+        && !GpWallet::seed_path(Path::new(&cfg.data_dir)).exists()
+        && !env_file_exists
+}
+
+/// Load a `Config` from the env file the wizard just wrote, so a first run can
+/// boot in-process from it (parsing the file directly rather than round-tripping
+/// through a systemd `EnvironmentFile` reload). The `*_FILE` secret indirection
+/// is honored by `Config::from_lookup`, so an UNATTENDED run resolves the 0400
+/// wallet-password file; a MANUAL run has no on-disk password and so returns an
+/// error here (the caller then prints how to start the service by hand).
+pub fn config_from_written_env(path: &Path) -> Result<Config, String> {
+    let contents =
+        fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let map: std::collections::HashMap<String, String> =
+        core_setup::parse_env_file(&contents).into_iter().collect();
+    Config::from_lookup(&|key| map.get(key).cloned())
+}
+
 /// Create a directory (and parents) with the given mode.
 fn ensure_dir(path: &Path, mode: u32) -> Result<(), String> {
     fs::create_dir_all(path).map_err(|e| format!("cannot create {}: {e}", path.display()))?;
@@ -670,8 +797,11 @@ fn ensure_dir(path: &Path, mode: u32) -> Result<(), String> {
         .map_err(|e| format!("cannot chmod {}: {e}", path.display()))
 }
 
-/// Write a secret to `path` with mode 0400 (create-or-truncate, then chmod).
+/// Write a secret to `path` with mode 0400. Any existing file is removed first:
+/// a prior 0400 secret has no write bit even for its owner, so an in-place
+/// rewrite (as on a reconfigure) would be denied.
 fn write_secret_file(path: &Path, contents: &str) -> Result<(), String> {
+    remove_if_exists(path)?;
     fs::write(path, format!("{contents}\n"))
         .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o400))
@@ -751,10 +881,11 @@ mod tests {
     fn full_run_writes_files_with_modes_and_paste_block() {
         let dir = TempDir::new("full");
         let opts = opts_with(&dir.0);
-        // Answers: public url, shop url, chosen password (twice), paste the dev
-        // seed, acknowledge, restart mode (Enter = unattended), currencies, rail.
+        // Answers: public url, shop url, bind (Enter = default; node is skipped
+        // via the override), chosen password (twice), paste the dev seed,
+        // acknowledge, restart mode (Enter = unattended), currencies, rail.
         let answers = format!(
-            "https://pay.myshop.com\nhttps://myshop.com\n\
+            "https://pay.myshop.com\nhttps://myshop.com\n\n\
              walletpass1\nwalletpass1\n{DEV_SEED_24}\nyes\n\nusd,eur\nn\n"
         );
         let mut out = Vec::new();
@@ -766,6 +897,7 @@ mod tests {
         let env = fs::read_to_string(&paths.env_file).unwrap();
         let mode = fs::metadata(&paths.env_file).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o640);
+        assert!(env.contains("GP_BIND=127.0.0.1:8080")); // bind default written
         assert!(env.contains("GP_PUBLIC_URL=https://pay.myshop.com"));
         assert!(env.contains("GP_WEBHOOK_URL=https://myshop.com/wp-json/goblinpay/v1/webhook"));
         assert!(env.contains("GP_RELAY_MODE=external"));
@@ -809,9 +941,9 @@ mod tests {
     fn fresh_seed_default_shows_the_seed_once() {
         let dir = TempDir::new("fresh");
         let opts = opts_with(&dir.0);
-        // password (twice), empty seed line -> generate fresh, acknowledge,
-        // Enter for restart (unattended) + currencies + rail.
-        let answers = "https://pay.myshop.com\nhttps://myshop.com\npw\npw\n\nyes\n\n\n\n";
+        // bind (Enter), password (twice), empty seed line -> generate fresh,
+        // acknowledge, Enter for restart (unattended) + currencies + rail.
+        let answers = "https://pay.myshop.com\nhttps://myshop.com\n\npw\npw\n\nyes\n\n\n\n";
         let mut out = Vec::new();
         run(Cursor::new(answers), &mut out, &opts).unwrap();
         let transcript = String::from_utf8(out).unwrap();
@@ -831,8 +963,9 @@ mod tests {
     fn manual_mode_writes_dropin_and_no_password_file() {
         let dir = TempDir::new("manual");
         let opts = opts_with(&dir.0);
-        // Fresh seed, acknowledge, restart mode 2 (manual), defaults after.
-        let answers = "https://pay.myshop.com\nhttps://myshop.com\npw\npw\n\nyes\n2\n\n\n";
+        // bind (Enter), fresh seed, acknowledge, restart mode 2 (manual),
+        // defaults after.
+        let answers = "https://pay.myshop.com\nhttps://myshop.com\n\npw\npw\n\nyes\n2\n\n\n";
         let mut out = Vec::new();
         run(Cursor::new(answers), &mut out, &opts).unwrap();
         let transcript = String::from_utf8(out).unwrap();
@@ -866,8 +999,9 @@ mod tests {
     fn password_mismatch_reprompts_then_succeeds() {
         let dir = TempDir::new("mismatch");
         let opts = opts_with(&dir.0);
-        // First pair mismatches (a/b), then a matching pair (c/c) succeeds.
-        let answers = "https://pay.myshop.com\nhttps://myshop.com\na\nb\nc\nc\n\nyes\n\n\n\n";
+        // bind (Enter), first password pair mismatches (a/b), then a matching
+        // pair (c/c) succeeds.
+        let answers = "https://pay.myshop.com\nhttps://myshop.com\n\na\nb\nc\nc\n\nyes\n\n\n\n";
         let mut out = Vec::new();
         run(Cursor::new(answers), &mut out, &opts).unwrap();
         let transcript = String::from_utf8(out).unwrap();
@@ -886,7 +1020,7 @@ mod tests {
         let dir = TempDir::new("clobber");
         let opts = opts_with(&dir.0);
         let answers = format!(
-            "https://pay.myshop.com\nhttps://myshop.com\n\
+            "https://pay.myshop.com\nhttps://myshop.com\n\n\
              pw\npw\n{DEV_SEED_24}\nyes\n\nusd\nn\n"
         );
         let mut out = Vec::new();
@@ -901,15 +1035,141 @@ mod tests {
         let token_before = fs::read_to_string(&paths.env_file).unwrap();
         let mut recfg = opts_with(&dir.0);
         recfg.reconfigure = true;
-        // Existing wallet => the seed question is skipped; feed 4 answers.
-        let recfg_answers = "https://pay.myshop.com\nhttps://myshop.com\ngbp\nn\n";
+        // Existing wallet => the seed/password questions are skipped, but bind,
+        // restart mode (Enter = preserve current), currencies, and rail are asked.
+        let recfg_answers = "https://pay.myshop.com\nhttps://myshop.com\n\n\ngbp\nn\n";
         let mut out3 = Vec::new();
         run(Cursor::new(recfg_answers), &mut out3, &recfg).unwrap();
         let transcript = String::from_utf8(out3).unwrap();
         assert!(transcript.contains("Existing till wallet found"));
+        // Preserved the unattended mode it was set up with (Enter kept it).
+        assert!(transcript.contains("Restart mode: UNATTENDED"));
         let token_after = fs::read_to_string(&paths.env_file).unwrap();
         assert!(token_after.contains("GP_RATE_CURRENCIES=gbp"));
         assert_ne!(token_before, token_after, "reconfigure regenerates config");
+    }
+
+    #[test]
+    fn reconfigure_can_switch_restart_mode() {
+        // The wart being fixed: reconfigure hardcoded UNATTENDED, so it silently
+        // rewrote (and could never change) the restart mode. Now the operator is
+        // prompted with the current mode as the default, so they can switch. An
+        // unattended till HAS its password on the 0400 file, so it can reopen and
+        // move that password off disk into manual mode.
+        let dir = TempDir::new("recfg-switch");
+        let opts = opts_with(&dir.0);
+        // Fresh UNATTENDED till (Enter on the restart prompt).
+        let answers = "https://pay.myshop.com\nhttps://myshop.com\n\npw\npw\n\nyes\n\n\n\n";
+        let mut out = Vec::new();
+        run(Cursor::new(answers), &mut out, &opts).unwrap();
+        let paths = Paths::resolve(Some(&dir.0));
+        assert!(paths.wallet_password_file.exists());
+        assert!(!paths.dropin_file.exists());
+
+        // Reconfigure and answer 2 (manual): it must switch, writing the drop-in
+        // and taking the password off disk.
+        let mut recfg = opts_with(&dir.0);
+        recfg.reconfigure = true;
+        let recfg_answers = "https://pay.myshop.com\nhttps://myshop.com\n\n2\ngbp\nn\n";
+        let mut out2 = Vec::new();
+        run(Cursor::new(recfg_answers), &mut out2, &recfg).unwrap();
+        let transcript = String::from_utf8(out2).unwrap();
+        assert!(transcript.contains("Restart mode: MANUAL"));
+        assert!(paths.dropin_file.exists());
+        assert!(
+            !paths.wallet_password_file.exists(),
+            "password moved off disk"
+        );
+        let env = fs::read_to_string(&paths.env_file).unwrap();
+        assert!(env.contains("MANUAL"));
+        assert!(env.contains("run/goblinpay/wallet_password"));
+    }
+
+    #[test]
+    fn node_prompt_accepts_an_explicit_url() {
+        let dir = TempDir::new("node");
+        // No --node override, so the node question is asked; the operator names
+        // their own node instead of pressing Enter (which would probe the net).
+        let mut opts = opts_with(&dir.0);
+        opts.node_override = None;
+        let answers = "https://pay.myshop.com\nhttps://myshop.com\n\n\
+             http://127.0.0.1:3413\npw\npw\n\nyes\n\n\n\n";
+        let mut out = Vec::new();
+        run(Cursor::new(answers), &mut out, &opts).unwrap();
+        let paths = Paths::resolve(Some(&dir.0));
+        let env = fs::read_to_string(&paths.env_file).unwrap();
+        assert!(env.contains("GP_NODE_URL=http://127.0.0.1:3413"));
+    }
+
+    #[test]
+    fn needs_first_run_setup_only_on_a_fresh_box() {
+        let dir = TempDir::new("firstrun");
+        let data_dir = dir.0.join("gp-data");
+        let base = Config {
+            data_dir: data_dir.display().to_string(),
+            ..Config::default()
+        };
+
+        // Genuinely fresh: ingest on, no secrets, no seed, no env file.
+        assert!(needs_first_run_setup(&base, false));
+
+        // An env file already present means an operator configured this box: the
+        // headless boot path must be taken (wizard never triggers).
+        assert!(!needs_first_run_setup(&base, true));
+
+        // A wallet password (or mnemonic) in the environment is a configured
+        // deploy; boot headless.
+        let with_pw = Config {
+            wallet_password: Some(gp_core::config::Secret::new("pw".into())),
+            ..Config {
+                data_dir: data_dir.display().to_string(),
+                ..Config::default()
+            }
+        };
+        assert!(!needs_first_run_setup(&with_pw, false));
+
+        // Ingest disabled: HTTP-only, no wallet needed, so do not force setup.
+        let no_ingest = Config {
+            ingest: false,
+            ..Config {
+                data_dir: data_dir.display().to_string(),
+                ..Config::default()
+            }
+        };
+        assert!(!needs_first_run_setup(&no_ingest, false));
+
+        // An existing seed at rest is a configured wallet: boot headless.
+        let seed_path = GpWallet::seed_path(&data_dir);
+        if let Some(parent) = seed_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&seed_path, b"encrypted-seed").unwrap();
+        assert!(!needs_first_run_setup(&base, false));
+    }
+
+    #[test]
+    fn config_from_written_env_round_trips_the_wizard_output() {
+        let dir = TempDir::new("written-env");
+        let opts = opts_with(&dir.0);
+        let answers = format!(
+            "https://pay.myshop.com\nhttps://myshop.com\n\n\
+             walletpass1\nwalletpass1\n{DEV_SEED_24}\nyes\n\nusd,eur\nn\n"
+        );
+        let mut out = Vec::new();
+        run(Cursor::new(answers), &mut out, &opts).unwrap();
+
+        // The env file the wizard wrote loads back into a Config the server can
+        // boot from: an UNATTENDED run resolves the 0400 wallet-password file.
+        let paths = Paths::resolve(Some(&dir.0));
+        let cfg = config_from_written_env(&paths.env_file).unwrap();
+        assert_eq!(cfg.public_url, "https://pay.myshop.com");
+        assert_eq!(cfg.node_url, "http://127.0.0.1:3413");
+        assert_eq!(cfg.relay_mode, gp_core::config::RelayMode::External);
+        assert_eq!(cfg.rate_currencies, vec!["usd", "eur"]);
+        assert!(
+            cfg.wallet_password.is_some(),
+            "the 0400 password file is resolved via GP_WALLET_PASSWORD_FILE"
+        );
     }
 
     #[test]

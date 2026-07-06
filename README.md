@@ -73,21 +73,30 @@ you), then:
 sudo gp-server setup
 ```
 
+On a fresh box you can skip even that: running `gp-server` with no configuration
+in an interactive terminal starts this same wizard automatically and then boots
+from what it wrote. An already-configured install (or a non-interactive run) is
+unaffected and starts headless exactly as before.
+
 It asks a few questions, each with a default. It is grin-wallet-faithful about
 the two things that are yours to own — your wallet password and your seed:
 
 1. the public URL customers reach this till at,
 2. your shop's website URL (used to build the webhook URL),
-3. **your wallet password** — you choose it, entered twice and confirmed to
+3. the local listen address (default `127.0.0.1:8080`; keep it loopback behind
+   your reverse proxy),
+4. the Grin node for confirmations and balance (press Enter to auto-pick a
+   healthy node from the curated list, or enter your own `https://` node),
+5. **your wallet password**: you choose it, entered twice and confirmed to
    match (hidden input; it is never auto-generated). It encrypts the seed at
    rest and is not recoverable, so if you forget it you restore from the seed;
-4. **the Grin seed** — press Enter to generate a fresh 24-word seed, which is
+6. **the Grin seed**: press Enter to generate a fresh 24-word seed, which is
    shown once and gated behind an acknowledgement that you wrote it down (exactly
    like `grin-wallet init`), or paste your existing recovery phrase;
-5. **restart mode** — how the till comes back after a reboot (default
+7. **restart mode**: how the till comes back after a reboot (default
    **unattended**; see below);
-6. the currencies your shop prices in (default `usd`),
-7. an advanced yes/no for the grin1/Tor rail (default no).
+8. the currencies your shop prices in (default `usd`),
+9. an advanced yes/no for the grin1/Tor rail (default no).
 
 Everything else it does for you:
 
@@ -97,8 +106,8 @@ Everything else it does for you:
 - creates the encrypted wallet on the spot from the seed, so the seed is
   consumed once and never lives in the service environment afterwards (it
   exists only encrypted at rest and in your written backup);
-- probes a curated list of healthy mainnet Grin nodes and picks the first that
-  answers, falling back automatically;
+- when you accept the node default, probes a curated list of healthy mainnet
+  Grin nodes and picks the first that answers, falling back automatically;
 - defaults the relays to an external vetted pool (the wallet's proven relays);
 - writes `/etc/goblinpay.env` (mode 0640, holds the config plus the bearer
   tokens) exactly where the shipped `gp-server.service` looks (`EnvironmentFile`),
@@ -138,7 +147,9 @@ default. Both are honest about their trade-off:
 Re-running is safe: the wizard refuses to overwrite an existing wallet or config
 unless you pass `--reconfigure` (which keeps the existing seed and password — the
 money — untouched and never re-prompts for them, only rewriting the config/tokens).
-If you run manual restart mode, re-apply it after a reconfigure.
+A reconfigure keeps your current restart mode by default: the prompt shows it as
+the default so pressing Enter preserves it, and you pick the other option to
+switch.
 Flags: `--reconfigure`, `--prefix DIR` (write under a prefix instead of `/`),
 `--node URL` (skip the node probe), `--batch` (read scripted answers from a
 non-terminal stdin).

@@ -293,6 +293,58 @@ fn run_setup(args: &[String]) -> i32 {
     }
 }
 
+/// First-run guided setup for a bare `gp-server` (no subcommand), the complement
+/// to configuring by env var. On a fresh, unconfigured box attached to a
+/// terminal, run the wizard and then boot from what it wrote. A configured
+/// deploy returns the config unchanged (headless, exactly as before), and a
+/// non-terminal first run also falls through to today's fail-fast at wallet
+/// open. The process exits here only when the wizard fails, or after a
+/// manual-mode setup that deliberately leaves no password on disk to boot from.
+fn first_run_or_boot(cfg: Config) -> Config {
+    use std::io::IsTerminal;
+    use std::path::Path;
+
+    use gp_server::setup::{self, SetupOptions};
+
+    let env_file = Path::new(gp_core::setup::DEFAULT_ENV_FILE);
+    if !setup::needs_first_run_setup(&cfg, env_file.exists()) {
+        return cfg;
+    }
+    // Non-TTY without config: keep today's behavior (fall through and fail fast
+    // at wallet open with the existing message).
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return cfg;
+    }
+
+    println!("No configuration found. Starting the GoblinPay setup wizard.\n");
+    let opts = SetupOptions {
+        reconfigure: false,
+        prefix: None,
+        node_override: None,
+        force_run: false,
+        stdin_is_tty: true,
+    };
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+    if let Err(e) = setup::run(stdin.lock(), &mut stdout, &opts) {
+        eprintln!("setup: {e}");
+        std::process::exit(1);
+    }
+    // Boot in-process from the freshly written env file. A manual-mode run keeps
+    // no wallet password on disk, so there is nothing to open unattended here:
+    // print how to start the service and exit cleanly.
+    match setup::config_from_written_env(env_file) {
+        Ok(cfg) => cfg,
+        Err(_) => {
+            println!(
+                "\nSetup complete. Start the service when you are ready:\n  \
+                 sudo systemctl start gp-server"
+            );
+            std::process::exit(0);
+        }
+    }
+}
+
 #[actix_web::main]
 async fn main() -> io::Result<()> {
     // Subcommand branch (manual argv, no clap): `gp-server setup` runs the
@@ -317,6 +369,10 @@ async fn main() -> io::Result<()> {
             std::process::exit(2);
         }
     };
+    // Complement env/config setup: on a fresh box with an interactive terminal,
+    // guide the operator through the wizard, then boot from what it wrote. No-op
+    // for configured deploys and non-terminal runs (zero behavior change).
+    let cfg = first_run_or_boot(cfg);
     println!(
         "gp-server {} starting: {}",
         env!("CARGO_PKG_VERSION"),

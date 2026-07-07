@@ -33,6 +33,16 @@ use gp_core::setup as core_setup;
 use gp_core::setup::SetupParams;
 use gp_wallet::GpWallet;
 
+/// Seals the wallet password to this host as an encrypted credential at rest.
+/// Given the plaintext password and the destination `.cred` path, returns
+/// `Ok(true)` when it wrote a ciphertext blob (the secure path), `Ok(false)`
+/// when sealing is unavailable on this host (the caller then falls back to the
+/// legacy 0400 plaintext file with a loud warning), or `Err` on an unexpected
+/// failure. The real implementation shells out to `systemd-creds encrypt`; tests
+/// inject a deterministic fake so neither the encrypted nor the fallback path
+/// depends on the host's systemd.
+pub type Sealer = dyn Fn(&str, &Path) -> Result<bool, String>;
+
 /// Options parsed from `gp-server setup [flags]` in `main.rs`.
 pub struct SetupOptions {
     /// `--reconfigure`: proceed even if a wallet/env already exists.
@@ -49,6 +59,47 @@ pub struct SetupOptions {
     /// TTY and `force_run` is false, the wizard prints guidance and exits
     /// rather than hanging on a prompt.
     pub stdin_is_tty: bool,
+    /// How the unattended wallet password is sealed at rest. `None` uses the real
+    /// `systemd-creds` sealer; tests inject a deterministic fake.
+    pub seal: Option<Box<Sealer>>,
+}
+
+/// Seal `password` to this host with `systemd-creds encrypt`, writing a ciphertext
+/// blob to `dest`. Returns `Ok(false)` (fall back to the plaintext file) when
+/// `systemd-creds` is missing or cannot access a host credential key (e.g. an
+/// older systemd, or a non-root dry run), so the wizard degrades gracefully
+/// instead of failing. The plaintext password is passed on stdin, never as an
+/// argv arg (which would be visible in the process table).
+fn systemd_creds_seal(password: &str, dest: &Path) -> Result<bool, String> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let mut child = match Command::new("systemd-creds")
+        .arg("encrypt")
+        .arg("--name=gp_wallet_password")
+        .arg("-")
+        .arg(dest)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        // No systemd-creds on this host: fall back to the plaintext file.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("could not run systemd-creds: {e}")),
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(password.as_bytes())
+            .map_err(|e| format!("could not pass the password to systemd-creds: {e}"))?;
+    }
+    let status = child
+        .wait()
+        .map_err(|e| format!("systemd-creds did not complete: {e}"))?;
+    // A non-zero exit (commonly: no host credential key without root) is a
+    // graceful fallback, not a hard error.
+    Ok(status.success())
 }
 
 /// What the wizard does about the wallet seed on this run.
@@ -67,11 +118,21 @@ enum SeedPlan {
 struct Paths {
     env_file: PathBuf,
     secrets_dir: PathBuf,
+    /// The legacy PLAINTEXT 0400 wallet-password file (unattended fallback when
+    /// `systemd-creds` is unavailable).
     wallet_password_file: PathBuf,
+    /// The host-SEALED (ciphertext) wallet-password credential
+    /// (`wallet_password.cred`), written in the encrypted-unattended default.
+    encrypted_cred_file: PathBuf,
     data_dir: PathBuf,
     db_path: PathBuf,
-    /// The MANUAL-mode systemd drop-in (`gp-server.service.d/manual.conf`).
+    /// The MANUAL-mode systemd drop-in (`gp-server.service.d/manual.conf`): its
+    /// presence is also how a reconfigure detects the till is in manual mode.
     dropin_file: PathBuf,
+    /// The encrypted-unattended systemd drop-in
+    /// (`gp-server.service.d/encrypted.conf`), switching the unit to
+    /// `LoadCredentialEncrypted`.
+    encrypted_dropin_file: PathBuf,
     /// The tmpfs credential the MANUAL mode reads the password from at start.
     runtime_password_file: PathBuf,
 }
@@ -83,13 +144,16 @@ impl Paths {
             None => PathBuf::from(abs),
         };
         let secrets_dir = join("etc/goblinpay/secrets");
+        let dropin_dir = "etc/systemd/system/gp-server.service.d";
         Paths {
             env_file: join("etc/goblinpay.env"),
             wallet_password_file: secrets_dir.join("wallet_password"),
+            encrypted_cred_file: secrets_dir.join("wallet_password.cred"),
             secrets_dir,
             data_dir: join("var/lib/goblinpay/gp-data"),
             db_path: join("var/lib/goblinpay/goblinpay.db"),
-            dropin_file: join("etc/systemd/system/gp-server.service.d/manual.conf"),
+            dropin_file: join(&format!("{dropin_dir}/manual.conf")),
+            encrypted_dropin_file: join(&format!("{dropin_dir}/encrypted.conf")),
             runtime_password_file: join(core_setup::RUNTIME_WALLET_PASSWORD_FILE),
         }
     }
@@ -354,20 +418,31 @@ pub fn run<R: BufRead, W: Write>(
     // the service environment (owner ruling O2). Reopening an existing wallet
     // reuses the password already on file, so a --reconfigure never re-encrypts
     // (which would need the old password) or touches the seed.
+    // The at-rest password sealer: the real systemd-creds one in production, a
+    // deterministic fake when tests inject it.
+    let default_seal: Box<Sealer> = Box::new(systemd_creds_seal);
+    let seal: &Sealer = opts.seal.as_deref().unwrap_or(default_seal.as_ref());
+
     ensure_dir(&paths.data_dir, 0o700)?;
     ensure_dir(&paths.secrets_dir, 0o700)?;
-    let wallet = match &seed_plan {
+    let (wallet, unattended_encrypted) = match &seed_plan {
         SeedPlan::Existing => {
-            let password = fs::read_to_string(&paths.wallet_password_file)
-                .map_err(|e| {
-                    format!(
-                        "existing wallet found but its password file {} is unreadable ({e}); \
-                         cannot reopen. This looks like a partial install, not a reconfigure.",
-                        paths.wallet_password_file.display()
+            // Reopen the existing wallet. Its password may be on the legacy 0400
+            // plaintext file (plaintext-unattended tills); the secure encrypted
+            // and manual shapes keep no readable password on disk, so prompt for
+            // it. A wrong password simply fails the reopen below.
+            let password = match fs::read_to_string(&paths.wallet_password_file) {
+                Ok(s) => s.trim_end_matches(['\n', '\r']).to_string(),
+                Err(_) => {
+                    writeln!(
+                        out,
+                        "This till keeps no readable password on disk. Enter its wallet\n\
+                         password to reopen the wallet and reconfigure it."
                     )
-                })?
-                .trim_end_matches(['\n', '\r'])
-                .to_string();
+                    .map_err(io_err)?;
+                    prompt_existing_password(&mut input, out, hidden)?
+                }
+            };
             writeln!(out, "Reopening the existing till wallet...").map_err(io_err)?;
             let w =
                 GpWallet::create_at(&paths.data_dir, None, &password, &node_url, Chain::Mainnet)
@@ -375,8 +450,8 @@ pub fn run<R: BufRead, W: Write>(
             // Re-apply the (possibly changed) restart mode. Preserving the mode
             // leaves these files as they were; switching mode moves the password
             // on/off disk accordingly.
-            apply_restart_persistence(&paths, restart_mode, &password)?;
-            w
+            let enc = apply_restart_persistence(&paths, restart_mode, &password, seal, out)?;
+            (w, enc)
         }
         SeedPlan::Fresh(m) | SeedPlan::Pasted(m) => {
             let password = chosen_password
@@ -391,8 +466,8 @@ pub fn run<R: BufRead, W: Write>(
                 Chain::Mainnet,
             )
             .map_err(|e| format!("wallet creation failed: {e}"))?;
-            apply_restart_persistence(&paths, restart_mode, password)?;
-            w
+            let enc = apply_restart_persistence(&paths, restart_mode, password, seal, out)?;
+            (w, enc)
         }
     };
     match wallet.slatepack_address() {
@@ -404,6 +479,13 @@ pub fn run<R: BufRead, W: Write>(
     // restart mode: the persistent 0400 file (unattended) or the tmpfs
     // credential the operator populates at each start (manual).
     let wallet_password_file = match restart_mode {
+        // Encrypted default: the env points at the runtime (decrypted) credential
+        // path systemd populates, matching the unit's %d/gp_wallet_password. It is
+        // absent at setup time (so an in-process first run defers to systemctl)
+        // and present once the service starts.
+        core_setup::RestartMode::Unattended if unattended_encrypted => {
+            core_setup::CREDENTIALS_WALLET_PASSWORD_PATH.to_string()
+        }
         core_setup::RestartMode::Unattended => paths.wallet_password_file.display().to_string(),
         core_setup::RestartMode::Manual => paths.runtime_password_file.display().to_string(),
     };
@@ -427,6 +509,7 @@ pub fn run<R: BufRead, W: Write>(
         db_path: paths.db_path.display().to_string(),
         wallet_password_file,
         restart_mode,
+        unattended_encrypted,
     };
     write_env_file(&paths.env_file, &params.render_env())?;
 
@@ -454,10 +537,22 @@ pub fn run<R: BufRead, W: Write>(
     // Final screen: how to start (per restart mode), and the WooCommerce block.
     writeln!(out, "\nGoblinPay is set up.").map_err(io_err)?;
     match restart_mode {
+        core_setup::RestartMode::Unattended if unattended_encrypted => writeln!(
+            out,
+            "Restart mode: UNATTENDED (encrypted at rest). Start it:\n\
+             \x20 sudo systemctl daemon-reload && sudo systemctl start gp-server\n\
+             The password is sealed to this host with systemd-creds (ciphertext on\n\
+             disk); systemd decrypts it at each start, so the service auto-restarts.\n\
+             (Keep the till a small hot float and sweep to your own wallet often:\n\
+             a compromise of the RUNNING host still means wallet compromise.)\n"
+        )
+        .map_err(io_err)?,
         core_setup::RestartMode::Unattended => writeln!(
             out,
-            "Restart mode: UNATTENDED. Start it:  sudo systemctl start gp-server\n\
-             It will auto-restart after reboots using the host-sealed password.\n\
+            "Restart mode: UNATTENDED (plaintext fallback). Start it:\n\
+             \x20 sudo systemctl start gp-server\n\
+             systemd-creds was unavailable, so the password is a root-owned 0400\n\
+             PLAINTEXT file. It will auto-restart, but the key is plaintext at rest.\n\
              (Keep the till a small hot float and sweep to your own wallet often:\n\
              a full-machine compromise means wallet compromise.)\n"
         )
@@ -508,9 +603,17 @@ pub fn run<R: BufRead, W: Write>(
     }
 
     match restart_mode {
+        core_setup::RestartMode::Unattended if unattended_encrypted => writeln!(
+            out,
+            "\nWrote {} and {} (sealed credential, ciphertext) plus the\n\
+             encrypted.conf drop-in. No plaintext wallet password is stored on disk.",
+            paths.env_file.display(),
+            paths.encrypted_cred_file.display()
+        )
+        .map_err(io_err)?,
         core_setup::RestartMode::Unattended => writeln!(
             out,
-            "\nWrote {} and {} (password file, mode 0400).",
+            "\nWrote {} and {} (PLAINTEXT password file, mode 0400).",
             paths.env_file.display(),
             paths.wallet_password_file.display()
         )
@@ -608,6 +711,26 @@ fn prompt_wallet_password<R: BufRead, W: Write>(
             return Ok(first);
         }
         writeln!(out, "   ! passwords do not match; try again\n").map_err(io_err)?;
+    }
+}
+
+/// Prompt once for an EXISTING wallet password (reconfiguring a till that keeps
+/// no readable password on disk: the encrypted or manual shapes). No confirm
+/// entry: correctness is checked by the wallet reopen that follows, which fails
+/// on a wrong password. Fails cleanly at end of input (batch/scripted runs).
+fn prompt_existing_password<R: BufRead, W: Write>(
+    input: &mut R,
+    out: &mut W,
+    hidden: bool,
+) -> Result<String, String> {
+    loop {
+        write!(out, "   wallet password > ").map_err(io_err)?;
+        out.flush().map_err(io_err)?;
+        match read_secret_line(input, out, hidden)? {
+            None => return Err("no wallet password provided (end of input)".into()),
+            Some(s) if !s.is_empty() => return Ok(s),
+            Some(_) => writeln!(out, "   ! password must not be empty\n").map_err(io_err)?,
+        }
     }
 }
 
@@ -724,21 +847,58 @@ fn prompt_restart_mode<R: BufRead, W: Write>(
 }
 
 /// Persist the wallet password per restart mode, idempotently, so this also
-/// handles a reconfigure that SWITCHES modes. UNATTENDED seals the chosen
-/// password to this host as a 0400 credential file (systemd LoadCredential reads
-/// it, so the service auto-restarts) and clears any stale manual drop-in. MANUAL
-/// keeps NOTHING sensitive on disk: it writes only the drop-in that repoints the
-/// credential to a tmpfs path the operator populates by hand, and removes the
-/// persistent password file if one was there.
-fn apply_restart_persistence(
+/// handles a reconfigure that SWITCHES modes. Returns whether an UNATTENDED
+/// password was ENCRYPTED at rest (the secure default) versus the plaintext
+/// fallback; the flag is meaningless (false) for MANUAL.
+///
+/// UNATTENDED first tries to SEAL the chosen password to this host with
+/// `systemd-creds` (ciphertext at rest, read by `LoadCredentialEncrypted`); no
+/// plaintext wallet password ever touches the disk. If sealing is unavailable it
+/// falls back to the legacy root-owned 0400 PLAINTEXT file (read by the base
+/// unit's `LoadCredential`) with a loud warning. MANUAL keeps NOTHING sensitive
+/// on disk: it writes only the drop-in that repoints the credential to a tmpfs
+/// path the operator populates by hand. Every stale artifact of the other shapes
+/// is cleared so a reconfigure that switches modes leaves exactly one in place.
+fn apply_restart_persistence<W: Write>(
     paths: &Paths,
     mode: core_setup::RestartMode,
     password: &str,
-) -> Result<(), String> {
+    seal: &Sealer,
+    out: &mut W,
+) -> Result<bool, String> {
     match mode {
         core_setup::RestartMode::Unattended => {
-            write_secret_file(&paths.wallet_password_file, password)?;
-            remove_if_exists(&paths.dropin_file)?;
+            ensure_dir(&paths.secrets_dir, 0o700)?;
+            if seal(password, paths.encrypted_cred_file.as_path())? {
+                // Encrypted at rest (secure default): write the drop-in that reads
+                // the sealed credential, and clear the plaintext + manual shapes.
+                let src = paths.encrypted_cred_file.display().to_string();
+                write_dropin_file(
+                    &paths.encrypted_dropin_file,
+                    &core_setup::render_encrypted_dropin(&src),
+                )?;
+                remove_if_exists(&paths.wallet_password_file)?;
+                remove_if_exists(&paths.dropin_file)?;
+                Ok(true)
+            } else {
+                // Fallback: systemd-creds unavailable. Root-owned 0400 plaintext
+                // file, matching the base unit's LoadCredential. Warn loudly.
+                writeln!(
+                    out,
+                    "WARNING: systemd-creds is unavailable on this host, so the wallet\n\
+                     password could not be encrypted at rest. Falling back to a root-owned\n\
+                     0400 PLAINTEXT file ({}). It is off the world-readable env file, but it\n\
+                     is still plaintext on disk. For encryption at rest, install systemd >= 250\n\
+                     with a host credential key and re-run: sudo gp-server setup --reconfigure",
+                    paths.wallet_password_file.display()
+                )
+                .map_err(io_err)?;
+                write_secret_file(&paths.wallet_password_file, password)?;
+                remove_if_exists(&paths.encrypted_cred_file)?;
+                remove_if_exists(&paths.encrypted_dropin_file)?;
+                remove_if_exists(&paths.dropin_file)?;
+                Ok(false)
+            }
         }
         core_setup::RestartMode::Manual => {
             let runtime_pw = paths.runtime_password_file.display().to_string();
@@ -747,9 +907,11 @@ fn apply_restart_persistence(
                 &core_setup::render_manual_dropin(&runtime_pw),
             )?;
             remove_if_exists(&paths.wallet_password_file)?;
+            remove_if_exists(&paths.encrypted_cred_file)?;
+            remove_if_exists(&paths.encrypted_dropin_file)?;
+            Ok(false)
         }
     }
-    Ok(())
 }
 
 /// Remove a file if it exists (ignoring a not-found race); used when a
@@ -870,7 +1032,21 @@ mod tests {
             node_override: Some("http://127.0.0.1:3413".into()),
             force_run: true,
             stdin_is_tty: false,
+            // Force the PLAINTEXT fallback deterministically (independent of the
+            // host's systemd), so these tests exercise the 0400-file shape. The
+            // encrypted path is covered by its own test with a fake sealer.
+            seal: Some(Box::new(|_, _| Ok(false))),
         }
+    }
+
+    /// A fake sealer that "succeeds", writing a non-secret marker to the `.cred`
+    /// path so the encrypted-unattended shape can be tested without real
+    /// systemd-creds (and without ever writing the password to that file).
+    fn fake_sealer_ok() -> Box<Sealer> {
+        Box::new(|_pw, dest| {
+            fs::write(dest, b"(sealed by test)\n").map_err(|e| format!("fake seal failed: {e}"))?;
+            Ok(true)
+        })
     }
 
     /// All-zero 32-byte entropy -> the well-known dev seed (24 words). Used only
@@ -957,6 +1133,82 @@ mod tests {
             .unwrap()
             .contains("GP_RATE_CURRENCIES=usd"));
         assert!(transcript.contains("Restart mode: UNATTENDED"));
+    }
+
+    #[test]
+    fn encrypted_unattended_seals_and_writes_no_plaintext() {
+        let dir = TempDir::new("encrypted");
+        let mut opts = opts_with(&dir.0);
+        opts.seal = Some(fake_sealer_ok());
+        // bind (Enter), password (twice), fresh seed, acknowledge, restart
+        // (Enter = unattended), currencies, rail.
+        let answers = "https://pay.myshop.com\nhttps://myshop.com\n\npw\npw\n\nyes\n\n\n\n";
+        let mut out = Vec::new();
+        run(Cursor::new(answers), &mut out, &opts).unwrap();
+        let transcript = String::from_utf8(out).unwrap();
+        let paths = Paths::resolve(Some(&dir.0));
+
+        // The sealed ciphertext credential + the encrypted.conf drop-in exist;
+        // NO plaintext password file and NO manual drop-in.
+        assert!(paths.encrypted_cred_file.exists());
+        assert!(paths.encrypted_dropin_file.exists());
+        assert!(
+            !paths.wallet_password_file.exists(),
+            "no plaintext password on disk"
+        );
+        assert!(!paths.dropin_file.exists());
+        // The sealed file never contains the plaintext password.
+        let cred = fs::read_to_string(&paths.encrypted_cred_file).unwrap();
+        assert!(!cred.contains("pw") || cred.contains("(sealed"));
+
+        let dropin = fs::read_to_string(&paths.encrypted_dropin_file).unwrap();
+        assert!(dropin.contains("LoadCredentialEncrypted=gp_wallet_password:"));
+        assert!(dropin.contains("LoadCredential=\n")); // resets the plaintext one
+
+        // Env points GP_WALLET_PASSWORD_FILE at the runtime credential path and
+        // never inlines the password; the narrative says encrypted-at-rest.
+        let env = fs::read_to_string(&paths.env_file).unwrap();
+        assert!(env.contains(&format!(
+            "GP_WALLET_PASSWORD_FILE={}",
+            core_setup::CREDENTIALS_WALLET_PASSWORD_PATH
+        )));
+        assert!(!env.contains("GP_WALLET_PASSWORD="));
+        assert!(env.contains("ENCRYPTED at rest"));
+        assert!(GpWallet::seed_path(&paths.data_dir).exists());
+        assert!(transcript.contains("Restart mode: UNATTENDED (encrypted at rest)"));
+    }
+
+    #[test]
+    fn reconfigure_encrypted_till_prompts_for_the_password() {
+        let dir = TempDir::new("recfg-enc");
+        let mut opts = opts_with(&dir.0);
+        opts.seal = Some(fake_sealer_ok());
+        // Fresh encrypted till, password "pw".
+        let answers = "https://pay.myshop.com\nhttps://myshop.com\n\npw\npw\n\nyes\n\n\n\n";
+        let mut out = Vec::new();
+        run(Cursor::new(answers), &mut out, &opts).unwrap();
+        let paths = Paths::resolve(Some(&dir.0));
+        assert!(
+            !paths.wallet_password_file.exists(),
+            "encrypted: no plaintext"
+        );
+
+        // Reconfigure: there is no readable password on disk, so the wizard must
+        // prompt for it. Supplying the right password reopens the wallet.
+        let mut recfg = opts_with(&dir.0);
+        recfg.reconfigure = true;
+        recfg.seal = Some(fake_sealer_ok());
+        // public, webhook, bind (Enter), restart (Enter = preserve), currencies
+        // gbp, rail n, then the EXISTING password prompt (pw) at wallet reopen.
+        let recfg_answers = "https://pay.myshop.com\nhttps://myshop.com\n\n\ngbp\nn\npw\n";
+        let mut out2 = Vec::new();
+        run(Cursor::new(recfg_answers), &mut out2, &recfg).unwrap();
+        let transcript = String::from_utf8(out2).unwrap();
+        assert!(transcript.contains("keeps no readable password on disk"));
+        assert!(transcript.contains("Reopening the existing till wallet"));
+        let env = fs::read_to_string(&paths.env_file).unwrap();
+        assert!(env.contains("GP_RATE_CURRENCIES=gbp"));
+        assert!(env.contains("ENCRYPTED at rest"));
     }
 
     #[test]

@@ -84,9 +84,15 @@ else
 
 Skipped the wizard. Finish setup either way:
   Guided (recommended):  $SUDO gp-server setup
-  By hand (advanced):    copy deploy/.env.example to $ENV_FILE and edit it,
-                         write $SECRETS_DIR/wallet_password (mode 0400), and
-                         bootstrap the wallet once with GP_MNEMONIC_FILE.
+  By hand (advanced):    copy deploy/.env.example to $ENV_FILE and edit it, then
+                         deliver the wallet password. Prefer ENCRYPTED at rest:
+                           printf '%s' 'YOUR-PASSWORD' | $SUDO systemd-creds encrypt \\
+                             --name=gp_wallet_password - $SECRETS_DIR/wallet_password.cred
+                         and switch the unit to LoadCredentialEncrypted (see
+                         deploy/gp-server.service). Or fall back to a 0400 plaintext
+                         $SECRETS_DIR/wallet_password. Bootstrap the wallet once with
+                         GP_MNEMONIC_FILE (a file, never the inline env var), then
+                         remove it.
 Then start it:  $SUDO systemctl start gp-server
 Check it:       curl -s http://127.0.0.1:8080/health
 EOF

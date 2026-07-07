@@ -245,6 +245,7 @@ fn run_setup(args: &[String]) -> i32 {
         node_override: None,
         force_run: false,
         stdin_is_tty: std::io::stdin().is_terminal(),
+        seal: None,
     };
     let mut i = 0;
     while i < args.len() {
@@ -323,6 +324,7 @@ fn first_run_or_boot(cfg: Config) -> Config {
         node_override: None,
         force_run: false,
         stdin_is_tty: true,
+        seal: None,
     };
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -373,6 +375,12 @@ async fn main() -> io::Result<()> {
     // guide the operator through the wizard, then boot from what it wrote. No-op
     // for configured deploys and non-terminal runs (zero behavior change).
     let cfg = first_run_or_boot(cfg);
+    // Loud deprecation warning if a money secret arrived inline (the bare env
+    // var) rather than as a file/systemd credential. The wizard and both shipped
+    // deployments use the file path, so a hardened deploy is silent here.
+    if let Some(warning) = cfg.inline_secret_warning() {
+        eprintln!("warning: {warning}");
+    }
     println!(
         "gp-server {} starting: {}",
         env!("CARGO_PKG_VERSION"),

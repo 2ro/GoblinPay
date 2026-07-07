@@ -254,7 +254,21 @@ pub struct Config {
     /// onion service proxies to (`GP_GRIN1_FOREIGN_PORT`, default 3416). Only
     /// used when `grin1_rail` is on.
     pub grin1_foreign_port: u16,
+    /// Names of the money/at-rest-encryption secrets that were supplied INLINE
+    /// (the bare `GP_MNEMONIC` / `GP_WALLET_PASSWORD` / `GP_NSEC` env vars)
+    /// rather than via their `_FILE` variant or a systemd credential. An inline
+    /// env var is visible to the whole process and (via `/proc`) to root for the
+    /// life of the service, so the startup path warns loudly when this is
+    /// non-empty. Never holds a secret VALUE, only variable names.
+    #[serde(skip)]
+    pub inline_secret_vars: Vec<String>,
 }
+
+/// The money/at-rest-encryption secrets whose INLINE env-var form is deprecated
+/// (deliver them as a `_FILE`/systemd credential instead). The bearer tokens and
+/// webhook secret are deliberately excluded: owner ruling O4 keeps those in the
+/// root-owned env file, so warning on them would be noise.
+pub const DEPRECATED_INLINE_SECRETS: &[&str] = &["GP_MNEMONIC", "GP_WALLET_PASSWORD", "GP_NSEC"];
 
 /// Default supported fiat currency when `GP_RATE_CURRENCIES` is unset.
 pub const DEFAULT_RATE_CURRENCY: &str = "usd";
@@ -314,6 +328,7 @@ impl Default for Config {
             confirmations_required: DEFAULT_CONFIRMATIONS,
             grin1_rail: false,
             grin1_foreign_port: DEFAULT_GRIN1_FOREIGN_PORT,
+            inline_secret_vars: Vec::new(),
         }
     }
 }
@@ -403,6 +418,16 @@ impl Config {
         let wallet_password = secret(get, "GP_WALLET_PASSWORD")?;
         let nsec = secret(get, "GP_NSEC")?;
         let ncryptsec = secret(get, "GP_NCRYPTSEC")?;
+
+        // Record which deprecated money secrets arrived INLINE (the bare var is
+        // set, not its `_FILE` variant). `secret()` already rejected setting both
+        // for a key, so a present bare var means the value came from the process
+        // environment, which the startup path warns about.
+        let inline_secret_vars = DEPRECATED_INLINE_SECRETS
+            .iter()
+            .filter(|k| get(k).is_some())
+            .map(|k| k.to_string())
+            .collect::<Vec<_>>();
 
         let public_url = get("GP_PUBLIC_URL")
             .map(|u| u.trim_end_matches('/').to_string())
@@ -497,9 +522,35 @@ impl Config {
             confirmations_required,
             grin1_rail,
             grin1_foreign_port,
+            inline_secret_vars,
         };
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// A loud, single-line-per-secret warning when any money secret was supplied
+    /// inline (the bare env var) instead of via its `_FILE` variant or a systemd
+    /// credential. `None` when every secret was delivered as a file/credential
+    /// (the wizard and both shipped deployments), so a hardened deploy is silent.
+    /// Never contains a secret value, only the offending variable names.
+    pub fn inline_secret_warning(&self) -> Option<String> {
+        if self.inline_secret_vars.is_empty() {
+            return None;
+        }
+        let names = self.inline_secret_vars.join(", ");
+        Some(format!(
+            "DEPRECATED: money secret(s) supplied inline as environment variables: {names}. \
+             An inline env var is readable by the whole process and, via /proc, by root for \
+             the life of the service. Deliver them as files instead ({names_file}) or via a \
+             systemd credential; see the shipped gp-server.service. The inline path still \
+             works but is deprecated and may be removed.",
+            names_file = self
+                .inline_secret_vars
+                .iter()
+                .map(|n| format!("{n}_FILE"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ))
     }
 
     /// The QR center logo to render: the inlined Goblin mark by default, an
@@ -995,6 +1046,40 @@ mod tests {
         assert!(load(&[("GP_QUOTE_TTL", "-1")]).is_err());
         assert!(load(&[("GP_RATE_CACHE_TTL", "-1")]).is_err());
         assert!(load(&[("GP_RATE_STALE_MAX", "-5")]).is_err());
+    }
+
+    #[test]
+    fn inline_money_secrets_are_flagged_but_files_are_silent() {
+        // Inline money secrets are recorded and produce a loud, value-free warning.
+        let cfg = load(&[
+            ("GP_MNEMONIC", "topsecret words"),
+            ("GP_WALLET_PASSWORD", "hushhush"),
+        ])
+        .unwrap();
+        assert_eq!(
+            cfg.inline_secret_vars,
+            vec!["GP_MNEMONIC".to_string(), "GP_WALLET_PASSWORD".to_string()]
+        );
+        let warn = cfg.inline_secret_warning().unwrap();
+        assert!(warn.contains("GP_MNEMONIC"));
+        assert!(warn.contains("GP_WALLET_PASSWORD"));
+        assert!(warn.contains("GP_MNEMONIC_FILE"));
+        assert!(warn.contains("DEPRECATED"));
+        // The warning never carries the secret VALUES.
+        assert!(!warn.contains("topsecret"));
+        assert!(!warn.contains("hushhush"));
+
+        // A file-delivered secret is NOT flagged (the hardened path is silent).
+        let path = std::env::temp_dir().join(format!("gp-pw-{}", std::process::id()));
+        std::fs::write(&path, "hushhush\n").unwrap();
+        let cfg = load(&[("GP_WALLET_PASSWORD_FILE", path.to_str().unwrap())]).unwrap();
+        assert!(cfg.inline_secret_vars.is_empty());
+        assert!(cfg.inline_secret_warning().is_none());
+        std::fs::remove_file(&path).unwrap();
+
+        // Bearer tokens/webhook secret inline are deliberately NOT flagged (O4).
+        let cfg = load(&[("GP_API_TOKEN", "gp_live_x"), ("GP_ADMIN_TOKEN", "gpadm_x")]).unwrap();
+        assert!(cfg.inline_secret_warning().is_none());
     }
 
     #[test]

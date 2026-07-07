@@ -9,8 +9,7 @@
 </head>
 <body>
 <main class="checkout">
-  <a class="brand" href="{{ info.base }}/"><img class="brandmark" src="{{ info.base }}/static/goblinpay-wordmark.svg" alt="GoblinPay"></a>
-  <h1>Pay with Goblin</h1>
+  <h1 class="brand"><a href="{{ info.base }}/"><img class="brandmark" src="{{ info.base }}/static/goblinpay-wordmark.svg" alt="Pay with Goblin"></a></h1>
   <p class="amount">{{ info.amount_display }}</p>
 
   {% if is_confirmed %}

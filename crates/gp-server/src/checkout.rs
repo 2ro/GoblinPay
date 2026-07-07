@@ -96,7 +96,15 @@ pub fn build_info(
     } else {
         pay_uri(&nprofile, inv)
     };
-    let qr_svg = qr::svg(&qr_payload, cfg.qr_logo()).unwrap_or_default();
+    // Pay-page payment QRs carry the centered Goblin emblem (owner ruling,
+    // superseding the earlier plain-by-default). An operator's explicit custom
+    // image (GP_QR_LOGO=<url>) is still honored; an unset/off config now
+    // resolves to the built-in emblem rather than a plain code.
+    let pay_logo = match cfg.qr_logo() {
+        qr::Logo::None => qr::Logo::Builtin,
+        other => other,
+    };
+    let qr_svg = qr::svg(&qr_payload, pay_logo).unwrap_or_default();
     // The Slatepack (grin1) address is stable and reused across invoices; its
     // QR carries the bare address (a Grin wallet reads no amount from it, so
     // the page states the amount to send in text next to it). No address means
@@ -113,7 +121,7 @@ pub fn build_info(
     let grin_rail_on = cfg.grin1_rail && cfg.checkout_slatepack;
     let (slatepack_address, slatepack_qr_svg) = match slatepack_addr {
         Some(addr) if grin_rail_on && plain_send_allowed && !addr.is_empty() => {
-            let qr = qr::svg(addr, cfg.qr_logo()).unwrap_or_default();
+            let qr = qr::svg(addr, pay_logo).unwrap_or_default();
             (Some(addr.to_string()), Some(qr))
         }
         _ => (None, None),
@@ -123,7 +131,7 @@ pub fn build_info(
     // still on). Its QR carries the armored slatepack text verbatim.
     let (invoice_slatepack, invoice_slatepack_qr_svg) = match invoice_slatepack {
         Some(armor) if grin_rail_on && !armor.is_empty() => {
-            let qr = qr::svg(armor, cfg.qr_logo()).unwrap_or_default();
+            let qr = qr::svg(armor, pay_logo).unwrap_or_default();
             (Some(armor.to_string()), Some(qr))
         }
         _ => (None, None),

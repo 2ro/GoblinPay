@@ -67,6 +67,7 @@ fn checkout_json(
         "recipient_pubkey": info.recipient_pubkey,
         "npub": info.npub,
         "nprofile": info.nprofile,
+        "pay_link": info.pay_link,
         "qr_svg": info.qr_svg,
         "amount": info.amount_display,
         "status": info.status,

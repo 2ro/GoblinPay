@@ -270,6 +270,12 @@ add_action('plugins_loaded', function () {
             if (!empty($body['nprofile'])) {
                 $order->update_meta_data('_goblinpay_nprofile', sanitize_text_field((string) $body['nprofile']));
             }
+            if (!empty($body['pay_link'])) {
+                // The goblin: deep link (same payload the QR carries). Powers the
+                // "Open in Goblin" pill on the embedded panel; a tap on the device
+                // holding the wallet opens it straight to a prefilled review.
+                $order->update_meta_data('_goblinpay_pay_link', sanitize_text_field((string) $body['pay_link']));
+            }
             if (!empty($body['amount'])) {
                 $order->update_meta_data('_goblinpay_amount', sanitize_text_field((string) $body['amount']));
             }
@@ -327,6 +333,7 @@ add_action('plugins_loaded', function () {
             $qr       = (string) $order->get_meta('_goblinpay_qr_svg');
             $nprofile = (string) $order->get_meta('_goblinpay_nprofile');
             $pay_url  = (string) $order->get_meta('_goblinpay_pay_url');
+            $pay_link = (string) $order->get_meta('_goblinpay_pay_link');
             $amount   = (string) $order->get_meta('_goblinpay_amount');
 
             echo '<section class="goblinpay-panel" style="margin:1.5em 0;max-width:420px;border:1px solid #33322a;border-radius:16px;overflow:hidden;background:#1e1e17;color:#f4f1e6;font-family:system-ui,-apple-system,\'Segoe UI\',Roboto,sans-serif">';
@@ -336,13 +343,23 @@ add_action('plugins_loaded', function () {
             echo '</div>';
             echo '<div class="goblinpay-body" style="padding:1.1em 1.25em 1.35em">';
             echo '<h2 style="margin:0 0 0.35em;font-size:1.2em;color:#f4f1e6">' . esc_html__('Pay with Goblin (GRIN)', 'goblinpay-woocommerce') . '</h2>';
-            echo '<p style="margin:0 0 0.75em;color:#a8a294;font-size:0.92em">' . esc_html__('Scan this code with your Goblin Wallet to pay.', 'goblinpay-woocommerce') . '</p>';
             if ('' !== $amount) {
                 echo '<p style="margin:0 0 0.75em;font-size:1.5em;font-weight:700;color:#e9c542">' . esc_html($amount) . '</p>';
             }
             if ('' !== $qr) {
                 echo '<div class="goblinpay-qr" style="background:#fff;border-radius:14px;padding:0.75em;max-width:280px;margin:0 auto 0.75em">' . goblinpay_wc_kses_svg($qr) . '</div>';
             }
+            // "Open in Goblin" deep link: the primary tap-to-pay affordance on the
+            // device that holds the wallet, carrying the same goblin: payload as
+            // the QR. The gold accent pill mirrors the hosted /pay page. Harmless
+            // where the goblin: scheme has no handler. goblin: is not in esc_url's
+            // default protocol allow-list, so it is passed explicitly.
+            if ('' !== $pay_link) {
+                echo '<p style="text-align:center;margin:0 0 0.75em"><a href="' . esc_url($pay_link, array('goblin')) . '" style="display:inline-block;background:#e9c542;color:#201d09;text-decoration:none;border-radius:999px;padding:0.7em 1.4em;font-weight:700;font-size:1em">'
+                    . esc_html__('Open in Goblin', 'goblinpay-woocommerce') . '</a></p>';
+            }
+            echo '<p style="margin:0 0 0.75em;color:#a8a294;font-size:0.92em">'
+                . esc_html__('On this device, tap Open in Goblin. On another, scan the code with your Goblin Wallet, or copy the address below.', 'goblinpay-woocommerce') . '</p>';
             if ('' !== $nprofile) {
                 echo '<p style="word-break:break-all;font-family:ui-monospace,monospace;font-size:12px;color:#a8a294;background:#14140f;border-radius:10px;padding:0.5em 0.65em">' . esc_html($nprofile) . '</p>';
             }
@@ -522,19 +539,29 @@ function goblinpay_wc_maybe_expire_order($order_id) {
 }
 
 /**
- * The GoblinPay wordmark, Apple Pay style: a gold Goblin "P" badge next to the
- * "GoblinPay" name. Emitted as self-contained inline SVG so it renders on the
- * order-received page with no external asset request (the GoblinPay static dir
- * is not reachable from the shop's origin). Trusted, plugin-authored markup.
+ * The white "Goblin Pay" lockup, Apple Pay style: the full wordmark on the dark
+ * panel header, matching the hosted /pay page's brandmark exactly. Emitted as
+ * self-contained inline SVG so it renders on the order-received page with no
+ * external asset request (the GoblinPay static dir is not reachable from the
+ * shop's origin). The lockup carries its own name, so no separate heading text
+ * sits beside it. Trusted, plugin-authored markup.
+ *
+ * Kept path-for-path in sync with GoblinPay's static/goblinpay-wordmark.svg
+ * (byte-identical to the owner's Goblin-Pay-W.svg): same viewBox and glyph
+ * geometry, white fill, rendered here at a modest ~30px header height.
  */
 function goblinpay_wc_wordmark() {
-    return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 168 32" height="22" role="img" aria-label="GoblinPay" style="display:block">'
-        . '<g transform="translate(0 2) scale(0.4375)">'
-        . '<rect width="64" height="64" rx="14" fill="#e9c542"/>'
-        . '<path fill="#201d09" fill-rule="evenodd" d="M22 14H35a12 12 0 0 1 0 24H30V50H22ZM30 21H34a6 6 0 0 1 0 12H30Z"/>'
-        . '</g>'
-        . '<text x="38" y="23" font-family="system-ui,-apple-system,\'Segoe UI\',Roboto,sans-serif" font-size="21" font-weight="700" letter-spacing="-0.5" fill="#f4f1e6">Goblin<tspan fill="#e9c542">Pay</tspan></text>'
-        . '</svg>';
+    return <<<'SVG'
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 232" height="30" role="img" aria-label="Goblin Pay" preserveAspectRatio="xMidYMid meet" style="display:block">
+<g transform="translate(0,232) scale(0.05,-0.05)" fill="#ffffff" stroke="none">
+<path d="M52 4522 c-131 -444 37 -874 416 -1064 l122 -61 -95 11 c-111 13 -226 67 -324 154 -83 72 -86 66 -28 -48 140 -278 398 -434 715 -434 197 0 331 45 362 120 62 150 316 340 520 391 271 67 273 570 2 813 -194 175 -626 253 -842 152 l-70 -33 91 -1 c191 -4 428 -112 506 -231 36 -53 15 -72 -26 -23 -89 108 -361 154 -623 104 -384 -72 -552 -22 -664 197 l-30 60 -32 -107z"/>
+<path d="M4560 2533 l0 -1610 285 3 285 4 5 573 6 573 484 9 c534 10 636 29 838 158 583 370 592 1348 15 1718 -240 155 -320 167 -1163 175 l-755 7 0 -1610z m1450 1080 c389 -170 416 -801 42 -998 -75 -40 -118 -44 -497 -51 l-415 -8 0 554 0 554 395 -8 c319 -7 410 -15 475 -43z"/>
+<path d="M3139 3938 c-92 -222 -202 -268 -639 -268 -462 0 -625 -70 -783 -338 -58 -100 -60 -71 -4 66 37 92 27 95 -96 29 -298 -160 -537 -548 -537 -871 0 -117 -1 -117 -150 -4 -124 94 -359 217 -456 240 l-55 13 43 -108 c23 -59 67 -230 98 -381 87 -422 215 -636 412 -686 l94 -23 -4 -152 c-8 -255 71 -431 252 -564 108 -79 133 -87 119 -36 -6 19 -16 75 -24 125 l-14 90 86 -87 c155 -155 391 -243 648 -243 238 1 257 17 94 80 -148 58 -352 193 -453 300 l-60 63 150 -81 c278 -149 618 -181 915 -86 79 25 130 33 138 20 43 -71 324 -122 433 -79 31 12 26 23 -37 83 -138 133 -143 166 -41 260 116 107 160 201 145 310 -11 78 -6 89 69 162 122 118 151 178 228 468 39 147 96 319 127 383 65 137 62 139 -143 85 -158 -41 -258 -93 -362 -188 l-84 -77 -33 95 c-42 118 -118 202 -181 202 -63 0 -316 127 -366 183 -21 23 -29 39 -18 34 11 -5 54 -25 96 -44 600 -273 1151 104 1154 791 l0 94 -101 -107 c-197 -209 -486 -299 -738 -231 l-88 23 64 51 c95 74 147 190 147 330 0 142 -10 158 -45 74z m-172 -1574 c115 -128 161 -505 71 -595 -162 -162 -289 -89 -286 164 3 327 112 544 215 431z m-1030 -33 c101 -52 201 -243 241 -459 71 -385 -574 -317 -668 70 -55 226 234 489 427 389z m1703 -77 c0 -181 -102 -341 -141 -222 l-24 74 -27 -63 c-47 -112 -128 -19 -128 146 0 76 37 97 54 31 12 -47 46 -54 46 -9 0 48 62 61 92 19 26 -35 27 -35 41 2 37 103 87 116 87 22z m-2770 -34 c16 -73 41 -77 58 -10 33 129 140 -19 128 -177 l-6 -83 -43 66 -42 66 -13 -51 c-14 -56 -66 -69 -85 -21 -17 45 -36 36 -61 -30 -50 -132 -103 -48 -68 108 39 175 108 243 132 132z m1350 -837 c0 -123 205 -183 399 -116 109 38 122 31 46 -24 -212 -151 -633 -30 -516 148 43 65 71 62 71 -8z"/>
+<path d="M7910 3299 c-533 -109 -818 -523 -817 -1189 0 -436 84 -696 300 -929 341 -369 1014 -413 1335 -88 l90 92 -13 -78 c-7 -42 -13 -99 -14 -127 l-1 -50 250 -6 c138 -3 270 -1 295 6 l45 11 0 1159 0 1160 -281 0 -281 0 14 -125 14 -125 -82 84 c-183 188 -531 271 -854 205z m590 -485 c333 -171 432 -878 177 -1262 -222 -336 -773 -264 -938 121 -297 691 196 1430 761 1141z"/>
+<path d="M9680 3249 c0 -6 211 -496 469 -1090 l469 -1078 -84 -201 c-162 -386 -315 -476 -665 -388 l-49 12 0 -231 c0 -269 -11 -255 217 -268 402 -22 736 151 909 470 43 81 553 1429 994 2630 l57 155 -296 0 -295 0 -256 -730 c-141 -402 -260 -726 -265 -722 -5 5 -146 331 -314 725 l-305 717 -293 6 c-161 3 -293 0 -293 -7z"/>
+</g>
+</svg>
+SVG;
 }
 
 /**

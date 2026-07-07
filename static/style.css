@@ -65,6 +65,23 @@ h2 { font-size: 1.05rem; margin: 1.75rem 0 0.5rem; color: var(--dim); text-trans
 }
 .qr svg { display: block; width: 100%; height: auto; }
 
+/* "Open in Goblin" deep-link: the primary tap-to-pay affordance on the device
+   that holds the wallet. Styled as the accent pill (matching the submit button)
+   but centered under the QR. Harmless where the goblin: scheme has no handler. */
+.open-wallet {
+  display: block;
+  width: fit-content;
+  margin: 0 auto 0.75rem;
+  background: var(--accent);
+  color: #201d09;
+  text-decoration: none;
+  border-radius: 999px;
+  padding: 0.7rem 1.4rem;
+  font-weight: 700;
+  font-size: 1rem;
+}
+.open-wallet:hover { filter: brightness(1.05); }
+
 .hint { color: var(--dim); font-size: 0.9rem; }
 .memo { color: var(--ink); background: var(--panel); padding: 0.5rem 0.75rem; border-radius: 10px; }
 

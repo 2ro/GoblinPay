@@ -39,6 +39,11 @@ pub struct CheckoutInfo {
     pub npub: String,
     pub nprofile: String,
     pub qr_svg: String,
+    /// The `goblin:` deep link for the "Open in Goblin" affordance: tapping it on
+    /// a device with the wallet installed opens it straight to a prefilled review
+    /// (recipient, amount, memo). Same payload the QR carries. Empty when there is
+    /// no Nostr recipient (nothing to open).
+    pub pay_link: String,
     /// The wallet's stable `grin1` Slatepack address, when a wallet is loaded
     /// AND the plain-send fallback is permitted for this invoice (the render
     /// gate: an amount collision with an earlier open grin1 invoice hides it).
@@ -90,7 +95,7 @@ pub fn build_info(
     // The QR carries a pay-URI so a scanning wallet can auto-fill the amount
     // (and memo). The human-readable nprofile/npub strings on the page are
     // unchanged — only the QR payload gains the query. An invalid pubkey yields
-    // an empty nprofile; keep that empty (no useless `nostr:` QR).
+    // an empty nprofile; keep that empty (no useless `goblin:` QR).
     let qr_payload = if nprofile.is_empty() {
         nprofile.clone()
     } else {
@@ -146,6 +151,7 @@ pub fn build_info(
         recipient_pubkey,
         npub,
         nprofile,
+        pay_link: qr_payload,
         qr_svg,
         slatepack_address,
         slatepack_qr_svg,
@@ -178,17 +184,22 @@ fn amount_display(inv: &Invoice) -> String {
     }
 }
 
-/// Build the QR pay-URI for an invoice: `nostr:<nprofile>`, plus `?amount=`
+/// Build the pay-URI for an invoice: `goblin:<nprofile>`, plus `?amount=`
 /// when the invoice has an exact expected amount, plus `&memo=` when it carries
 /// a human memo. A scanning Goblin wallet auto-fills the amount (and note) from
-/// this; open-amount invoices stay a bare `nostr:<nprofile>`.
+/// this; open-amount invoices stay a bare `goblin:<nprofile>`.
+///
+/// `goblin:` is the wallet's registered deep-link scheme (an "Open in Goblin"
+/// link hands the OS the URI and the wallet opens straight to a prefilled
+/// review). The wallet accepts the equivalent `nostr:` form too, but we emit
+/// `goblin:` for both the clickable link and the QR so the two agree.
 ///
 /// The URI never carries the invoice token or any key — only the already-public
 /// recipient nprofile, relay hints, the amount, and the human memo shown on the
 /// page. `expected_amount` is a locked nanogrin quote (i64 in the DB, always
 /// non-negative here); only strictly positive amounts are emitted.
 fn pay_uri(nprofile: &str, inv: &Invoice) -> String {
-    let mut uri = format!("nostr:{nprofile}");
+    let mut uri = format!("goblin:{nprofile}");
     let mut sep = '?';
     if let Some(nano) = inv.expected_amount {
         if nano > 0 {
@@ -851,19 +862,19 @@ mod tests {
 
     #[test]
     fn amount_invoice_encodes_amount() {
-        // 1.5 GRIN → nostr:<nprofile>?amount=1.5
+        // 1.5 GRIN → goblin:<nprofile>?amount=1.5
         let inv = invoice(Some(1_500_000_000), None);
         assert_eq!(
             pay_uri("nprofile1abc", &inv),
-            "nostr:nprofile1abc?amount=1.5"
+            "goblin:nprofile1abc?amount=1.5"
         );
     }
 
     #[test]
     fn open_amount_invoice_stays_bare() {
-        // Open amount (no expected_amount, no memo) → bare nostr:<nprofile>.
+        // Open amount (no expected_amount, no memo) → bare goblin:<nprofile>.
         let inv = invoice(None, None);
-        assert_eq!(pay_uri("nprofile1abc", &inv), "nostr:nprofile1abc");
+        assert_eq!(pay_uri("nprofile1abc", &inv), "goblin:nprofile1abc");
     }
 
     #[test]
@@ -871,7 +882,7 @@ mod tests {
         let inv = invoice(Some(1_000_000_000), Some("Coffee & cake"));
         assert_eq!(
             pay_uri("nprofile1abc", &inv),
-            "nostr:nprofile1abc?amount=1&memo=Coffee%20%26%20cake"
+            "goblin:nprofile1abc?amount=1&memo=Coffee%20%26%20cake"
         );
     }
 
@@ -879,19 +890,19 @@ mod tests {
     fn memo_only_uses_question_mark() {
         // No amount but a memo → the memo is the first (and only) query param.
         let inv = invoice(None, Some("hi"));
-        assert_eq!(pay_uri("nprofile1abc", &inv), "nostr:nprofile1abc?memo=hi");
+        assert_eq!(pay_uri("nprofile1abc", &inv), "goblin:nprofile1abc?memo=hi");
     }
 
     #[test]
     fn zero_and_blank_are_treated_as_open() {
         assert_eq!(
             pay_uri("nprofile1abc", &invoice(Some(0), None)),
-            "nostr:nprofile1abc"
+            "goblin:nprofile1abc"
         );
         // A whitespace-only memo is dropped.
         assert_eq!(
             pay_uri("nprofile1abc", &invoice(None, Some("   "))),
-            "nostr:nprofile1abc"
+            "goblin:nprofile1abc"
         );
     }
 

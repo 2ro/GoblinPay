@@ -42,7 +42,8 @@
       {% if has_goblin %}
       <section class="rail-panel" id="panel-goblin">
         <div class="qr">{{ info.qr_svg|safe }}</div>
-        <p class="hint">Scan with your Goblin Wallet, or copy the address below.</p>
+        {% if !info.pay_link.is_empty() %}<a class="open-wallet" href="{{ info.pay_link }}">Open in Goblin</a>{% endif %}
+        <p class="hint">On this device, tap Open in Goblin. On another, scan the code with your Goblin Wallet, or copy the address below.</p>
         <label for="nprofile">Payment address (nprofile)</label>
         <textarea id="nprofile" class="copybox" rows="3" readonly>{{ info.nprofile }}</textarea>
       </section>

@@ -14,10 +14,14 @@
 # exposed read-only to the dynamic service user) rather than left world-readable.
 #
 # Restart mode (the wizard asks; default UNATTENDED):
-#   UNATTENDED — the chosen password is sealed to THIS host as the 0400 file
-#     below, so the service auto-restarts with no human. Honest trade-off: a
-#     full-machine compromise means wallet compromise; keep the till a small hot
-#     float and sweep to your own wallet regularly.
+#   UNATTENDED: the chosen password is sealed to THIS host and the service
+#     auto-restarts with no human. By default (systemd-creds present) it is
+#     ENCRYPTED at rest: a `systemd-creds encrypt` ciphertext blob, decrypted
+#     into a tmpfs credentials dir at each start, so no plaintext key is on disk.
+#     If systemd-creds is unavailable it falls back to a root-owned 0400 plaintext
+#     file (with a loud warning). Honest trade-off: a compromise of the RUNNING
+#     host still means wallet compromise; keep the till a small hot float and
+#     sweep to your own wallet regularly.
 #   MANUAL — nothing is stored on disk; the operator re-enters the password after
 #     every restart. The wizard drops in gp-server.service.d/manual.conf, which
 #     repoints LoadCredential to a tmpfs path (/run/goblinpay/wallet_password)
@@ -46,13 +50,30 @@ DynamicUser=yes
 # as root, so a 0640 root:root file is fine even under DynamicUser.
 EnvironmentFile=/etc/goblinpay.env
 
-# The wallet password as a credential: the source file stays root-owned 0400
-# (in UNATTENDED mode the wizard writes the operator's CHOSEN password there);
-# systemd exposes a copy under $CREDENTIALS_DIRECTORY (%d), readable by the
-# dynamic service user. The wallet is pointed at it via the *_FILE variant. This
-# overrides any GP_WALLET_PASSWORD_FILE in the env file above, so the service
-# always reads the credential copy. In MANUAL mode the manual.conf drop-in resets
-# this line and reads /run/goblinpay/wallet_password (tmpfs) instead.
+# The wallet password as a credential. systemd exposes it under
+# $CREDENTIALS_DIRECTORY (%d), readable only by the dynamic service user, and the
+# wallet is pointed at it via the *_FILE variant. This overrides any
+# GP_WALLET_PASSWORD_FILE in the env file above, so the service always reads the
+# credential copy at %d/gp_wallet_password.
+#
+# The wizard (`gp-server setup`) writes a drop-in that picks the delivery:
+#   * UNATTENDED, ENCRYPTED (the secure default): gp-server.service.d/encrypted.conf
+#     resets the line below and uses `LoadCredentialEncrypted=` to read a
+#     host-sealed CIPHERTEXT blob (wallet_password.cred, made with
+#     `systemd-creds encrypt`). No plaintext wallet password is on disk.
+#   * UNATTENDED, plaintext fallback (only when systemd-creds is unavailable):
+#     no drop-in; the line below reads the root-owned 0400 PLAINTEXT file.
+#   * MANUAL: gp-server.service.d/manual.conf resets the line and reads
+#     /run/goblinpay/wallet_password (tmpfs), which the operator populates by hand.
+#
+# The line below is the plaintext-fallback default so a by-hand install works out
+# of the box. To harden a by-hand install, seal the password and switch to the
+# encrypted directive:
+#   printf '%s' 'YOUR-WALLET-PASSWORD' \
+#     | sudo systemd-creds encrypt --name=gp_wallet_password - \
+#         /etc/goblinpay/secrets/wallet_password.cred
+#   # then, in a drop-in, replace the LoadCredential line below with:
+#   #   LoadCredentialEncrypted=gp_wallet_password:/etc/goblinpay/secrets/wallet_password.cred
 LoadCredential=gp_wallet_password:/etc/goblinpay/secrets/wallet_password
 Environment=GP_WALLET_PASSWORD_FILE=%d/gp_wallet_password
 # First-boot-only seed bootstrap WITHOUT the wizard (remove after the wallet

@@ -111,8 +111,9 @@ Everything else it does for you:
 - defaults the relays to an external vetted pool (the wallet's proven relays);
 - writes `/etc/goblinpay.env` (mode 0640, holds the config plus the bearer
   tokens) exactly where the shipped `gp-server.service` looks (`EnvironmentFile`),
-  and — in unattended mode — `/etc/goblinpay/secrets/wallet_password` (mode 0400)
-  where its `LoadCredential` reads it;
+  and, in unattended mode, seals your wallet password to this host with
+  `systemd-creds` as an encrypted-at-rest credential (`wallet_password.cred`,
+  read via `LoadCredentialEncrypted`), so no plaintext key is written to disk;
 - prints the webhook URL and the three values to paste into WooCommerce
   (GoblinPay URL, API Token, Webhook Secret) plus the private admin token.
 
@@ -121,12 +122,20 @@ Everything else it does for you:
 The wizard asks how the till should restart after a reboot; press Enter for the
 default. Both are honest about their trade-off:
 
-- **Unattended (default).** Your chosen password is sealed to *this host* as a
-  systemd credential (the 0400 file above), so the service auto-restarts with no
-  human in the loop. Be clear-eyed about the trade-off: whoever fully controls
-  this machine controls the wallet. Treat the till as a small hot wallet — hold
-  only a working balance and sweep to your own wallet regularly (see *Secrets and
-  the wallet seed*).
+- **Unattended (default).** Your chosen password is sealed to *this host* and the
+  service auto-restarts with no human in the loop. By default it is **encrypted at
+  rest**: the wizard runs `systemd-creds encrypt` to write a ciphertext blob
+  (`/etc/goblinpay/secrets/wallet_password.cred`) that only this host (and its TPM,
+  when present) can decrypt, and systemd decrypts it into a tmpfs credentials
+  directory at each start, so no plaintext key is ever written to disk. If
+  `systemd-creds` is unavailable (older systemd, or no host credential key) it
+  falls back to a root-owned 0400 plaintext file and prints a loud warning; re-run
+  `gp-server setup --reconfigure` once systemd-creds is available to encrypt it.
+  Be clear-eyed about the trade-off: whoever fully controls the *running* machine
+  can still have systemd decrypt the credential, so a live-host compromise means
+  wallet compromise. Treat the till as a small hot wallet: hold only a working
+  balance and sweep to your own wallet regularly (see *Secrets and the wallet
+  seed*).
 - **Manual.** The password lives only in your head; nothing sensitive is written
   to disk. The wizard drops in `gp-server.service.d/manual.conf`, which repoints
   the credential to a tmpfs path (`/run/goblinpay/wallet_password`). You supply
@@ -297,17 +306,26 @@ Deliver both secrets as files rather than plain environment variables:
 `GP_NCRYPTSEC_FILE` (mode 0400 recommended). Setting both a variable and its
 `_FILE` variant is an error, as is setting both `GP_NSEC` and `GP_NCRYPTSEC`.
 An environment variable is visible to the whole process (and via `/proc` to the
-same user and root) for the life of the service; a file is not. The shipped
-`deploy/gp-server.service` reads the seed and password with systemd
-`LoadCredential` (they land under `$CREDENTIALS_DIRECTORY`, pointed at by the
+same user and root) for the life of the service; a file is not. **Supplying
+`GP_MNEMONIC`, `GP_WALLET_PASSWORD`, or `GP_NSEC` inline is deprecated: the
+server prints a loud warning at startup and the path may be removed.** The
+shipped `deploy/gp-server.service` reads the seed and password with systemd
+credentials (they land under `$CREDENTIALS_DIRECTORY`, pointed at by the
 `_FILE` variables), and `deploy/docker-compose.yml` mounts them under
 `/run/secrets`, so with either deployment nothing sensitive is in the
 environment.
 
 You choose `GP_WALLET_PASSWORD` yourself (the wizard prompts for it twice and
 confirms the match; it is never auto-generated). How it reaches the service on
-restart is the restart-mode choice above: sealed to the host for unattended
-auto-restart, or re-entered by hand each start in manual mode.
+restart is the restart-mode choice above. In **unattended** mode the wizard seals
+it with `systemd-creds` into an encrypted-at-rest credential
+(`wallet_password.cred`), which the unit reads via `LoadCredentialEncrypted` and
+systemd decrypts into a tmpfs credentials dir at each start, so the key exists as
+plaintext only in the memory of the running service, never as a plaintext file on
+disk (with a 0400-plaintext fallback, plus a warning, when `systemd-creds` is
+unavailable). In **manual** mode nothing is stored on disk and you re-enter it at
+each start. Reconfiguring an encrypted or manual till (which keeps no readable
+password on disk) prompts you for the existing password to reopen the wallet.
 
 Treat the till as a small hot wallet. Grin receives are interactive, so the
 till must hold live keys; keep the risk small by giving it a seed of its own,

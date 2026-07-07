@@ -36,7 +36,7 @@ main.admin { max-width: 60rem; }
    reads "Goblin Pay"), keeping the sheet clean and uncluttered. The lockup is
    the page's h1; its alt carries the heading for assistive tech. */
 .brand { margin: 0.25rem 0 1.75rem; text-align: center; line-height: 0; }
-.brandmark { height: 34px; width: auto; display: inline-block; }
+.brandmark { height: 4rem; width: auto; display: inline-block; }
 
 h1 { font-size: 1.5rem; margin: 0 0 0.5rem; }
 h2 { font-size: 1.05rem; margin: 1.75rem 0 0.5rem; color: var(--dim); text-transform: uppercase; letter-spacing: 0.04em; }

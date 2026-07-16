@@ -24,7 +24,7 @@
     <p class="status open">Waiting for payment&#8230;</p>
 
     {% let has_goblin = !info.nprofile.is_empty() %}
-    {% let has_grin = info.invoice_slatepack.is_some() || info.slatepack_address.is_some() %}
+    {% let has_grin = info.invoice_slatepack.is_some() || info.slatepack_address.is_some() || info.slatepack_manual %}
 
     <div class="rails">
       {% if has_goblin && has_grin %}
@@ -71,11 +71,15 @@
         </div>
         {% endif %}
 
-        {# The manual fallback for BOTH grin sub-rails: a plain-send S1 is
-           received here, and an invoice response (I2) is finalized here when
-           the payer's wallet cannot reach us over Tor. #}
+        {# The manual copy/paste receive: a plain-send S1 is received here, and
+           (grin1 rail) an invoice response (I2) is finalized here when the
+           payer's wallet cannot reach us over Tor. Offered whenever the
+           slatepack method is enabled and a wallet is loaded — no Tor rail
+           required. #}
+        {% if info.slatepack_manual %}
         <div class="grin-sub">
           <h3>Paste a slatepack</h3>
+          <p class="hint">Send exactly <strong>{{ info.amount_display }}</strong> from your Grin wallet, then paste the slatepack it produces below. Your payment is <strong>not complete</strong> until you copy the response slatepack we return back into your wallet and broadcast it.</p>
           <form method="post" action="{{ info.base }}/pay/{{ info.token }}/slatepack">
             <label for="s1">Your slatepack</label>
             <textarea id="s1" name="slatepack" rows="6" required
@@ -83,13 +87,14 @@
             <button type="submit">Submit slatepack</button>
           </form>
         </div>
+        {% endif %}
       </section>
       {% endif %}
     </div>
   {% endif %}
 
   {% if let Some(memo) = info.memo %}<p class="memo">{{ memo }}</p>{% endif %}
-  <p class="footer">Powered by GoblinPay &middot; receive-only Grin over Nostr{% if info.invoice_slatepack.is_some() || info.slatepack_address.is_some() %} and Tor{% endif %}</p>
+  <p class="footer">Powered by GoblinPay &middot; receive-only Grin over Nostr{% if info.slatepack_manual || info.slatepack_address.is_some() %} and Grin slatepack{% endif %}{% if info.invoice_slatepack.is_some() %} over Tor{% endif %}</p>
 </main>
 </body>
 </html>

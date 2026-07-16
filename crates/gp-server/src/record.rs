@@ -4,16 +4,33 @@
 
 use gp_core::config::MatchMode;
 use gp_core::invoice;
-use gp_core::matching::{match_payment, IncomingPayment, MatchResult};
+use gp_core::matching::{match_payment, AmountMismatch, IncomingPayment, MatchResult};
 use gp_core::webhook::{enqueue, WebhookPayload};
 use gp_wallet::Received;
 use log::{error, warn};
 use sqlx::SqlitePool;
 
+/// The result of [`persist_and_match`].
+#[derive(Debug, Clone)]
+pub enum PersistOutcome {
+    /// The payment was recorded and resolved (possibly to nothing).
+    Matched(MatchResult),
+    /// The received amount does not equal the matched invoice's expected
+    /// amount, so the payment was REJECTED: no payment row is persisted, the
+    /// invoice is left open, and no webhook is enqueued. Carries the exact
+    /// figures (nanogrin) so the caller can tell the payer what to send.
+    Rejected(AmountMismatch),
+}
+
 /// Insert the payment row, resolve it to an invoice/user, and enqueue the
-/// webhook if one is configured. Returns what it matched. Never fails the
-/// caller: the money is already in hand, so persistence/matching/webhook
-/// errors are logged and swallowed.
+/// webhook if one is configured. Returns what it matched. A correct payment
+/// never fails the caller: the money is already in hand, so persistence/
+/// matching/webhook errors are logged and swallowed.
+///
+/// The one hard stop is the amount-binding guard: if the payment resolves to an
+/// invoice whose exact expected amount it does not pay, the just-inserted
+/// payment row is removed and [`PersistOutcome::Rejected`] is returned — the
+/// invoice never flips paid on an under- or overpayment.
 pub async fn persist_and_match(
     pool: &SqlitePool,
     received: &Received,
@@ -22,7 +39,7 @@ pub async fn persist_and_match(
     memo: Option<&str>,
     default_mode: MatchMode,
     webhook: Option<&(String, String)>,
-) -> MatchResult {
+) -> PersistOutcome {
     let inserted = sqlx::query(
         "INSERT INTO payment \
              (id, amount, payer, slate_id, kernel, proof, s2_armor, recipient, status, \
@@ -65,6 +82,24 @@ pub async fn persist_and_match(
         }
     };
 
+    // Amount-binding rejection: the slate resolved to an invoice but pays the
+    // wrong amount. Undo the record (nothing is persisted for a rejected
+    // payment) and return the mismatch without notifying the store.
+    if let Some(mismatch) = matched.amount_mismatch {
+        if let Err(e) = sqlx::query("DELETE FROM payment WHERE id = ?1")
+            .bind(&received.slate_id)
+            .execute(pool)
+            .await
+        {
+            warn!("payment record delete for {}: {e}", received.slate_id);
+        }
+        warn!(
+            "rejected {}: pays {} nanogrin, invoice expects {} nanogrin",
+            received.slate_id, mismatch.received, mismatch.expected
+        );
+        return PersistOutcome::Rejected(mismatch);
+    }
+
     if let Some((url, _secret)) = webhook {
         let order_ref = match matched.invoice_id.as_deref() {
             Some(id) => invoice::get(pool, id)
@@ -87,5 +122,5 @@ pub async fn persist_and_match(
         }
     }
 
-    matched
+    PersistOutcome::Matched(matched)
 }

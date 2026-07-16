@@ -40,6 +40,17 @@ pub struct IncomingPayment<'a> {
     pub memo: Option<&'a str>,
 }
 
+/// A resolved invoice whose expected amount did not equal the received amount:
+/// the payment is REJECTED (never marked paid, never linked). Carries the exact
+/// figures (nanogrin) so the caller can tell the payer precisely what to send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AmountMismatch {
+    /// The invoice's locked expected amount, in nanogrin.
+    pub expected: u64,
+    /// The amount the pasted/received slate actually pays, in nanogrin.
+    pub received: u64,
+}
+
 /// What the payment resolved to.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MatchResult {
@@ -47,6 +58,10 @@ pub struct MatchResult {
     pub invoice_id: Option<String>,
     /// The tenant user it credits, if the endpub belongs to one.
     pub user_id: Option<String>,
+    /// Set when a candidate invoice was resolved by identity/memo but its
+    /// expected amount does not equal the received amount. The payment is then
+    /// rejected: `invoice_id`/`user_id` are cleared and nothing is marked paid.
+    pub amount_mismatch: Option<AmountMismatch>,
 }
 
 /// Resolve `incoming` against the open invoices and endpubs, mark a matched
@@ -78,6 +93,35 @@ pub async fn match_payment(
         None => resolve_amount(pool, default, incoming.amount).await?,
     };
 
+    // Amount binding (money-path guard): a resolved invoice that carries an
+    // exact expected amount must be paid in full — no under-, no overpayment.
+    // Amount-mode already resolved on the exact amount, but derived/memo mode
+    // matched on identity/reference alone and did NOT check the amount, which is
+    // the underpayment hole. An open-amount invoice (`expected_amount` NULL)
+    // binds nothing and accepts any amount. On a mismatch the payment is
+    // rejected outright: nothing is marked paid, nothing is linked, and the
+    // caller (manual paste / Nostr ingest) is told the exact expected figure.
+    if let Some(id) = &invoice_id {
+        let expected: Option<i64> =
+            sqlx::query_scalar("SELECT expected_amount FROM invoice WHERE id = ?1")
+                .bind(id)
+                .fetch_one(pool)
+                .await?;
+        if let Some(expected) = expected {
+            let expected = expected.max(0) as u64;
+            if incoming.amount != expected {
+                return Ok(MatchResult {
+                    invoice_id: None,
+                    user_id: None,
+                    amount_mismatch: Some(AmountMismatch {
+                        expected,
+                        received: incoming.amount,
+                    }),
+                });
+            }
+        }
+    }
+
     if let Some(id) = &invoice_id {
         invoice::mark_paid(pool, id, incoming.slate_id).await?;
     }
@@ -93,6 +137,7 @@ pub async fn match_payment(
     Ok(MatchResult {
         invoice_id,
         user_id,
+        amount_mismatch: None,
     })
 }
 
@@ -257,16 +302,16 @@ mod tests {
         .await
         .unwrap();
         let recipient = inv.recipient_pubkey.clone().unwrap();
-        insert_payment(&pool, "slate-b", 999, &recipient).await;
+        // The derived identity is unambiguous, and the amount matches the
+        // invoice exactly (the amount-binding guard now REQUIRES this).
+        insert_payment(&pool, "slate-b", 100, &recipient).await;
 
-        // Even with a mismatched amount and no memo, the derived identity is
-        // unambiguous.
         let result = match_payment(
             &pool,
             MatchMode::Memo,
             &IncomingPayment {
                 slate_id: "slate-b",
-                amount: 999,
+                amount: 100,
                 recipient_hex: &recipient,
                 memo: None,
             },
@@ -274,6 +319,70 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.invoice_id.as_deref(), Some(inv.id.as_str()));
+        assert!(result.amount_mismatch.is_none());
+    }
+
+    #[tokio::test]
+    async fn derived_mode_rejects_underpayment_and_overpayment() {
+        // The underpayment hole: a derived-identity match must not flip the
+        // invoice paid unless the amount equals the invoice exactly. Both an
+        // underpayment and an overpayment are rejected, the invoice stays open,
+        // and the caller learns the exact expected figure.
+        for pay in [50u64, 150u64] {
+            let pool = pool().await;
+            let inv = invoice::create(
+                &pool,
+                new(AmountSpec::Grin(100), None, Some(MatchMode::Derived)),
+                &MASTER,
+                MASTER_PUB,
+                MatchMode::Memo,
+            )
+            .await
+            .unwrap();
+            let recipient = inv.recipient_pubkey.clone().unwrap();
+            insert_payment(&pool, "slate-mis", pay, &recipient).await;
+
+            let result = match_payment(
+                &pool,
+                MatchMode::Memo,
+                &IncomingPayment {
+                    slate_id: "slate-mis",
+                    amount: pay,
+                    recipient_hex: &recipient,
+                    memo: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            // Not matched, not credited, and the exact mismatch is reported.
+            assert_eq!(result.invoice_id, None, "pay {pay}: not matched");
+            assert_eq!(
+                result.amount_mismatch,
+                Some(AmountMismatch {
+                    expected: 100,
+                    received: pay
+                }),
+                "pay {pay}"
+            );
+            // The invoice is untouched (still open) and the payment row is not
+            // linked to it.
+            assert_eq!(
+                invoice::get(&pool, &inv.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status(),
+                invoice::InvoiceStatus::Open,
+                "pay {pay}: invoice stays open"
+            );
+            let linked: Option<String> =
+                sqlx::query_scalar("SELECT invoice_id FROM payment WHERE id = 'slate-mis'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(linked, None, "pay {pay}: payment not linked");
+        }
     }
 
     #[tokio::test]

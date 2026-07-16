@@ -454,13 +454,19 @@ function goblinpay_wc_handle_webhook(WP_REST_Request $request) {
 
     switch ($event_type) {
         case 'payment.received':
-            // Funds received off-chain (S2 returned). Complete the order.
-            goblinpay_wc_settle_order($order, $slate_id, __('Grin payment received via GoblinPay.', 'goblinpay-woocommerce'));
+            // Funds received off-chain (the S2 was handed back), but the payer
+            // may never broadcast the finalized transaction, so this is NOT yet
+            // fulfilment. Keep the order on-hold and note the intermediate state;
+            // the order completes only on payment.confirmed (kernel on chain).
+            if (!$order->is_paid()) {
+                $order->add_order_note(__('Grin payment received off-chain via GoblinPay; awaiting on-chain confirmation before the order is completed.', 'goblinpay-woocommerce'));
+            }
             break;
 
         case 'payment.confirmed':
-            // On-chain confirmation may arrive after payment.received. Idempotent:
-            // complete if not already paid, otherwise just note the confirmation.
+            // The paying kernel reached GP_CONFIRMATIONS on chain: this is the
+            // fulfilment signal. Complete the order (idempotent), else just note
+            // the confirmation if some other flow already completed it.
             if (!$order->is_paid()) {
                 goblinpay_wc_settle_order($order, $slate_id, __('Grin payment confirmed on chain via GoblinPay.', 'goblinpay-woocommerce'));
             } else {
@@ -520,8 +526,11 @@ function goblinpay_wc_poll_invoice($order_id) {
         return;
     }
     $body = json_decode(wp_remote_retrieve_body($resp), true);
-    if (is_array($body) && isset($body['status']) && 'paid' === $body['status']) {
-        goblinpay_wc_settle_order($order, '', __('Grin payment reconciled via GoblinPay status poll.', 'goblinpay-woocommerce'));
+    // Fulfil only on a confirmed (on-chain) invoice: a merely `paid` invoice is
+    // received off-chain but not yet broadcast/confirmed, so it must not complete
+    // the order (mirrors the webhook: fulfilment is payment.confirmed only).
+    if (is_array($body) && isset($body['status']) && 'confirmed' === $body['status']) {
+        goblinpay_wc_settle_order($order, '', __('Grin payment reconciled via GoblinPay status poll (confirmed on chain).', 'goblinpay-woocommerce'));
     }
 }
 

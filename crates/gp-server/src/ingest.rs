@@ -17,7 +17,7 @@ use gp_wallet::{GpWallet, WalletError};
 use log::warn;
 use sqlx::SqlitePool;
 
-use crate::record::persist_and_match;
+use crate::record::{persist_and_match, PersistOutcome};
 
 /// Wallet + database receiver for incoming S1 slatepacks.
 pub struct WalletReceiver {
@@ -88,7 +88,12 @@ impl SlatepackReceiver for WalletReceiver {
         // Persist, match (all three modes), and enqueue the webhook. Side
         // effects only: the reply is what completes the payment, so a matching
         // or webhook hiccup never fails the receive.
-        persist_and_match(
+        //
+        // The amount-binding guard is the exception: a slate that resolves to an
+        // invoice but pays the wrong amount is rejected here, BEFORE the S2 reply
+        // is handed back, so the transport never returns the reply the payer's
+        // wallet needs to broadcast — the underpayment cannot complete.
+        match persist_and_match(
             &self.pool,
             &received,
             Some(ctx.payer_hex),
@@ -97,7 +102,20 @@ impl SlatepackReceiver for WalletReceiver {
             self.default_mode,
             self.webhook.as_ref(),
         )
-        .await;
+        .await
+        {
+            PersistOutcome::Matched(_) => {}
+            PersistOutcome::Rejected(mismatch) => {
+                warn!(
+                    "ingest rejected {}: pays {} nanogrin, invoice expects {} nanogrin",
+                    received.slate_id, mismatch.received, mismatch.expected
+                );
+                return Err(ReceiveError::Rejected(format!(
+                    "payment pays {} nanogrin but the invoice expects exactly {} nanogrin",
+                    mismatch.received, mismatch.expected
+                )));
+            }
+        }
 
         Ok(ReceivedPayment {
             slate_id: received.slate_id,

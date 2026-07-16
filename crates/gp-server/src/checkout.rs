@@ -44,10 +44,17 @@ pub struct CheckoutInfo {
     /// (recipient, amount, memo). Same payload the QR carries. Empty when there is
     /// no Nostr recipient (nothing to open).
     pub pay_link: String,
-    /// The wallet's stable `grin1` Slatepack address, when a wallet is loaded
-    /// AND the plain-send fallback is permitted for this invoice (the render
-    /// gate: an amount collision with an earlier open grin1 invoice hides it).
-    /// `None` (and no plain-send panel shown) otherwise.
+    /// Whether the manual Slatepack flow (the "Send to address" plain-send panel
+    /// and the copy/paste receive form) is offered on this page: the operator
+    /// enabled the slatepack method (`GP_CHECKOUT_METHODS`) AND a wallet is
+    /// loaded. Deliberately INDEPENDENT of the grin1/Tor rail — the offline
+    /// receive needs no onion, no node round-trip, and no issued invoice slate
+    /// (Option B). The native "Grin invoice" (I1) panel stays rail-gated.
+    pub slatepack_manual: bool,
+    /// The wallet's stable `grin1` Slatepack address, when the manual Slatepack
+    /// flow is offered AND the plain-send fallback is permitted for this invoice
+    /// (the render gate: an amount collision with an earlier open grin1 invoice
+    /// hides it). `None` (and no plain-send panel shown) otherwise.
     pub slatepack_address: Option<String>,
     /// QR SVG of the `grin1` Slatepack address (present with the address).
     pub slatepack_qr_svg: Option<String>,
@@ -119,13 +126,21 @@ pub fn build_info(
     // The whole "pay with any Grin wallet" rail is operator opt-in
     // (GP_GRIN1_RAIL, packaged default OFF): with the rail off the page shows
     // only the Goblin method, even for an invoice armed while it was on.
-    // The plain-send fallback (an exact-amount receive to the stable grin1
-    // address) additionally needs the slatepack method enabled, a wallet
-    // address, AND the render gate (no amount collision with an earlier open
-    // grin1 invoice; Phase 3, no jitter).
+    // Option B: the manual Slatepack flow (plain-send address + copy/paste
+    // receive) is offered whenever the operator enabled the slatepack method AND
+    // a wallet is loaded — INDEPENDENT of the grin1/Tor rail, because the offline
+    // receive needs no onion, no node round-trip, and no issued invoice slate.
+    // "Wallet loaded" is implied by a non-empty stable address being passed in.
+    let wallet_loaded = slatepack_addr.map(|a| !a.is_empty()).unwrap_or(false);
+    let slatepack_manual = cfg.checkout_slatepack && wallet_loaded;
+    // The native invoice slatepack (I1) is the only piece that still needs the
+    // full grin1 rail (it issues an invoice slate and returns over the onion).
     let grin_rail_on = cfg.grin1_rail && cfg.checkout_slatepack;
+    // The plain-send fallback (an exact-amount receive to the stable grin1
+    // address) needs the manual flow offered, a wallet address, AND the render
+    // gate (no amount collision with an earlier open grin1 invoice; Phase 3).
     let (slatepack_address, slatepack_qr_svg) = match slatepack_addr {
-        Some(addr) if grin_rail_on && plain_send_allowed && !addr.is_empty() => {
+        Some(addr) if slatepack_manual && plain_send_allowed && !addr.is_empty() => {
             let qr = qr::svg(addr, pay_logo).unwrap_or_default();
             (Some(addr.to_string()), Some(qr))
         }
@@ -153,6 +168,7 @@ pub fn build_info(
         nprofile,
         pay_link: qr_payload,
         qr_svg,
+        slatepack_manual,
         slatepack_address,
         slatepack_qr_svg,
         invoice_slatepack,
@@ -459,7 +475,7 @@ async fn manual_slatepack(
             match wallet.receive_slatepack(&armor) {
                 Ok(received) => {
                     let webhook = crate::foreign::webhook_pair(cfg.get_ref());
-                    crate::record::persist_and_match(
+                    match crate::record::persist_and_match(
                         pool.get_ref(),
                         &received,
                         None,
@@ -468,14 +484,34 @@ async fn manual_slatepack(
                         cfg.match_mode,
                         webhook.as_ref(),
                     )
-                    .await;
-                    (
-                        true,
-                        "Payment received. Copy the response slatepack below back \
-                         into your wallet to finalize and post it to the chain."
-                            .into(),
-                        received.s2_armor,
-                    )
+                    .await
+                    {
+                        crate::record::PersistOutcome::Matched(_) => (
+                            true,
+                            "Payment received, but it is not complete yet. Copy the \
+                             response slatepack below back into your wallet to finalize \
+                             and broadcast it. The payment only settles once your wallet \
+                             posts it to the chain."
+                                .into(),
+                            received.s2_armor,
+                        ),
+                        // Amount-binding guard: the slatepack pays the wrong amount.
+                        // Nothing was recorded and the invoice stays open; tell the
+                        // payer the exact figure to send. No S2 is returned, so this
+                        // underpayment cannot be finalized or broadcast.
+                        crate::record::PersistOutcome::Rejected(mismatch) => (
+                            false,
+                            format!(
+                                "This invoice must be paid in full: it expects exactly \
+                                 {} GRIN, but the slatepack you pasted pays {} GRIN. \
+                                 Nothing was recorded. Send the exact amount and paste \
+                                 that slatepack instead.",
+                                nanogrin_to_grin(mismatch.expected),
+                                nanogrin_to_grin(mismatch.received),
+                            ),
+                            String::new(),
+                        ),
+                    }
                 }
                 Err(e) => (
                     false,
@@ -655,13 +691,15 @@ mod tests {
     }
 
     #[test]
-    fn grin1_rail_off_strips_all_grin_ui_and_switcher() {
-        // Owner requirement: with GP_GRIN1_RAIL off (the packaged default),
-        // the page shows ONLY "Pay with Goblin" — no switcher, no grin1 UI —
-        // even when a wallet address and an armed invoice slatepack exist.
+    fn option_b_surfaces_manual_slatepack_without_the_tor_rail() {
+        // Option B: with GP_GRIN1_RAIL OFF but the slatepack method enabled and a
+        // wallet loaded, the manual Slatepack flow (plain-send address + paste
+        // form) is offered WITHOUT arming the Tor rail. The native "Grin invoice"
+        // (I1) panel stays rail-gated and does NOT appear.
         let inv = invoice(Some(1_500_000_000), None);
-        let cfg = Config::default(); // grin1_rail defaults OFF
-        assert!(!cfg.grin1_rail, "packaged default must be off");
+        let cfg = Config::default(); // grin1_rail defaults OFF, checkout_slatepack ON
+        assert!(!cfg.grin1_rail, "rail stays off");
+        assert!(cfg.checkout_slatepack, "slatepack method on by default");
         let info = build_info(
             &inv,
             &cfg,
@@ -669,9 +707,13 @@ mod tests {
             Some("BEGINSLATEPACK.inv.ENDSLATEPACK."),
             true,
         );
-        assert!(info.slatepack_address.is_none(), "no plain-send when off");
-        assert!(info.slatepack_qr_svg.is_none());
-        assert!(info.invoice_slatepack.is_none(), "no invoice pack when off");
+        assert!(info.slatepack_manual, "manual flow offered (rail-independent)");
+        assert_eq!(
+            info.slatepack_address.as_deref(),
+            Some("grin1qtestaddress"),
+            "plain-send address shows without the rail"
+        );
+        assert!(info.invoice_slatepack.is_none(), "no I1 invoice pack off-rail");
         assert!(info.invoice_slatepack_qr_svg.is_none());
         assert!(!info.nprofile.is_empty(), "Goblin method still present");
 
@@ -685,16 +727,25 @@ mod tests {
             confirmations_required: 10,
         };
         let html = page.render().unwrap();
-        assert!(!html.contains("rail-tab"), "no switcher when rail off");
-        assert!(!html.contains("rail-radio"), "no switcher radios either");
-        assert!(!html.contains("id=\"panel-grin\""), "no grin panel");
-        assert!(!html.contains("grin1qtestaddress"), "no grin1 address");
-        assert!(!html.contains("BEGINSLATEPACK"), "no invoice slatepack");
         assert!(html.contains("id=\"panel-goblin\""), "Goblin panel present");
+        assert!(html.contains("id=\"panel-grin\""), "grin panel present");
+        assert!(html.contains("Send to address"), "plain-send panel present");
         assert!(
-            html.contains("Nostr</p>"),
-            "footer reads like the pre-rail page (no 'and Tor')"
+            html.contains(&format!("/pay/{}/slatepack", "secret-token-should-never-leak")),
+            "paste form present"
         );
+        assert!(html.contains("grin1qtestaddress"), "grin1 address shown");
+        // The native invoice (I1) panel is rail-gated and absent (the paste
+        // form's own placeholder still carries the BEGINSLATEPACK hint, so match
+        // on the armored I1 body, not the generic marker).
+        assert!(!html.contains("<h3>Grin invoice</h3>"), "no I1 invoice panel");
+        assert!(
+            !html.contains("BEGINSLATEPACK.inv.ENDSLATEPACK."),
+            "no I1 invoice slatepack rendered"
+        );
+        // Footer names the slatepack path but not Tor (the onion stays down).
+        assert!(html.contains("Grin slatepack"), "footer mentions Grin slatepack");
+        assert!(!html.contains("over Tor"), "no Tor claim when the rail is off");
     }
 
     #[test]

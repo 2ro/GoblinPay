@@ -129,33 +129,27 @@ details.manual ol { color: var(--dim); font-size: 0.9rem; padding-left: 1.2rem; 
 .pay-method:first-of-type { border-top: none; padding-top: 0; }
 .pay-method ol { color: var(--dim); font-size: 0.9rem; padding-left: 1.2rem; }
 
-/* Two-rail switcher (CSS only, no JavaScript): hidden radios drive which
-   panel shows; the tab labels are the control. Radios precede the panels so the
-   general-sibling combinator can target them. The radios and tabs are rendered
-   only when BOTH rails are available (grin1 rail is operator opt-in, default
-   off); a single rail renders its panel directly with no switcher chrome, so
-   panels are visible by default and the radios hide the unselected one. */
-.rails { margin-top: 1.25rem; }
-.rail-radio { position: absolute; width: 0; height: 0; opacity: 0; pointer-events: none; }
-.rail-tabs { display: flex; gap: 0.4rem; margin-bottom: 1rem; }
-.rail-tab {
-  flex: 1; text-align: center; cursor: pointer;
-  /* Center the label within the tab: sibling tabs stretch to equal height, so
-     when one label wraps to two lines the single-line label stays vertically
-     centered instead of hugging the top. */
+/* Method chooser (server-driven, no JavaScript): each tab is an `<a>` link that
+   sets `?method=<key>`; the server marks one active and renders only that panel.
+   The selection survives the page's meta-refresh because the refresh URL carries
+   the same `?method=`. Tabs wrap to a second row on narrow screens. The tab bar
+   is rendered only when more than one method is available; a single method shows
+   its panel with no tab chrome. */
+.methods { margin-top: 1.25rem; }
+.method-tabs { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 1rem; }
+.method-tab {
+  flex: 1 1 auto; text-align: center; cursor: pointer; text-decoration: none;
+  /* Equal-height tabs: a label that wraps to two lines keeps its neighbours the
+     same height, with single-line labels vertically centered. */
   display: flex; align-items: center; justify-content: center;
-  padding: 0.55rem 0.5rem; border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 0.55rem 0.6rem; border: 1px solid var(--line); border-radius: var(--radius);
   color: var(--dim); font-size: 0.9rem; font-weight: 600; background: var(--panel);
 }
-#rail-goblin:checked ~ .rail-tabs [for="rail-goblin"],
-#rail-grin:checked ~ .rail-tabs [for="rail-grin"] {
+.method-tab:hover { border-color: var(--dim); }
+.method-tab.active {
   color: var(--bg); background: var(--accent); border-color: var(--accent);
 }
-#rail-goblin:checked ~ #panel-grin,
-#rail-grin:checked ~ #panel-goblin { display: none; }
-.grin-sub { margin-top: 1.5rem; border-top: 1px solid var(--line); padding-top: 1rem; }
-.grin-sub:first-child { margin-top: 0; border-top: none; padding-top: 0; }
-.grin-sub h3 { margin: 0 0 0.5rem; font-size: 1rem; }
+.method-panel h3 { margin: 0 0 0.5rem; font-size: 1rem; }
 
 a { color: var(--accent); }
 

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-{% if is_open || is_paid %}<meta http-equiv="refresh" content="10">{% endif %}
+{% if is_open || is_paid %}<meta http-equiv="refresh" content="10; url={{ refresh_url }}">{% endif %}
 <title>Pay with Goblin (GRIN)</title>
 <link rel="stylesheet" href="{{ info.base }}/static/style.css">
 </head>
@@ -23,71 +23,61 @@
   {% else %}
     <p class="status open">Waiting for payment&#8230;</p>
 
-    {% let has_goblin = !info.nprofile.is_empty() %}
-    {% let has_grin = info.invoice_slatepack.is_some() || info.slatepack_address.is_some() || info.slatepack_manual %}
-
-    <div class="rails">
-      {% if has_goblin && has_grin %}
-      {# The CSS-only switcher appears only when both rails are available; the
-         Goblin rail is the default-selected tab. A single available rail
-         renders its panel directly, with no switcher chrome at all. #}
-      <input class="rail-radio" type="radio" name="rail" id="rail-goblin" checked>
-      <input class="rail-radio" type="radio" name="rail" id="rail-grin">
-      <div class="rail-tabs">
-        <label class="rail-tab" for="rail-goblin">Pay with Goblin</label>
-        <label class="rail-tab" for="rail-grin">Pay with any Grin wallet</label>
-      </div>
+    {# Server-driven method chooser (zero-JS): each tab is an `<a>` link that sets
+       `?method=<key>`, the server marks one active, and the meta-refresh URL
+       carries the same `?method=` so the choice survives the ~10s status refresh
+       (a CSS `:checked` radio would reset on every refresh). Only the active
+       panel is rendered. A single available method needs no tab bar. #}
+    <div class="methods">
+      {% if tabs.len() > 1 %}
+      <nav class="method-tabs" aria-label="Payment method">
+        {% for tab in tabs %}
+        <a class="method-tab{% if tab.active %} active{% endif %}" href="{{ info.base }}/pay/{{ info.token }}?method={{ tab.key }}"{% if tab.active %} aria-current="page"{% endif %}>{{ tab.label }}</a>
+        {% endfor %}
+      </nav>
       {% endif %}
 
-      {% if has_goblin %}
-      <section class="rail-panel" id="panel-goblin">
+      {% if active_method == "goblin" %}
+      <section class="method-panel" id="panel-goblin">
         <div class="qr">{{ info.qr_svg|safe }}</div>
         {% if !info.pay_link.is_empty() %}<a class="open-wallet" href="{{ info.pay_link }}">Open in Goblin</a>{% endif %}
         <p class="hint">On this device, tap Open in Goblin. On another, scan the code with your Goblin Wallet, or copy the address below.</p>
         <label for="nprofile">Payment address (nprofile)</label>
         <textarea id="nprofile" class="copybox" rows="3" readonly>{{ info.nprofile }}</textarea>
       </section>
+      {% else if active_method == "invoice" %}
+      {% if let Some(pack) = info.invoice_slatepack %}
+      <section class="method-panel" id="panel-invoice">
+        <h3>Grin invoice</h3>
+        <p class="hint">Open your Grin wallet, import this invoice, and pay it. The response returns to us automatically over Tor, no copy-paste back needed. If your wallet cannot send the response automatically, paste it under &#8220;Paste a slatepack&#8221;.</p>
+        {% if let Some(pack_qr) = info.invoice_slatepack_qr_svg %}<div class="qr">{{ pack_qr|safe }}</div>{% endif %}
+        <label for="invoice-slatepack">Invoice slatepack</label>
+        <textarea id="invoice-slatepack" class="copybox" rows="11" readonly>{{ pack }}</textarea>
+      </section>
       {% endif %}
-
-      {% if has_grin %}
-      <section class="rail-panel" id="panel-grin">
-        {% if let Some(pack) = info.invoice_slatepack %}
-        <div class="grin-sub">
-          <h3>Grin invoice</h3>
-          <p class="hint">Open your Grin wallet, import this invoice, and pay it. The response returns to us automatically over Tor, no copy-paste back needed. If your wallet cannot send the response automatically, paste it in the box below.</p>
-          {% if let Some(pack_qr) = info.invoice_slatepack_qr_svg %}<div class="qr">{{ pack_qr|safe }}</div>{% endif %}
-          <label for="invoice-slatepack">Invoice slatepack</label>
-          <textarea id="invoice-slatepack" class="copybox" rows="11" readonly>{{ pack }}</textarea>
-        </div>
-        {% endif %}
-
-        {% if let Some(grin1) = info.slatepack_address %}
-        <div class="grin-sub">
-          <h3>Send to address</h3>
-          <p class="hint">Prefer sending yourself? Send exactly <strong>{{ info.amount_display }}</strong> to the address below, then paste the slatepack your wallet produces.</p>
-          {% if let Some(grin1_qr) = info.slatepack_qr_svg %}<div class="qr">{{ grin1_qr|safe }}</div>{% endif %}
-          <label for="grin1">Slatepack address (grin1)</label>
-          <textarea id="grin1" class="copybox" rows="3" readonly>{{ grin1 }}</textarea>
-        </div>
-        {% endif %}
-
-        {# The manual copy/paste receive: a plain-send S1 is received here, and
-           (grin1 rail) an invoice response (I2) is finalized here when the
-           payer's wallet cannot reach us over Tor. Offered whenever the
-           slatepack method is enabled and a wallet is loaded — no Tor rail
-           required. #}
-        {% if info.slatepack_manual %}
-        <div class="grin-sub">
-          <h3>Paste a slatepack</h3>
-          <p class="hint">Send exactly <strong>{{ info.amount_display }}</strong> from your Grin wallet, then paste the slatepack it produces below. Your payment is <strong>not complete</strong> until you copy the response slatepack we return back into your wallet and broadcast it.</p>
-          <form method="post" action="{{ info.base }}/pay/{{ info.token }}/slatepack">
-            <label for="s1">Your slatepack</label>
-            <textarea id="s1" name="slatepack" rows="6" required
-              placeholder="BEGINSLATEPACK. &#8230; ENDSLATEPACK."></textarea>
-            <button type="submit">Submit slatepack</button>
-          </form>
-        </div>
-        {% endif %}
+      {% else if active_method == "address" %}
+      {% if let Some(grin1) = info.slatepack_address %}
+      <section class="method-panel" id="panel-address">
+        <h3>Send to address</h3>
+        <p class="hint">Send exactly <strong>{{ info.amount_display }}</strong> to the address below, then switch to &#8220;Paste a slatepack&#8221; and paste the slatepack your wallet produces.</p>
+        {% if let Some(grin1_qr) = info.slatepack_qr_svg %}<div class="qr">{{ grin1_qr|safe }}</div>{% endif %}
+        <label for="grin1">Slatepack address (grin1)</label>
+        <textarea id="grin1" class="copybox" rows="3" readonly>{{ grin1 }}</textarea>
+      </section>
+      {% endif %}
+      {% else if active_method == "slatepack" %}
+      {# The manual copy/paste receive: a plain-send S1 is received here, and
+         (grin1 rail) an invoice response (I2) is finalized here when the payer's
+         wallet cannot reach us over Tor. #}
+      <section class="method-panel" id="panel-slatepack">
+        <h3>Paste a slatepack</h3>
+        <p class="hint">Send exactly <strong>{{ info.amount_display }}</strong> from your Grin wallet, then paste the slatepack it produces below. Your payment is <strong>not complete</strong> until you copy the response slatepack we return back into your wallet and broadcast it.</p>
+        <form method="post" action="{{ info.base }}/pay/{{ info.token }}/slatepack">
+          <label for="s1">Your slatepack</label>
+          <textarea id="s1" name="slatepack" rows="6" required
+            placeholder="BEGINSLATEPACK. &#8230; ENDSLATEPACK."></textarea>
+          <button type="submit">Submit slatepack</button>
+        </form>
       </section>
       {% endif %}
     </div>

@@ -252,10 +252,75 @@ fn percent_encode(s: &str) -> String {
     out
 }
 
+/// One selectable payment-method tab on the checkout page. Rendered server-side
+/// as an `<a>` link carrying `?method=<key>` (zero-JS), so the payer's choice is
+/// re-derived on every request and therefore survives the page's meta-refresh —
+/// unlike a CSS `:checked` radio, which the refresh would reset to the default.
+pub struct MethodTab {
+    /// The `?method=` query value (and panel id suffix).
+    pub key: String,
+    /// The human tab label.
+    pub label: String,
+    /// Whether this tab is the active (shown) one.
+    pub active: bool,
+}
+
+/// The ordered candidate methods and their tab labels. A method becomes a tab
+/// only when its existing render gate is satisfied (see [`method_available`]);
+/// the first available one (Goblin) is the default selection.
+const METHODS: &[(&str, &str)] = &[
+    ("goblin", "Pay with Goblin"),
+    ("invoice", "Grin invoice"),
+    ("address", "Send to address"),
+    ("slatepack", "Paste a slatepack"),
+];
+
+/// Whether a method's panel would render for this invoice — the same gate the
+/// panel itself uses, so a tab never points at an empty panel.
+fn method_available(info: &CheckoutInfo, key: &str) -> bool {
+    match key {
+        "goblin" => !info.nprofile.is_empty(),
+        "invoice" => info.invoice_slatepack.is_some(),
+        "address" => info.slatepack_address.is_some(),
+        "slatepack" => info.slatepack_manual,
+        _ => false,
+    }
+}
+
+/// Resolve the available method tabs and the active one. The `requested` method
+/// (from `?method=`) is honored only when it names a known, available method;
+/// otherwise the first available method is selected (absent/invalid/unavailable
+/// all fall back). Pure, so the selection logic is unit-testable.
+fn build_tabs(info: &CheckoutInfo, requested: Option<&str>) -> (Vec<MethodTab>, String) {
+    let available: Vec<(&str, &str)> = METHODS
+        .iter()
+        .copied()
+        .filter(|(key, _)| method_available(info, key))
+        .collect();
+    let active = requested
+        .filter(|r| available.iter().any(|(k, _)| k == r))
+        .map(|r| r.to_string())
+        .or_else(|| available.first().map(|(k, _)| k.to_string()))
+        .unwrap_or_default();
+    let tabs = available
+        .into_iter()
+        .map(|(key, label)| MethodTab {
+            key: key.to_string(),
+            label: label.to_string(),
+            active: key == active,
+        })
+        .collect();
+    (tabs, active)
+}
+
 /// The checkout page template. `is_paid` is the "received, confirming on chain"
 /// state (funds in hand, below the confirmation threshold); `is_confirmed` is
 /// the final settled state at/above the threshold. `confirmations` /
 /// `confirmations_required` drive the "n of N" progress shown while confirming.
+///
+/// `tabs` are the payment-method tabs, `active_method` the currently shown one,
+/// and `refresh_url` the meta-refresh target — which carries `?method=` so the
+/// selected tab persists across the ~10s status refresh (zero-JS).
 #[derive(Template)]
 #[template(path = "pay.html")]
 struct PayPage {
@@ -266,6 +331,9 @@ struct PayPage {
     is_expired: bool,
     confirmations: i64,
     confirmations_required: i64,
+    tabs: Vec<MethodTab>,
+    active_method: String,
+    refresh_url: String,
 }
 
 /// The manual-slatepack result template (S2 to copy back).
@@ -287,9 +355,18 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/pay/{token}/slatepack", web::post().to(manual_slatepack));
 }
 
+/// The `?method=` selector on the pay page: which payment-method tab to show.
+/// Validated against the available tabs server-side (an unknown value falls
+/// back to the default), so it is safe to reflect into links and the refresh.
+#[derive(Deserialize)]
+struct PayQuery {
+    method: Option<String>,
+}
+
 /// GET /pay/{token}: the hosted checkout page.
 async fn pay_page(
     path: web::Path<String>,
+    query: web::Query<PayQuery>,
     pool: web::Data<SqlitePool>,
     cfg: web::Data<Config>,
     wallet: web::Data<Option<GpWallet>>,
@@ -319,20 +396,29 @@ async fn pay_page(
     let plain_send_allowed = invoice::plain_send_allowed(pool.get_ref(), &inv)
         .await
         .unwrap_or(false);
+    let info = build_info(
+        &inv,
+        cfg.get_ref(),
+        slatepack_addr.as_deref(),
+        inv.slatepack.as_deref(),
+        plain_send_allowed,
+    );
+    // Resolve the active method tab from the (validated) `?method=` param, then
+    // build the meta-refresh URL that carries it so the payer's tab choice
+    // survives the ~10s status refresh without any JavaScript.
+    let (tabs, active_method) = build_tabs(&info, query.method.as_deref());
+    let refresh_url = format!("{}/pay/{}?method={}", info.base, info.token, active_method);
     let page = PayPage {
-        info: build_info(
-            &inv,
-            cfg.get_ref(),
-            slatepack_addr.as_deref(),
-            inv.slatepack.as_deref(),
-            plain_send_allowed,
-        ),
+        info,
         is_open: status == InvoiceStatus::Open,
         is_paid: status == InvoiceStatus::Paid,
         is_confirmed: status == InvoiceStatus::Confirmed,
         is_expired: status == InvoiceStatus::Expired,
         confirmations,
         confirmations_required: cfg.confirmations_required,
+        tabs,
+        active_method,
+        refresh_url,
     };
     render(page)
 }
@@ -690,12 +776,35 @@ mod tests {
         assert!(qr.contains("<svg"), "grin1 QR is an SVG");
     }
 
+    /// The invoice fixture's checkout token (base path is empty in tests).
+    const TOKEN: &str = "secret-token-should-never-leak";
+
+    /// Render an OPEN pay page for `info` with the given requested `?method=`,
+    /// exercising the real server-side tab resolution (`build_tabs`) and the
+    /// meta-refresh URL, exactly as the handler does.
+    fn open_page(info: CheckoutInfo, requested: Option<&str>) -> PayPage {
+        let (tabs, active_method) = build_tabs(&info, requested);
+        let refresh_url = format!("{}/pay/{}?method={}", info.base, info.token, active_method);
+        PayPage {
+            info,
+            is_open: true,
+            is_paid: false,
+            is_confirmed: false,
+            is_expired: false,
+            confirmations: 0,
+            confirmations_required: 10,
+            tabs,
+            active_method,
+            refresh_url,
+        }
+    }
+
     #[test]
     fn option_b_surfaces_manual_slatepack_without_the_tor_rail() {
         // Option B: with GP_GRIN1_RAIL OFF but the slatepack method enabled and a
         // wallet loaded, the manual Slatepack flow (plain-send address + paste
         // form) is offered WITHOUT arming the Tor rail. The native "Grin invoice"
-        // (I1) panel stays rail-gated and does NOT appear.
+        // (I1) tab/panel stays rail-gated and does NOT appear.
         let inv = invoice(Some(1_500_000_000), None);
         let cfg = Config::default(); // grin1_rail defaults OFF, checkout_slatepack ON
         assert!(!cfg.grin1_rail, "rail stays off");
@@ -708,50 +817,45 @@ mod tests {
             true,
         );
         assert!(info.slatepack_manual, "manual flow offered (rail-independent)");
-        assert_eq!(
-            info.slatepack_address.as_deref(),
-            Some("grin1qtestaddress"),
-            "plain-send address shows without the rail"
-        );
+        assert_eq!(info.slatepack_address.as_deref(), Some("grin1qtestaddress"));
         assert!(info.invoice_slatepack.is_none(), "no I1 invoice pack off-rail");
-        assert!(info.invoice_slatepack_qr_svg.is_none());
         assert!(!info.nprofile.is_empty(), "Goblin method still present");
 
-        let page = PayPage {
-            info,
-            is_open: true,
-            is_paid: false,
-            is_confirmed: false,
-            is_expired: false,
-            confirmations: 0,
-            confirmations_required: 10,
-        };
-        let html = page.render().unwrap();
-        assert!(html.contains("id=\"panel-goblin\""), "Goblin panel present");
-        assert!(html.contains("id=\"panel-grin\""), "grin panel present");
-        assert!(html.contains("Send to address"), "plain-send panel present");
-        assert!(
-            html.contains(&format!("/pay/{}/slatepack", "secret-token-should-never-leak")),
-            "paste form present"
-        );
-        assert!(html.contains("grin1qtestaddress"), "grin1 address shown");
-        // The native invoice (I1) panel is rail-gated and absent (the paste
-        // form's own placeholder still carries the BEGINSLATEPACK hint, so match
-        // on the armored I1 body, not the generic marker).
-        assert!(!html.contains("<h3>Grin invoice</h3>"), "no I1 invoice panel");
-        assert!(
-            !html.contains("BEGINSLATEPACK.inv.ENDSLATEPACK."),
-            "no I1 invoice slatepack rendered"
-        );
-        // Footer names the slatepack path but not Tor (the onion stays down).
-        assert!(html.contains("Grin slatepack"), "footer mentions Grin slatepack");
-        assert!(!html.contains("over Tor"), "no Tor claim when the rail is off");
+        // Tabs: goblin + address + slatepack (no invoice off-rail); goblin default.
+        let (tabs, active) = build_tabs(&info, None);
+        let keys: Vec<&str> = tabs.iter().map(|t| t.key.as_str()).collect();
+        assert_eq!(keys, vec!["goblin", "address", "slatepack"], "no I1 tab off-rail");
+        assert_eq!(active, "goblin", "first available is the default");
+
+        // Default render: the tab bar + only the active (Goblin) panel.
+        let html = open_page(info.clone(), None).render().unwrap();
+        assert!(html.contains("class=\"method-tabs\""), "tab bar present (3 methods)");
+        assert!(html.contains(">Pay with Goblin</a>"), "Goblin tab");
+        assert!(html.contains(">Send to address</a>"), "address tab");
+        assert!(html.contains(">Paste a slatepack</a>"), "slatepack tab");
+        assert!(!html.contains(">Grin invoice</a>"), "no I1 tab off-rail");
+        assert!(html.contains("id=\"panel-goblin\""), "Goblin panel active by default");
+        assert!(!html.contains("id=\"panel-address\""), "only the active panel renders");
+
+        // Selecting the address tab renders the plain-send panel.
+        let html_addr = open_page(info.clone(), Some("address")).render().unwrap();
+        assert!(html_addr.contains("id=\"panel-address\""));
+        assert!(html_addr.contains("grin1qtestaddress"), "grin1 address shown");
+        assert!(!html_addr.contains("id=\"panel-goblin\""), "goblin panel hidden");
+
+        // Selecting the slatepack tab renders the paste form + broadcast copy,
+        // and the footer names the slatepack path but never Tor (rail off).
+        let html_paste = open_page(info, Some("slatepack")).render().unwrap();
+        assert!(html_paste.contains("id=\"panel-slatepack\""));
+        assert!(html_paste.contains(&format!("/pay/{TOKEN}/slatepack")), "paste form");
+        assert!(html_paste.contains("Grin slatepack"), "footer names slatepack");
+        assert!(!html_paste.contains("over Tor"), "no Tor claim when rail off");
     }
 
     #[test]
-    fn grin1_rail_on_shows_switcher_with_goblin_default_selected() {
-        // Owner requirement: rail enabled => the two-rail switcher renders and
-        // the Goblin tab is the default-selected one.
+    fn grin1_rail_on_shows_all_method_tabs_with_goblin_default() {
+        // Rail enabled + wallet + nostr: all four method tabs render and Goblin
+        // is the default-active one.
         let inv = invoice(Some(1_500_000_000), None);
         let cfg = grin1_cfg();
         let info = build_info(
@@ -761,28 +865,80 @@ mod tests {
             Some("BEGINSLATEPACK.inv.ENDSLATEPACK."),
             true,
         );
-        let page = PayPage {
-            info,
-            is_open: true,
-            is_paid: false,
-            is_confirmed: false,
-            is_expired: false,
-            confirmations: 0,
-            confirmations_required: 10,
-        };
-        let html = page.render().unwrap();
+        let (tabs, active) = build_tabs(&info, None);
+        let keys: Vec<&str> = tabs.iter().map(|t| t.key.as_str()).collect();
+        assert_eq!(keys, vec!["goblin", "invoice", "address", "slatepack"]);
+        assert_eq!(active, "goblin");
+
+        let html = open_page(info, None).render().unwrap();
+        assert!(html.contains("class=\"method-tabs\""));
+        assert!(html.contains(">Pay with Goblin</a>"));
+        assert!(html.contains(">Grin invoice</a>"));
+        assert!(html.contains(">Send to address</a>"));
+        assert!(html.contains(">Paste a slatepack</a>"));
+        // Goblin is the active tab (aria-current on its link) and its panel shows.
         assert!(
-            html.contains(r#"id="rail-goblin" checked"#),
-            "Goblin rail is the default-selected tab"
+            html.contains("?method=goblin\" aria-current=\"page\""),
+            "Goblin tab is active"
         );
         assert!(
-            !html.contains(r#"id="rail-grin" checked"#),
-            "Grin rail is the alternative, not preselected"
+            !html.contains("?method=invoice\" aria-current=\"page\""),
+            "invoice tab is not preselected"
         );
-        assert!(html.contains("Pay with Goblin"), "Goblin tab label");
-        assert!(html.contains("Pay with any Grin wallet"), "Grin tab label");
         assert!(html.contains("id=\"panel-goblin\""));
-        assert!(html.contains("id=\"panel-grin\""));
+        assert!(!html.contains("id=\"panel-invoice\""), "non-active panels not rendered");
+    }
+
+    #[test]
+    fn method_selection_validates_and_falls_back() {
+        // Server-side selection: a valid+available method is honored; absent,
+        // unknown, and known-but-unavailable all fall back to the default.
+        let inv = invoice(Some(1_500_000_000), None);
+        let cfg = grin1_cfg();
+        let info = build_info(
+            &inv,
+            &cfg,
+            Some("grin1qtestaddress"),
+            Some("BEGINSLATEPACK.inv.ENDSLATEPACK."),
+            true,
+        );
+        assert_eq!(build_tabs(&info, Some("address")).1, "address", "valid honored");
+        assert_eq!(build_tabs(&info, None).1, "goblin", "absent -> default");
+        assert_eq!(build_tabs(&info, Some("bitcoin")).1, "goblin", "unknown -> default");
+
+        // Drop the wallet: address/slatepack/invoice are unavailable, so a
+        // request for one of them falls back to the only available tab.
+        let bare = build_info(&inv, &cfg, None, None, true);
+        assert_eq!(build_tabs(&bare, Some("address")).1, "goblin", "unavailable -> default");
+        let keys: Vec<String> = build_tabs(&bare, Some("slatepack"))
+            .0
+            .into_iter()
+            .map(|t| t.key)
+            .collect();
+        assert_eq!(keys, vec!["goblin".to_string()], "only goblin available");
+    }
+
+    #[test]
+    fn refresh_url_carries_active_method_across_meta_refresh() {
+        // The meta-refresh reloads the SAME `?method=`, so the ~10s status poll
+        // does not reset the payer's chosen tab (the whole reason selection is
+        // server-driven rather than a CSS :checked radio).
+        let inv = invoice(Some(1_500_000_000), None);
+        let cfg = grin1_cfg();
+        let info = build_info(
+            &inv,
+            &cfg,
+            Some("grin1qtestaddress"),
+            Some("BEGINSLATEPACK.inv.ENDSLATEPACK."),
+            true,
+        );
+        let html = open_page(info, Some("slatepack")).render().unwrap();
+        assert!(
+            html.contains(&format!(
+                "http-equiv=\"refresh\" content=\"10; url=/pay/{TOKEN}?method=slatepack\""
+            )),
+            "refresh URL pins the active method"
+        );
     }
 
     #[test]
@@ -842,26 +998,18 @@ mod tests {
         assert!(info.npub.is_empty(), "npub empty when nostr off");
         assert_eq!(info.slatepack_address.as_deref(), Some("grin1qtestaddress"));
 
-        let page = PayPage {
-            info,
-            is_open: true,
-            is_paid: false,
-            is_confirmed: false,
-            is_expired: false,
-            confirmations: 0,
-            confirmations_required: 10,
-        };
-        let html = page.render().unwrap();
-        // The Goblin rail (nprofile) is absent; the Grin rail is present.
-        assert!(
-            !html.contains("id=\"rail-goblin\""),
-            "Goblin rail absent when checkout_nostr=false"
-        );
-        assert!(
-            html.contains("id=\"panel-grin\""),
-            "Grin rail present"
-        );
-        assert!(html.contains("Send to address"), "plain-send panel present");
+        // No Goblin tab (nprofile empty); the address tab is the first available
+        // and therefore the default-active one.
+        let (tabs, active) = build_tabs(&info, None);
+        let keys: Vec<&str> = tabs.iter().map(|t| t.key.as_str()).collect();
+        assert_eq!(keys, vec!["address", "slatepack"], "no Goblin tab when nostr off");
+        assert_eq!(active, "address");
+
+        let html = open_page(info, None).render().unwrap();
+        assert!(!html.contains(">Pay with Goblin</a>"), "no Goblin tab");
+        assert!(!html.contains("id=\"panel-goblin\""), "no Goblin panel");
+        assert!(html.contains(">Send to address</a>"), "address tab present");
+        assert!(html.contains("id=\"panel-address\""), "address panel active by default");
     }
 
     #[test]
@@ -894,21 +1042,18 @@ mod tests {
         );
         assert!(!info.nprofile.is_empty(), "nprofile present when nostr on");
 
-        let page = PayPage {
-            info,
-            is_open: true,
-            is_paid: false,
-            is_confirmed: false,
-            is_expired: false,
-            confirmations: 0,
-            confirmations_required: 10,
-        };
-        let html = page.render().unwrap();
-        assert!(html.contains("id=\"panel-goblin\""), "Goblin rail present");
-        assert!(
-            !html.contains("id=\"panel-grin\""),
-            "Grin rail absent when checkout_slatepack=false"
-        );
+        // Only the Goblin method survives, so a single panel renders with NO tab
+        // bar (no grin invoice / address / slatepack tabs).
+        let (tabs, active) = build_tabs(&info, None);
+        assert_eq!(tabs.len(), 1, "one method");
+        assert_eq!(active, "goblin");
+
+        let html = open_page(info, None).render().unwrap();
+        assert!(!html.contains("class=\"method-tabs\""), "single method: no tab bar");
+        assert!(html.contains("id=\"panel-goblin\""), "Goblin panel present");
+        assert!(!html.contains("id=\"panel-invoice\""), "no I1 panel");
+        assert!(!html.contains("id=\"panel-address\""), "no address panel");
+        assert!(!html.contains("id=\"panel-slatepack\""), "no paste panel");
     }
 
     #[test]

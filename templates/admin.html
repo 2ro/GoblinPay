@@ -18,7 +18,7 @@
       <li>Ingest: <code>{% if ingest %}on{% else %}off{% endif %}</code></li>
       <li>Relays watched: <code>{{ relay_count }}</code></li>
       <li>Webhook: <code>{% if webhook_configured %}configured{% else %}off{% endif %}</code>
-          (pending: {{ pending_webhooks }})</li>
+          (pending: {{ pending_webhooks }}, dead: {{ dead_webhooks }})</li>
       <li>Endpub rotation: <code>{{ rotate_interval }}s</code>, overlap <code>{{ overlap_epochs }}</code></li>
     </ul>
   </section>

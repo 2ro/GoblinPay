@@ -12,7 +12,7 @@ use gp_nostr::{KeyDirectory, Keys};
 use gp_server::directory::{self, DbKeyDirectory};
 use gp_server::ingest::WalletReceiver;
 use gp_server::payments::{self, ReceiptSigner};
-use gp_server::{admin, checkout, foreign, invoices, tor, webhookd};
+use gp_server::{admin, checkout, foreign, health, invoices, tor, webhookd};
 use gp_wallet::GpWallet;
 
 /// Landing page ("GoblinPay").
@@ -35,13 +35,6 @@ async fn index(cfg: web::Data<Config>) -> impl Responder {
             .body(html),
         Err(err) => HttpResponse::InternalServerError().body(format!("template error: {err}")),
     }
-}
-
-async fn health() -> impl Responder {
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "ok",
-        "version": env!("CARGO_PKG_VERSION"),
-    }))
 }
 
 /// The one hand-written stylesheet, embedded at compile time (zero build step).
@@ -86,7 +79,7 @@ async fn goblinpay_badge_black() -> impl Responder {
 /// Route table, shared by `main` and the tests.
 fn routes(cfg: &mut web::ServiceConfig) {
     cfg.route("/", web::get().to(index))
-        .route("/health", web::get().to(health))
+        .route("/health", web::get().to(health::health))
         .route("/static/style.css", web::get().to(style))
         .route("/static/goblin-mark.svg", web::get().to(goblin_mark))
         .route("/static/goblinpay-mark.svg", web::get().to(goblinpay_mark))

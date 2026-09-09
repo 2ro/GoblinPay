@@ -74,7 +74,10 @@ Place a test order, choose Grin (GRIN), and confirm:
 - Redirect mode sends you to the GoblinPay `/pay/<token>` page.
 - Embed mode shows the Goblin QR on the order-received page.
 - Paying from a Goblin Wallet moves the order to processing or completed once
-  GoblinPay delivers the `payment.received` webhook.
+  GoblinPay delivers the `payment.confirmed` webhook (the paying kernel has
+  reached `GP_CONFIRMATIONS` on chain). The earlier `payment.received` delivery
+  only adds an order note: the payer may never broadcast the finalized
+  transaction, so a received payment is not yet fulfilment.
 
 Turn on Debug logging in the gateway settings to trace requests and webhooks in
 WooCommerce, then Status, then Logs, source `goblinpay`.

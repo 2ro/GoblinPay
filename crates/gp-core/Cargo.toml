@@ -29,11 +29,11 @@ zeroize = "1"
 # Host-only log line when a stale rate is served (matches the crate's
 # host-only logging posture).
 log = "0.4"
-# The conversion-rate oracle fetch (milestone 7). DIRECT HTTP, never Nym:
-# gp-core has no mixnet linkage, so the direct path is structural. Reuses the
-# process-installed rustls `ring` provider (`rustls-no-provider`, no aws-lc-rs),
-# exactly as gp-server's webhook client does; no JSON feature (we parse the
-# small body with serde_json).
+# The conversion-rate oracle fetch (milestone 7). DIRECT HTTP, untunnelled:
+# gp-core links no anonymity transport, so the direct path is structural.
+# Reuses the process-installed rustls `ring` provider (`rustls-no-provider`,
+# no aws-lc-rs), exactly as gp-server's webhook client does; no JSON feature
+# (we parse the small body with serde_json).
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 
 [dev-dependencies]

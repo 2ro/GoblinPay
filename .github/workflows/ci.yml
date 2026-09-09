@@ -1,22 +1,22 @@
-# CI gate for GoblinPay. Mirror of .gitea/workflows/ci.yml, plus the workspace
-# trim below (this hosted runner can't reach the private goblin tree; a
-# deploy-host runner that has it does not need the trim).
+# CI gate for GoblinPay on a hosted GitHub runner. The sibling
+# .gitea/workflows/ci.yml is NOT a mirror of this file: it has no trim step and
+# tests gp-core only. See its header.
 #
 # What runs where:
-#   - fmt + the gp-core/gp-wallet clippy/test gate run on ANY runner, BUT every
-#     cargo command runs `cargo metadata` over the whole workspace first, and
-#     gp-goblin-sender has path deps into the private goblin/ tree that a hosted
-#     runner can't check out. `-p` scoping does NOT skip that resolution, so the
-#     trim step drops it before any cargo command, along with gp-nostr and
-#     gp-server (they resolve fine now that nip44 comes from crates.io, but
-#     building them pulls the whole arti/Tor and grin stack, which this gate
-#     deliberately does not attempt). What's left (gp-core, gp-wallet) is
-#     self-contained and holds the domain logic (config, invoices, matching,
-#     webhooks, rates, the wallet seam).
-#   - The FULL gate (gp-nostr + gp-server + the gp-goblin-sender round-trip, via
-#     ./ci.sh) needs the goblin/ tree checked out next to the repo. It runs where
-#     the workspace is laid out like the deploy host; otherwise it is skipped
-#     below.
+#   - Everything except the gp-goblin-sender round trip runs on ANY runner, BUT
+#     every cargo command runs `cargo metadata` over the whole workspace first,
+#     and gp-goblin-sender path-depends on the private goblin/ tree a hosted
+#     runner cannot check out. `-p` scoping does NOT skip that resolution
+#     (verified: with gp-goblin-sender in members and no ../goblin present, even
+#     `cargo fmt -p gp-core` dies with "failed to load manifest for dependency
+#     grin_core"), so the trim step below drops that one crate from the members
+#     list before any cargo command. Everything else resolves and builds here:
+#     nip44 comes from crates.io, and arti/Tor plus the grin stack build from
+#     the registry.
+#   - The FULL gate (./ci.sh: fmt, clippy --workspace, test --workspace,
+#     including the 7 gp-goblin-sender fixture tests) needs the goblin/ tree
+#     checked out next to the repo. It runs where the workspace is laid out like
+#     the development tree; otherwise it is skipped below.
 name: ci
 on:
   push:
@@ -46,34 +46,65 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Scope workspace to hosted-runnable crates
-        # gp-goblin-sender has path deps into the private goblin tree this
-        # hosted runner can't check out, so `cargo metadata` can't resolve it
-        # here, and metadata runs before any `-p` scoping. gp-nostr and
-        # gp-server resolve fine (nip44 comes from crates.io), but building them
-        # pulls the arti/Tor and grin stacks, which this gate does not attempt.
-        # Drop all three from the members list so the self-contained core gate
-        # (gp-core, gp-wallet) can run. The full workspace is unchanged in the
-        # repo and still builds on the deploy host.
-        run: sed -i '/crates\/gp-goblin-sender\|crates\/gp-nostr\|crates\/gp-server/d' Cargo.toml
+        # Drop ONLY gp-goblin-sender: it is the single crate with path deps into
+        # the private goblin tree, so it is the only reason `cargo metadata`
+        # cannot resolve here. gp-nostr and gp-server stay in.
+        #
+        # This step used to drop gp-nostr and gp-server too, on the assumption
+        # that their arti/Tor and grin dependencies were too heavy for a hosted
+        # runner. Measured instead of assumed: a COLD `cargo test -p gp-nostr -p
+        # gp-server --lib` (empty target dir, warm registry, this exact trim,
+        # no ../goblin present) took 700s of CPU, 56s wall on 28 cores, 3.7 GB
+        # of target dir and 2.1 GB peak RSS, and passed 83 tests. On a 4-vCPU
+        # hosted runner that is roughly 3 minutes of compile, on 2 vCPU roughly
+        # 6, plus the cold registry fetch. That is an ordinary CI budget, and it
+        # buys the whole Nostr ingest and HTTP surface, so they stay.
+        #
+        # The full workspace is unchanged in the repo and still builds
+        # everywhere; this edit is local to the runner's checkout.
+        run: sed -i '/crates\/gp-goblin-sender/d' Cargo.toml
 
-      - name: Format check (self-contained crates)
+      - name: Format check
+        # `--all` is safe here only BECAUSE of the trim above: it means "all
+        # packages and their local path-based dependencies", and once
+        # gp-goblin-sender is gone no member path-depends outside this repo.
+        # ci.sh, which runs on a full workspace, has to name the crates instead.
         run: cargo fmt --all -- --check
 
       - name: Clippy (gp-core, deny warnings)
         run: cargo clippy -p gp-core --all-targets -- -D warnings
 
+      # NOTE on --locked, which these steps used to pass: it cannot be used
+      # after the trim. Removing a member from the members list changes the
+      # lock file, so cargo refuses with "cannot update the lock file ...
+      # because --locked was passed" and the step fails before it runs a single
+      # test. Cargo.lock is still committed and still pins every version; what
+      # is lost is only the assertion that the file needed no change, which the
+      # trim itself guarantees would be false. The untrimmed ./ci.sh gate below
+      # is where a lock drift would show up.
+
       - name: Test (gp-core)
-        run: cargo test -p gp-core --locked
+        run: cargo test -p gp-core
 
       - name: Test (gp-wallet unit tests)
-        # `--lib` only: gp-wallet's two integration tests drive the
-        # gp-goblin-sender binary, which the trim above removed (it needs the
-        # goblin tree). They run in the full ./ci.sh gate below. The 27 unit
-        # tests need nothing outside this repo.
-        run: cargo test -p gp-wallet --lib --locked
+        # `--lib` only: gp-wallet's integration tests drive the
+        # gp-goblin-sender binary, which the trim above removed. Without the
+        # crate they do not skip, they fail ("package ID specification
+        # `gp-goblin-sender` did not match any packages"), so they are left to
+        # the full ./ci.sh gate. The unit tests need nothing outside this repo.
+        run: cargo test -p gp-wallet --lib
+
+      - name: Test (gp-nostr + gp-server unit tests)
+        # `--lib` for the same reason: gp-server's checkout_e2e and
+        # nostr_ingest_e2e integration tests drive gp-goblin-sender too.
+        run: cargo test -p gp-nostr -p gp-server --lib
 
       - name: Full gate (when the goblin checkout is present)
+        # Restore the members list first: ci.sh runs clippy and tests over the
+        # WHOLE workspace and names gp-goblin-sender explicitly, so it must see
+        # the untrimmed manifest.
         run: |
+          git checkout -- Cargo.toml
           if [ -d ../goblin ]; then
             echo "goblin sibling present - running the full ./ci.sh gate."
             ./ci.sh

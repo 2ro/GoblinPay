@@ -52,9 +52,28 @@ EnvironmentFile=/etc/goblinpay.env
 
 # The wallet password as a credential. systemd exposes it under
 # $CREDENTIALS_DIRECTORY (%d), readable only by the dynamic service user, and the
-# wallet is pointed at it via the *_FILE variant. This overrides any
-# GP_WALLET_PASSWORD_FILE in the env file above, so the service always reads the
-# credential copy at %d/gp_wallet_password.
+# wallet is pointed at it via the *_FILE variant.
+#
+# PRECEDENCE (man systemd.exec, EnvironmentFile=): settings read from an
+# EnvironmentFile OVERRIDE settings made with Environment=, regardless of the
+# order they appear in here. So the Environment= line below is the DEFAULT, not
+# the winner: whatever /etc/goblinpay.env sets for GP_WALLET_PASSWORD_FILE is
+# what the service actually reads.
+#
+# In its default UNATTENDED-ENCRYPTED mode the wizard writes that key pointing
+# at /run/credentials/gp-server.service/gp_wallet_password, which is exactly
+# what %d/gp_wallet_password expands to for this unit, so the two agree and the
+# precedence does not matter. Its plaintext-fallback and MANUAL modes write the
+# SOURCE path instead (/etc/goblinpay/secrets/wallet_password and
+# /run/goblinpay/wallet_password), and neither drop-in re-sets Environment=, so
+# under this precedence the service reads the source file directly rather than
+# the credential copy systemd staged. Those two are root-owned 0400, which the
+# DynamicUser cannot read. That is an open issue in the wizard, not in this
+# unit, and it is noted here so nobody "fixes" it by inverting the rule again.
+#
+# If you edit the env file by hand, either leave GP_WALLET_PASSWORD_FILE out of
+# it or keep it pointed at the credential copy under %d: a path systemd did not
+# stage there is not readable by the DynamicUser.
 #
 # The wizard (`gp-server setup`) writes a drop-in that picks the delivery:
 #   * UNATTENDED, ENCRYPTED (the secure default): gp-server.service.d/encrypted.conf
@@ -111,7 +130,8 @@ RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
-# If the Nym mixnet stack ever fails to start with a W^X error, comment this out.
+# If an in-process component (the grin1 rail's Tor client, say) ever fails to
+# start with a W^X error, comment this out.
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service

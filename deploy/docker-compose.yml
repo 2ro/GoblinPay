@@ -38,7 +38,26 @@ services:
       GP_BIND: 0.0.0.0:8080
       GP_DB_PATH: /data/goblinpay.db
       GP_DATA_DIR: /data/gp-data
-      # Money/identity secrets come from mounted files (never the image/env):
+      # Money/identity secrets come from mounted files (never the image/env).
+      #
+      # TRADE-OFF, be clear-eyed about it: ./secrets on the host is PLAINTEXT,
+      # bind-mounted read-only at /run/secrets. Compose has no equivalent of the
+      # systemd unit's host-sealed credential, so the seed phrase and the wallet
+      # password sit on disk in the clear and a stolen or copied disk yields the
+      # wallet. Keep the till a small hot float and sweep regularly.
+      #
+      # Seal it as far as compose allows:
+      #   1. After the first successful boot, DELETE ./secrets/gp_mnemonic and
+      #      remove the GP_MNEMONIC_FILE line below (a *_FILE that points at a
+      #      missing file is a hard config error, not a skip). The seed is
+      #      consumed once to create the wallet; afterwards it lives only
+      #      encrypted at rest in the gp-data volume and in your written 24-word
+      #      backup, and boot needs the password file alone.
+      #   2. chmod 0400 what is left, keep ./secrets out of every image build
+      #      context, and keep it out of any backup that leaves the host.
+      #   3. For an encrypted-at-rest password, use the bare-metal path instead:
+      #      deploy/gp-server.service plus the wizard's LoadCredentialEncrypted
+      #      drop-in, where systemd-creds seals the password to the host.
       GP_MNEMONIC_FILE: /run/secrets/gp_mnemonic
       GP_WALLET_PASSWORD_FILE: /run/secrets/gp_wallet_password
       GP_NCRYPTSEC_FILE: /run/secrets/gp_ncryptsec

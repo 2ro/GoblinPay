@@ -131,7 +131,7 @@ async fn create_invoice(
     });
 
     // Milestone 7: a fiat invoice is priced into Grin by the oracle (DIRECT
-    // HTTP, never Nym) and its quote locked for the expiry window, so its
+    // HTTP, untunnelled) and its quote locked for the expiry window, so its
     // expected_amount is filled and it matches by amount. A Grin invoice
     // bypasses the oracle entirely. Fail fast on an unpriceable invoice.
     let params = match price_if_fiat(oracle.get_ref(), params).await {

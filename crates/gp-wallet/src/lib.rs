@@ -44,7 +44,7 @@ use serde::Serialize;
 pub use confirm::{confirm_status, ConfirmStatus};
 
 /// Health-probe a Grin node URL: a fresh `HTTPNodeClient` `get_tip` round trip
-/// over DIRECT HTTP (never Nym), same read path the confirmation poll uses.
+/// over DIRECT HTTP (untunnelled), same read path the confirmation poll uses.
 /// Returns `true` if the node answered with a tip. Used by the setup wizard to
 /// pick the first healthy node from its curated list; a failed probe (down,
 /// unreachable, or a non-tip response) simply returns `false` so the wizard
@@ -190,7 +190,7 @@ pub struct Balance {
 pub struct GpWallet {
     instance: Instance,
     mask: Option<SecretKey>,
-    /// Configured node URL for confirmation reads (DIRECT HTTP, never Nym).
+    /// Configured node URL for confirmation reads (DIRECT HTTP, untunnelled).
     node_url: String,
 }
 
@@ -256,7 +256,7 @@ impl GpWallet {
     /// `<data_dir>/wallet/wallet_data/wallet.seed`, mode 0600. The receive path
     /// is fully offline; `node_url` is used only for lightweight confirmation
     /// reads (a single `get_kernel` per pending payment), which go DIRECT over
-    /// HTTP, never through the Nym tunnel.
+    /// HTTP, never through a tunnel.
     ///
     /// `mnemonic` is consumed only on first run (when no wallet exists yet):
     /// - wallet absent + `Some(seed)`: create the wallet from `seed`.
@@ -684,7 +684,7 @@ impl GpWallet {
     }
 
     /// Confirmation status for a received payment's kernel, via a DIRECT node
-    /// read (never Nym). `kernel_excess_hex` is [`Received::kernel_excess`].
+    /// read (untunnelled). `kernel_excess_hex` is [`Received::kernel_excess`].
     pub fn confirm_status(&self, kernel_excess_hex: &str) -> Result<ConfirmStatus, WalletError> {
         confirm::confirm_status(&self.node_url, kernel_excess_hex)
     }
@@ -806,9 +806,28 @@ mod tests {
         assert_eq!(mode, 0o600, "seed file must be 0600");
 
         // Encrypted at rest: no mnemonic word appears in the seed file.
+        //
+        // The file is `serde_json::to_string_pretty` of upstream's
+        // EncryptedWalletSeed { encrypted_seed, salt, nonce }, all three values
+        // hex. So its whole text is hex digits plus those three key names, and
+        // two classes of BIP39 word match it by coincidence rather than by
+        // leaking: the 8 words that are themselves valid hex (add, beef, dad,
+        // decade, face, fade, fee, feed) and the 4 that are substrings of the
+        // key names (cry, once, salt, seed). 12 of 2048, which is why the
+        // unfiltered assertion fails on ~13% of random mnemonics. Skip exactly
+        // those; the other 2036 words still have to be absent, and a random
+        // 24-word phrase still checks ~24 of them.
         let raw = fs::read_to_string(&seed_path).unwrap();
         for word in mnemonic.split_whitespace() {
-            assert!(!raw.contains(word), "seed file leaks mnemonic word");
+            let is_hex = word.chars().all(|c| c.is_ascii_hexdigit());
+            let in_json_key = "encrypted_seed salt nonce".contains(word);
+            if is_hex || in_json_key {
+                continue;
+            }
+            assert!(
+                !raw.contains(word),
+                "seed file leaks mnemonic word `{word}`"
+            );
         }
 
         let addr = wallet.slatepack_address().unwrap();

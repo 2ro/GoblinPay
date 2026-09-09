@@ -235,9 +235,24 @@ async fn receive_tx(
         webhook.as_ref(),
     )
     .await;
-    if let crate::record::PersistOutcome::Matched(matched) = &outcome {
-        // A plain send settled a grin1 invoice: the I1 it issued is now stale.
-        crate::record::cancel_stale_grin1(pool, matched, &received.slate_id, wallet).await;
+    match &outcome {
+        // The payment could not be recorded at all: withhold the S2 rather than
+        // let the payer broadcast a transaction this till has no ledger entry
+        // for. The wallet keeps its own tx-log entry either way.
+        Err(e) => {
+            error!(
+                "foreign receive could not record {}: {e}",
+                received.slate_id
+            );
+            return err(id, -32603, "payment could not be recorded");
+        }
+        Ok(crate::record::PersistOutcome::Matched(matched)) => {
+            // A plain send settled a grin1 invoice: the I1 it issued is now stale.
+            crate::record::cancel_stale_grin1(pool, matched, &received.slate_id, wallet).await;
+        }
+        // An amount mismatch is left as it was before this lane: the reply still
+        // goes back, unlike the Nostr and paste paths. Reported, not changed.
+        Ok(crate::record::PersistOutcome::Rejected(_)) => {}
     }
 
     ok(id, serde_json::to_value(out_slate).unwrap())

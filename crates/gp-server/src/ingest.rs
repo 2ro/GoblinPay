@@ -104,7 +104,15 @@ impl SlatepackReceiver for WalletReceiver {
         )
         .await
         {
-            PersistOutcome::Matched(matched) => {
+            // The payment could not be recorded at all. Return a TRANSIENT
+            // failure: gp-nostr leaves the wrap unmarked and no S2 goes back, so
+            // the payer cannot broadcast a transaction this till has no ledger
+            // entry for.
+            Err(e) => {
+                warn!("ingest could not record {}: {e}", received.slate_id);
+                return Err(ReceiveError::Failed(format!("payment not recorded: {e}")));
+            }
+            Ok(PersistOutcome::Matched(matched)) => {
                 // This payment settled a grin1 invoice by a route other than
                 // its issued I1: cancel that stale invoice slate.
                 crate::record::cancel_stale_grin1(
@@ -115,7 +123,7 @@ impl SlatepackReceiver for WalletReceiver {
                 )
                 .await;
             }
-            PersistOutcome::Rejected(mismatch) => {
+            Ok(PersistOutcome::Rejected(mismatch)) => {
                 warn!(
                     "ingest rejected {}: pays {} nanogrin, invoice expects {} nanogrin",
                     received.slate_id, mismatch.received, mismatch.expected

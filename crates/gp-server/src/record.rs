@@ -23,14 +23,21 @@ pub enum PersistOutcome {
 }
 
 /// Insert the payment row, resolve it to an invoice/user, and enqueue the
-/// webhook if one is configured. Returns what it matched. A correct payment
-/// never fails the caller: the money is already in hand, so persistence/
-/// matching/webhook errors are logged and swallowed.
+/// webhook if one is configured. Returns what it matched. Matching and webhook
+/// errors never fail the caller: the money is already in hand, so they are
+/// logged and swallowed.
 ///
-/// The one hard stop is the amount-binding guard: if the payment resolves to an
-/// invoice whose exact expected amount it does not pay, the just-inserted
-/// payment row is removed and [`PersistOutcome::Rejected`] is returned — the
-/// invoice never flips paid on an under- or overpayment.
+/// Two hard stops:
+///
+/// * the amount-binding guard: if the payment resolves to an invoice whose
+///   exact expected amount it does not pay, the just-inserted payment row is
+///   removed and [`PersistOutcome::Rejected`] is returned, so the invoice never
+///   flips paid on an under- or overpayment;
+/// * a payment that could not be RECORDED returns `Err`. Only a duplicate id
+///   (the same slate received twice) is benign there: the row is already
+///   present, so matching still has something to link. Any other insert error
+///   means nothing was written, and matching would then link a row that does
+///   not exist and mark an invoice paid off a ledger entry nobody can see.
 pub async fn persist_and_match(
     pool: &SqlitePool,
     received: &Received,
@@ -39,7 +46,7 @@ pub async fn persist_and_match(
     memo: Option<&str>,
     default_mode: MatchMode,
     webhook: Option<&(String, String)>,
-) -> PersistOutcome {
+) -> Result<PersistOutcome, sqlx::Error> {
     let inserted = sqlx::query(
         "INSERT INTO payment \
              (id, amount, payer, slate_id, kernel, proof, s2_armor, recipient, status, \
@@ -57,10 +64,20 @@ pub async fn persist_and_match(
     .execute(pool)
     .await;
     if let Err(e) = inserted {
-        // A duplicate id (same slate received twice) is expected on a retry;
-        // anything else is logged. Either way, keep going so the reply/S2 is
-        // still handed back.
-        error!("payment record insert for {}: {e}", received.slate_id);
+        if !is_duplicate_slate(&e) {
+            // Nothing was recorded: a disk fault, a locked database, schema
+            // drift. Stop here rather than matching against a row that does not
+            // exist, which would settle an invoice with no ledger entry behind
+            // it. The caller withholds the reply, so the payer can retry.
+            error!("payment record insert for {}: {e}", received.slate_id);
+            return Err(e);
+        }
+        // The same slate received twice (a transport retry): the row is already
+        // there, so carry on and hand the reply back again.
+        warn!(
+            "payment {} was already recorded; replying again",
+            received.slate_id
+        );
     }
 
     let matched = match match_payment(
@@ -97,7 +114,7 @@ pub async fn persist_and_match(
             "rejected {}: pays {} nanogrin, invoice expects {} nanogrin",
             received.slate_id, mismatch.received, mismatch.expected
         );
-        return PersistOutcome::Rejected(mismatch);
+        return Ok(PersistOutcome::Rejected(mismatch));
     }
 
     if let Some((url, _secret)) = webhook {
@@ -122,7 +139,23 @@ pub async fn persist_and_match(
         }
     }
 
-    PersistOutcome::Matched(matched)
+    Ok(PersistOutcome::Matched(matched))
+}
+
+/// Whether an insert failure is just this slate arriving twice.
+///
+/// `payment.id` is a `TEXT PRIMARY KEY`, so SQLite raises
+/// `SQLITE_CONSTRAINT_PRIMARYKEY` (1555) rather than the plain unique code
+/// (2067); sqlx classifies both as a unique violation, and the raw codes are
+/// checked as well so a driver that does not is still handled. Every other
+/// database error means the row was NOT written.
+fn is_duplicate_slate(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::Database(db) => {
+            db.is_unique_violation() || matches!(db.code().as_deref(), Some("1555") | Some("2067"))
+        }
+        _ => false,
+    }
 }
 
 /// Cancel the I1 a grin1 invoice issued, once that invoice has been paid some
@@ -265,6 +298,60 @@ mod tests {
             .await
             .unwrap();
         inv.id
+    }
+
+    /// A received payment as the wallet hands it over.
+    fn received(slate_id: &str, amount: u64) -> Received {
+        Received {
+            slate_id: slate_id.into(),
+            amount,
+            s2_armor: "BEGINSLATEPACK.s2.ENDSLATEPACK.".into(),
+            kernel_excess: "08".repeat(33),
+            proof: None,
+        }
+    }
+
+    async fn record(pool: &SqlitePool, r: &Received) -> Result<PersistOutcome, sqlx::Error> {
+        persist_and_match(pool, r, None, "", None, MatchMode::Amount, None).await
+    }
+
+    #[tokio::test]
+    async fn only_a_duplicate_slate_is_a_benign_insert_failure() {
+        let pool = pool().await;
+        let r = received("slate-dup", 1_000_000_000);
+
+        // First receive records the row.
+        assert!(matches!(
+            record(&pool, &r).await,
+            Ok(PersistOutcome::Matched(_))
+        ));
+
+        // The SAME slate again: the primary key rejects the insert, but the row
+        // is already there, so the caller still gets its outcome (and therefore
+        // still hands the S2 back to a payer whose reply went missing).
+        assert!(
+            matches!(record(&pool, &r).await, Ok(PersistOutcome::Matched(_))),
+            "a duplicate must stay benign"
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "no duplicate row");
+
+        // Any OTHER insert failure means nothing was written. Force one by
+        // taking the table away, and check it is NOT swallowed.
+        sqlx::query("DROP TABLE payment")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let err = record(&pool, &received("slate-hard-fail", 1_000_000_000))
+            .await
+            .expect_err("a real insert failure must reach the caller");
+        assert!(
+            !is_duplicate_slate(&err),
+            "and must not be classed as a duplicate: {err}"
+        );
     }
 
     #[tokio::test]

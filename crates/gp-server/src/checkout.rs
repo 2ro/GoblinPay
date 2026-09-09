@@ -585,7 +585,21 @@ async fn manual_slatepack(
                     )
                     .await
                     {
-                        crate::record::PersistOutcome::Matched(matched) => {
+                        // The payment could not be recorded at all. Withhold the
+                        // S2: without it the payer cannot broadcast, so no money
+                        // moves for a sale this till has no ledger entry for.
+                        Err(e) => {
+                            error!("manual receive could not record {}: {e}", received.slate_id);
+                            (
+                                false,
+                                "This payment could not be recorded, so it has not been \
+                                 accepted. Nothing was charged. Please try again in a \
+                                 moment, or contact the store."
+                                    .into(),
+                                String::new(),
+                            )
+                        }
+                        Ok(crate::record::PersistOutcome::Matched(matched)) => {
                             // Settled by a plain-send paste: the I1 this invoice
                             // issued is now stale, so cancel its wallet context.
                             crate::record::cancel_stale_grin1(
@@ -609,7 +623,7 @@ async fn manual_slatepack(
                         // Nothing was recorded and the invoice stays open; tell the
                         // payer the exact figure to send. No S2 is returned, so this
                         // underpayment cannot be finalized or broadcast.
-                        crate::record::PersistOutcome::Rejected(mismatch) => (
+                        Ok(crate::record::PersistOutcome::Rejected(mismatch)) => (
                             false,
                             format!(
                                 "This invoice must be paid in full: it expects exactly \

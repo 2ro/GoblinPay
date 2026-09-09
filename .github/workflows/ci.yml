@@ -65,6 +65,13 @@ jobs:
       - name: Test (gp-core)
         run: cargo test -p gp-core --locked
 
+      - name: Test (gp-wallet unit tests)
+        # `--lib` only: gp-wallet's two integration tests drive the
+        # gp-goblin-sender binary, which the trim above removed (it needs the
+        # goblin tree). They run in the full ./ci.sh gate below. The 27 unit
+        # tests need nothing outside this repo.
+        run: cargo test -p gp-wallet --lib --locked
+
       - name: Full gate (when the goblin checkout is present)
         run: |
           if [ -d ../goblin ]; then

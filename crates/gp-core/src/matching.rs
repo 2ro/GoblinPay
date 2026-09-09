@@ -133,13 +133,22 @@ pub async fn match_payment(
         newly_paid = invoice::mark_paid(pool, id, incoming.slate_id).await?;
     }
 
-    // Link the payment row to whatever it resolved to (both optional).
-    sqlx::query("UPDATE payment SET invoice_id = ?2, user_id = ?3 WHERE id = ?1")
-        .bind(incoming.slate_id)
-        .bind(&invoice_id)
-        .bind(&user_id)
-        .execute(pool)
-        .await?;
+    // Link the payment row to whatever it resolved to (both optional). COALESCE
+    // so a re-match that resolves NOTHING cannot unlink what an earlier pass
+    // already established: the second run sees the invoice closed (it is no
+    // longer `open`, so no candidate query returns it) and would otherwise
+    // write NULL over a live link, orphaning the payment from the order it paid
+    // and zeroing the tenant's credit. A link is only ever set, never cleared;
+    // a rejected payment is deleted outright instead.
+    sqlx::query(
+        "UPDATE payment SET invoice_id = COALESCE(?2, invoice_id), \
+         user_id = COALESCE(?3, user_id) WHERE id = ?1",
+    )
+    .bind(incoming.slate_id)
+    .bind(&invoice_id)
+    .bind(&user_id)
+    .execute(pool)
+    .await?;
 
     Ok(MatchResult {
         invoice_id,
@@ -410,6 +419,65 @@ mod tests {
                     .unwrap();
             assert_eq!(linked, None, "pay {pay}: payment not linked");
         }
+    }
+
+    #[tokio::test]
+    async fn a_rematch_never_clears_an_existing_link() {
+        // The same slate can reach matching twice (a transport retry, a paste
+        // after the Nostr copy landed). By then the invoice is `paid`, so no
+        // candidate query returns it and the run resolves nothing. That second
+        // run must not write NULL over the link the first one established: the
+        // payment would be orphaned from its order and the tenant's credit
+        // would vanish from the balance.
+        let pool = pool().await;
+        let (_user, ep) = endpub::create_user(&pool, &MASTER, Some("bob".into()), None)
+            .await
+            .unwrap();
+        let inv = invoice::create(
+            &pool,
+            new(
+                AmountSpec::Grin(700),
+                Some("order-77"),
+                Some(MatchMode::Memo),
+            ),
+            &MASTER,
+            MASTER_PUB,
+            MatchMode::Memo,
+        )
+        .await
+        .unwrap();
+        insert_payment(&pool, "slate-again", 700, &ep.pubkey).await;
+
+        let incoming = IncomingPayment {
+            slate_id: "slate-again",
+            amount: 700,
+            recipient_hex: &ep.pubkey,
+            memo: Some("order-77"),
+        };
+        let first = match_payment(&pool, MatchMode::Memo, &incoming)
+            .await
+            .unwrap();
+        assert_eq!(first.invoice_id.as_deref(), Some(inv.id.as_str()));
+        assert_eq!(first.user_id.as_deref(), Some("bob"));
+
+        // Second pass: the invoice is closed, so nothing resolves.
+        let second = match_payment(&pool, MatchMode::Memo, &incoming)
+            .await
+            .unwrap();
+        assert_eq!(second.invoice_id, None, "no candidate the second time");
+        assert!(!second.newly_paid);
+
+        // The links from the first pass survive.
+        let (linked_invoice, linked_user): (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT invoice_id, user_id FROM payment WHERE id = 'slate-again'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(linked_invoice.as_deref(), Some(inv.id.as_str()));
+        assert_eq!(linked_user.as_deref(), Some("bob"));
+        // And the tenant is still credited.
+        let balances = endpub::list_with_balances(&pool).await.unwrap();
+        assert_eq!(balances[0].balance, 700);
     }
 
     #[tokio::test]

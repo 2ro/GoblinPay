@@ -554,17 +554,16 @@ mod tests {
             public_url: "https://myshop.com/pay".into(),
             ..Config::default()
         };
-        let app = test::init_service(
-            App::new()
-                .app_data(web::Data::new(cfg))
-                .configure(routes),
-        )
-        .await;
+        let app =
+            test::init_service(App::new().app_data(web::Data::new(cfg)).configure(routes)).await;
         let req = test::TestRequest::get().uri("/").to_request();
         let resp = test::call_service(&app, req).await;
         let body = test::read_body(resp).await;
         let html = std::str::from_utf8(&body).unwrap();
-        assert!(html.contains("/pay/static/style.css"), "asset link is prefixed");
+        assert!(
+            html.contains("/pay/static/style.css"),
+            "asset link is prefixed"
+        );
     }
 
     #[actix_web::test]

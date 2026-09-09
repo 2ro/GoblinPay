@@ -131,7 +131,11 @@ fn add_service_key(
 /// `Ok(onion_address)` once the proxy is accepting rendezvous requests (the
 /// descriptor upload continues in the background), or `Err(reason)`. The
 /// thread then keeps the service alive for the process lifetime.
-pub fn spawn(data_dir: PathBuf, seed: [u8; 32], local_port: u16) -> mpsc::Receiver<Result<String, String>> {
+pub fn spawn(
+    data_dir: PathBuf,
+    seed: [u8; 32],
+    local_port: u16,
+) -> mpsc::Receiver<Result<String, String>> {
     let (tx, rx) = mpsc::channel();
     let tx_err = tx.clone();
     if let Err(e) = thread::Builder::new()
@@ -181,8 +185,7 @@ fn run(
     add_service_key(config.fs_mistrust(), seed, &keystore_dir, &nickname)?;
     let onion_address = onion_address_from_seed(seed);
 
-    let runtime =
-        TokioNativeTlsRuntime::create().map_err(|e| format!("tor runtime: {e}"))?;
+    let runtime = TokioNativeTlsRuntime::create().map_err(|e| format!("tor runtime: {e}"))?;
     let client = TorClient::with_runtime(runtime.clone())
         .config(config)
         .create_unbootstrapped()

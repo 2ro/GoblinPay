@@ -293,7 +293,10 @@ async fn refresh_subscription<R: SlatepackReceiver>(
     // Back-fill only the newly added keys (a pure shrink adds none).
     if !plan.added.is_empty() {
         let filter = watch_filter(plan.added.iter().copied(), since);
-        match client.fetch_events_from(relays, filter, FETCH_TIMEOUT).await {
+        match client
+            .fetch_events_from(relays, filter, FETCH_TIMEOUT)
+            .await
+        {
             Ok(events) => {
                 info!(
                     "nostr: refresh added {} key(s), catch-up fetched {} wrap(s)",
@@ -307,7 +310,10 @@ async fn refresh_subscription<R: SlatepackReceiver>(
             Err(e) => warn!("nostr: refresh catch-up fetch failed: {e}"),
         }
     } else {
-        info!("nostr: refresh retired keys, watch set now {}", current.len());
+        info!(
+            "nostr: refresh retired keys, watch set now {}",
+            current.len()
+        );
     }
 
     *last_watched = current;
@@ -632,7 +638,10 @@ mod tests {
         let current = set(&[&master]);
 
         let plan = plan_refresh(&last, &current);
-        assert!(plan.changed, "a shrunk set must re-subscribe to drop the key");
+        assert!(
+            plan.changed,
+            "a shrunk set must re-subscribe to drop the key"
+        );
         assert!(
             plan.added.is_empty(),
             "a shrink adds no keys, so nothing is fetched"

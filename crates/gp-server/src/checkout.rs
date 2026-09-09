@@ -617,8 +617,7 @@ async fn manual_slatepack(
             let w = wallet.clone();
             let a = armor.clone();
             let finalized =
-                actix_web::rt::task::spawn_blocking(move || w.finalize_invoice_slatepack(&a))
-                    .await;
+                actix_web::rt::task::spawn_blocking(move || w.finalize_invoice_slatepack(&a)).await;
             match finalized {
                 Ok(Ok(finalized)) => {
                     let webhook = crate::foreign::webhook_pair(cfg.get_ref());
@@ -816,40 +815,74 @@ mod tests {
             Some("BEGINSLATEPACK.inv.ENDSLATEPACK."),
             true,
         );
-        assert!(info.slatepack_manual, "manual flow offered (rail-independent)");
+        assert!(
+            info.slatepack_manual,
+            "manual flow offered (rail-independent)"
+        );
         assert_eq!(info.slatepack_address.as_deref(), Some("grin1qtestaddress"));
-        assert!(info.invoice_slatepack.is_none(), "no I1 invoice pack off-rail");
+        assert!(
+            info.invoice_slatepack.is_none(),
+            "no I1 invoice pack off-rail"
+        );
         assert!(!info.nprofile.is_empty(), "Goblin method still present");
 
         // Tabs: goblin + address + slatepack (no invoice off-rail); goblin default.
         let (tabs, active) = build_tabs(&info, None);
         let keys: Vec<&str> = tabs.iter().map(|t| t.key.as_str()).collect();
-        assert_eq!(keys, vec!["goblin", "address", "slatepack"], "no I1 tab off-rail");
+        assert_eq!(
+            keys,
+            vec!["goblin", "address", "slatepack"],
+            "no I1 tab off-rail"
+        );
         assert_eq!(active, "goblin", "first available is the default");
 
         // Default render: the tab bar + only the active (Goblin) panel.
         let html = open_page(info.clone(), None).render().unwrap();
-        assert!(html.contains("class=\"method-tabs\""), "tab bar present (3 methods)");
+        assert!(
+            html.contains("class=\"method-tabs\""),
+            "tab bar present (3 methods)"
+        );
         assert!(html.contains(">Pay with Goblin</a>"), "Goblin tab");
         assert!(html.contains(">Send to address</a>"), "address tab");
         assert!(html.contains(">Paste a slatepack</a>"), "slatepack tab");
         assert!(!html.contains(">Grin invoice</a>"), "no I1 tab off-rail");
-        assert!(html.contains("id=\"panel-goblin\""), "Goblin panel active by default");
-        assert!(!html.contains("id=\"panel-address\""), "only the active panel renders");
+        assert!(
+            html.contains("id=\"panel-goblin\""),
+            "Goblin panel active by default"
+        );
+        assert!(
+            !html.contains("id=\"panel-address\""),
+            "only the active panel renders"
+        );
 
         // Selecting the address tab renders the plain-send panel.
         let html_addr = open_page(info.clone(), Some("address")).render().unwrap();
         assert!(html_addr.contains("id=\"panel-address\""));
-        assert!(html_addr.contains("grin1qtestaddress"), "grin1 address shown");
-        assert!(!html_addr.contains("id=\"panel-goblin\""), "goblin panel hidden");
+        assert!(
+            html_addr.contains("grin1qtestaddress"),
+            "grin1 address shown"
+        );
+        assert!(
+            !html_addr.contains("id=\"panel-goblin\""),
+            "goblin panel hidden"
+        );
 
         // Selecting the slatepack tab renders the paste form + broadcast copy,
         // and the footer names the slatepack path but never Tor (rail off).
         let html_paste = open_page(info, Some("slatepack")).render().unwrap();
         assert!(html_paste.contains("id=\"panel-slatepack\""));
-        assert!(html_paste.contains(&format!("/pay/{TOKEN}/slatepack")), "paste form");
-        assert!(html_paste.contains("Grin slatepack"), "footer names slatepack");
-        assert!(!html_paste.contains("over Tor"), "no Tor claim when rail off");
+        assert!(
+            html_paste.contains(&format!("/pay/{TOKEN}/slatepack")),
+            "paste form"
+        );
+        assert!(
+            html_paste.contains("Grin slatepack"),
+            "footer names slatepack"
+        );
+        assert!(
+            !html_paste.contains("over Tor"),
+            "no Tor claim when rail off"
+        );
     }
 
     #[test]
@@ -886,7 +919,10 @@ mod tests {
             "invoice tab is not preselected"
         );
         assert!(html.contains("id=\"panel-goblin\""));
-        assert!(!html.contains("id=\"panel-invoice\""), "non-active panels not rendered");
+        assert!(
+            !html.contains("id=\"panel-invoice\""),
+            "non-active panels not rendered"
+        );
     }
 
     #[test]
@@ -902,14 +938,26 @@ mod tests {
             Some("BEGINSLATEPACK.inv.ENDSLATEPACK."),
             true,
         );
-        assert_eq!(build_tabs(&info, Some("address")).1, "address", "valid honored");
+        assert_eq!(
+            build_tabs(&info, Some("address")).1,
+            "address",
+            "valid honored"
+        );
         assert_eq!(build_tabs(&info, None).1, "goblin", "absent -> default");
-        assert_eq!(build_tabs(&info, Some("bitcoin")).1, "goblin", "unknown -> default");
+        assert_eq!(
+            build_tabs(&info, Some("bitcoin")).1,
+            "goblin",
+            "unknown -> default"
+        );
 
         // Drop the wallet: address/slatepack/invoice are unavailable, so a
         // request for one of them falls back to the only available tab.
         let bare = build_info(&inv, &cfg, None, None, true);
-        assert_eq!(build_tabs(&bare, Some("address")).1, "goblin", "unavailable -> default");
+        assert_eq!(
+            build_tabs(&bare, Some("address")).1,
+            "goblin",
+            "unavailable -> default"
+        );
         let keys: Vec<String> = build_tabs(&bare, Some("slatepack"))
             .0
             .into_iter()
@@ -1002,14 +1050,21 @@ mod tests {
         // and therefore the default-active one.
         let (tabs, active) = build_tabs(&info, None);
         let keys: Vec<&str> = tabs.iter().map(|t| t.key.as_str()).collect();
-        assert_eq!(keys, vec!["address", "slatepack"], "no Goblin tab when nostr off");
+        assert_eq!(
+            keys,
+            vec!["address", "slatepack"],
+            "no Goblin tab when nostr off"
+        );
         assert_eq!(active, "address");
 
         let html = open_page(info, None).render().unwrap();
         assert!(!html.contains(">Pay with Goblin</a>"), "no Goblin tab");
         assert!(!html.contains("id=\"panel-goblin\""), "no Goblin panel");
         assert!(html.contains(">Send to address</a>"), "address tab present");
-        assert!(html.contains("id=\"panel-address\""), "address panel active by default");
+        assert!(
+            html.contains("id=\"panel-address\""),
+            "address panel active by default"
+        );
     }
 
     #[test]
@@ -1049,7 +1104,10 @@ mod tests {
         assert_eq!(active, "goblin");
 
         let html = open_page(info, None).render().unwrap();
-        assert!(!html.contains("class=\"method-tabs\""), "single method: no tab bar");
+        assert!(
+            !html.contains("class=\"method-tabs\""),
+            "single method: no tab bar"
+        );
         assert!(html.contains("id=\"panel-goblin\""), "Goblin panel present");
         assert!(!html.contains("id=\"panel-invoice\""), "no I1 panel");
         assert!(!html.contains("id=\"panel-address\""), "no address panel");

@@ -332,15 +332,13 @@ pub async fn attach_grin1(
     slate_id: &str,
     slatepack: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "UPDATE invoice SET rail = ?2, slate_id = ?3, slatepack = ?4 WHERE id = ?1",
-    )
-    .bind(invoice_id)
-    .bind(RAIL_GRIN1)
-    .bind(slate_id)
-    .bind(slatepack)
-    .execute(pool)
-    .await?;
+    sqlx::query("UPDATE invoice SET rail = ?2, slate_id = ?3, slatepack = ?4 WHERE id = ?1")
+        .bind(invoice_id)
+        .bind(RAIL_GRIN1)
+        .bind(slate_id)
+        .bind(slatepack)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -459,10 +457,11 @@ pub async fn due_grin1_slates(pool: &SqlitePool) -> Result<Vec<(String, String)>
 /// Flip a still-open invoice to `expired` (used by the grin1 sweep after its
 /// context is cancelled). Idempotent: only an `open` invoice transitions.
 pub async fn mark_expired(pool: &SqlitePool, invoice_id: &str) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query("UPDATE invoice SET status = 'expired' WHERE id = ?1 AND status = 'open'")
-        .bind(invoice_id)
-        .execute(pool)
-        .await?;
+    let result =
+        sqlx::query("UPDATE invoice SET status = 'expired' WHERE id = ?1 AND status = 'open'")
+            .bind(invoice_id)
+            .execute(pool)
+            .await?;
     Ok(result.rows_affected() > 0)
 }
 
@@ -627,9 +626,14 @@ mod tests {
         let inv = create(pool, grin(nano), &MASTER, MASTER_PUB, MatchMode::Amount)
             .await
             .unwrap();
-        attach_grin1(pool, &inv.id, &format!("slate-{}", inv.id), "BEGINSLATEPACK.x.ENDSLATEPACK.")
-            .await
-            .unwrap();
+        attach_grin1(
+            pool,
+            &inv.id,
+            &format!("slate-{}", inv.id),
+            "BEGINSLATEPACK.x.ENDSLATEPACK.",
+        )
+        .await
+        .unwrap();
         get(pool, &inv.id).await.unwrap().unwrap()
     }
 
@@ -638,8 +642,15 @@ mod tests {
         let pool = pool().await;
         let inv = open_grin1(&pool, 1_000_000_000).await;
         assert!(inv.is_grin1());
-        assert_eq!(inv.slate_id.as_deref(), Some(format!("slate-{}", inv.id).as_str()));
-        assert!(inv.slatepack.as_deref().unwrap().starts_with("BEGINSLATEPACK"));
+        assert_eq!(
+            inv.slate_id.as_deref(),
+            Some(format!("slate-{}", inv.id).as_str())
+        );
+        assert!(inv
+            .slatepack
+            .as_deref()
+            .unwrap()
+            .starts_with("BEGINSLATEPACK"));
 
         let by_slate = get_by_slate_id(&pool, &format!("slate-{}", inv.id))
             .await
@@ -677,12 +688,23 @@ mod tests {
         // A grin1 invoice, then force it to a due-but-still-open state (a real
         // sweep sees a live invoice whose expiry has just passed; create()'s
         // lazy expiry would otherwise flip a negative expiry immediately).
-        let inv = create(&pool, grin(1_000_000_000), &MASTER, MASTER_PUB, MatchMode::Amount)
-            .await
-            .unwrap();
-        attach_grin1(&pool, &inv.id, "slate-exp", "BEGINSLATEPACK.x.ENDSLATEPACK.")
-            .await
-            .unwrap();
+        let inv = create(
+            &pool,
+            grin(1_000_000_000),
+            &MASTER,
+            MASTER_PUB,
+            MatchMode::Amount,
+        )
+        .await
+        .unwrap();
+        attach_grin1(
+            &pool,
+            &inv.id,
+            "slate-exp",
+            "BEGINSLATEPACK.x.ENDSLATEPACK.",
+        )
+        .await
+        .unwrap();
         sqlx::query(
             "UPDATE invoice SET status = 'open', \
              expiry = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-10 seconds') WHERE id = ?1",
@@ -733,9 +755,14 @@ mod tests {
         let inv = create(&pool, p, &MASTER, MASTER_PUB, MatchMode::Amount)
             .await
             .unwrap();
-        attach_grin1(&pool, &inv.id, "slate-amountless", "BEGINSLATEPACK.x.ENDSLATEPACK.")
-            .await
-            .unwrap();
+        attach_grin1(
+            &pool,
+            &inv.id,
+            "slate-amountless",
+            "BEGINSLATEPACK.x.ENDSLATEPACK.",
+        )
+        .await
+        .unwrap();
         let inv = get(&pool, &inv.id).await.unwrap().unwrap();
         assert!(inv.is_grin1() && inv.expected_amount.is_none());
         assert!(!plain_send_allowed(&pool, &inv).await.unwrap());

@@ -236,7 +236,11 @@ async fn arm_grin1_rail(
                 return inv;
             }
             // Refetch so the returned row carries the rail fields.
-            invoice::get(pool, &inv.id).await.ok().flatten().unwrap_or(inv)
+            invoice::get(pool, &inv.id)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(inv)
         }
         Ok(Err(e)) => {
             error!("grin1: issue_invoice failed for {}: {e}", inv.id);

@@ -358,8 +358,7 @@ impl GpWallet {
     /// Money-adjacent secret: callers hand it straight to the keystore and
     /// never log or persist it anywhere else.
     pub fn slatepack_secret_seed(&self) -> Result<[u8; 32], WalletError> {
-        let d_skey =
-            owner::get_slatepack_secret_key(self.instance.clone(), self.mask.as_ref(), 0)?;
+        let d_skey = owner::get_slatepack_secret_key(self.instance.clone(), self.mask.as_ref(), 0)?;
         Ok(d_skey.to_bytes())
     }
 
@@ -519,9 +518,8 @@ impl GpWallet {
             let w = lc.wallet_inst()?;
             owner::finalize_tx(&mut **w, self.mask.as_ref(), &i2)?
         };
-        let client = HTTPNodeClient::new(&self.node_url, None).map_err(|e| {
-            WalletError::Config(format!("bad node URL `{}`: {e}", self.node_url))
-        })?;
+        let client = HTTPNodeClient::new(&self.node_url, None)
+            .map_err(|e| WalletError::Config(format!("bad node URL `{}`: {e}", self.node_url)))?;
         owner::post_tx(&client, final_slate.tx_or_err()?, true)?;
 
         // Kernel excess from the tx log (offset-independent, summed over both
@@ -898,7 +896,9 @@ mod tests {
         assert_eq!(got_id, id);
         assert_eq!(got_state, "S1");
 
-        assert!(wallet.slatepack_kind("BEGINSLATEPACK. nope. ENDSLATEPACK.").is_err());
+        assert!(wallet
+            .slatepack_kind("BEGINSLATEPACK. nope. ENDSLATEPACK.")
+            .is_err());
     }
 
     #[test]

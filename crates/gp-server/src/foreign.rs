@@ -108,7 +108,10 @@ async fn handle(
 
     // check_version needs no wallet.
     if method == "check_version" {
-        return ok(id, serde_json::to_value(gp_wallet::check_version()).unwrap());
+        return ok(
+            id,
+            serde_json::to_value(gp_wallet::check_version()).unwrap(),
+        );
     }
 
     let Some(wallet) = wallet.get_ref().as_ref() else {
@@ -225,11 +228,17 @@ pub(crate) async fn settle_finalized(
             return;
         }
         Err(e) => {
-            error!("foreign finalize: invoice lookup for {}: {e}", finalized.slate_id);
+            error!(
+                "foreign finalize: invoice lookup for {}: {e}",
+                finalized.slate_id
+            );
             return;
         }
     };
-    let amount = inv.expected_amount.unwrap_or(finalized.amount as i64).max(0) as u64;
+    let amount = inv
+        .expected_amount
+        .unwrap_or(finalized.amount as i64)
+        .max(0) as u64;
 
     // Record the payment (id = slate id, its own unguessable bearer), linked to
     // the invoice, with the kernel excess for the confirmation poll.
@@ -247,7 +256,10 @@ pub(crate) async fn settle_finalized(
     .await
     {
         // A duplicate id (same finalize replayed) is expected; log others.
-        warn!("foreign finalize: payment insert for {}: {e}", finalized.slate_id);
+        warn!(
+            "foreign finalize: payment insert for {}: {e}",
+            finalized.slate_id
+        );
     }
 
     match invoice::mark_paid(pool, &inv.id, &finalized.slate_id).await {
@@ -269,7 +281,10 @@ pub(crate) async fn settle_finalized(
             None,
         );
         if let Err(e) = enqueue(pool, url, &payload).await {
-            warn!("foreign finalize: webhook enqueue for {}: {e}", finalized.slate_id);
+            warn!(
+                "foreign finalize: webhook enqueue for {}: {e}",
+                finalized.slate_id
+            );
         }
     }
 }
@@ -352,10 +367,11 @@ mod tests {
         settle_finalized(&pool, &finalized, None).await;
         settle_finalized(&pool, &finalized, None).await; // replay
 
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment WHERE slate_id = 'slate-fin-2'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM payment WHERE slate_id = 'slate-fin-2'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(count, 1, "no duplicate payment row");
         let inv = invoice::get(&pool, &inv_id).await.unwrap().unwrap();
         assert_eq!(inv.status(), gp_core::invoice::InvoiceStatus::Paid);
@@ -403,7 +419,10 @@ mod tests {
             .to_request();
         let body: Value = test::call_and_read_body_json(&app, req).await;
         assert_eq!(body["id"], 7);
-        assert!(body["error"]["message"].as_str().unwrap().contains("wallet not loaded"));
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("wallet not loaded"));
     }
 
     #[tokio::test]

@@ -60,6 +60,63 @@ impl WalletReceiver {
             webhook,
         }
     }
+
+    /// Handle an S1 that grin-wallet refuses because it has already received
+    /// this slate.
+    ///
+    /// Usually that is a plain replay of a wrap whose reply went missing, and
+    /// the wrap is dropped: the payment row already holds the S2, and the
+    /// unreplied sweep re-sends it. But the same error also covers the case
+    /// where the FIRST receive succeeded in the wallet and then failed to
+    /// record. Treating that as a replay dropped the wrap for good, and since
+    /// no row existed the unreplied sweep had nothing to re-send either: the
+    /// payer was stranded with locked inputs and no S2, permanently.
+    ///
+    /// So the ledger decides. With no row, the earlier receive left an orphan:
+    /// an output and a tx-log entry the payer was never told about (the S2 is
+    /// only released after the row is written). Its slate context is not kept
+    /// by grin-wallet, so the S2 cannot be rebuilt; the receive is instead
+    /// released with `cancel_tx` and run again on the same S1, which yields a
+    /// fresh, valid S2. Cancelling is safe exactly because no reply ever went
+    /// out, and grin refuses to cancel a confirmed transaction anyway.
+    ///
+    /// Every failure here returns [`ReceiveError::Failed`], so the wrap is
+    /// retried rather than dropped. A wrap is only ever dropped on positive
+    /// evidence that the payment is already on the ledger.
+    async fn recover_duplicate(&self, s1_armor: &str) -> Result<gp_wallet::Received, ReceiveError> {
+        // Read the slate id back off the S1 (no wallet state is touched).
+        let slate_id = match self.wallet.slatepack_kind(s1_armor) {
+            Ok((slate_id, _state)) => slate_id,
+            Err(e) => {
+                warn!("duplicate receive: cannot read the slatepack back: {e}");
+                return Err(ReceiveError::Failed(format!("cannot read slatepack: {e}")));
+            }
+        };
+        match duplicate_action(&self.pool, &slate_id).await {
+            DuplicateAction::Drop => Err(ReceiveError::Duplicate),
+            DuplicateAction::Retry(e) => {
+                warn!("duplicate receive {slate_id}: ledger unreadable ({e}); will retry");
+                Err(ReceiveError::Failed(format!("ledger unreadable: {e}")))
+            }
+            DuplicateAction::Recover => {
+                warn!("duplicate receive {slate_id} has no payment row: redoing the receive");
+                if let Err(e) =
+                    crate::record::wallet_cancel(self.wallet.clone(), slate_id.clone()).await
+                {
+                    warn!(
+                        "duplicate receive {slate_id}: cannot release the orphan ({e}); will retry"
+                    );
+                    return Err(ReceiveError::Failed(format!(
+                        "cannot release the orphaned receive: {e}"
+                    )));
+                }
+                self.wallet.receive_slatepack(s1_armor).map_err(|e| {
+                    warn!("duplicate receive {slate_id}: redo failed ({e}); will retry");
+                    ReceiveError::Failed(format!("receive redo failed: {e}"))
+                })
+            }
+        }
+    }
 }
 
 /// The text grin-wallet's duplicate-receive guard puts in its error message
@@ -72,14 +129,46 @@ const ALREADY_RECEIVED: &str = "already been received";
 /// Classify a wallet receive failure for the transport.
 ///
 /// A slatepack the wallet refuses is permanently bad (drop the wrap); a slate
-/// grin has already received is a replay (drop the wrap, it is not lost); every
-/// other failure is transient, so the wrap stays unmarked and the next catch-up
-/// retries it. Split out so the classification is testable without a wallet.
+/// grin has already received is a replay, decided against the ledger by
+/// [`duplicate_action`] before any wrap is dropped; every other failure is
+/// transient, so the wrap stays unmarked and the next catch-up retries it.
+/// Split out so the classification is testable without a wallet.
 fn map_receive_error(e: WalletError) -> ReceiveError {
     match e {
         WalletError::Slatepack(m) => ReceiveError::Rejected(m),
         WalletError::Wallet(m) if m.contains(ALREADY_RECEIVED) => ReceiveError::Duplicate,
         other => ReceiveError::Failed(other.to_string()),
+    }
+}
+
+/// What a duplicate receive means, decided from the ledger alone.
+#[derive(Debug, PartialEq, Eq)]
+enum DuplicateAction {
+    /// A payment row exists, so the first receive ran to completion and its S2
+    /// is on file. A true replay: drop the wrap.
+    Drop,
+    /// No payment row. The first receive left an output and a tx-log entry in
+    /// the wallet but nothing on the ledger, which means no S2 was ever handed
+    /// back (the reply is only released once the row is written). Redo it.
+    Recover,
+    /// The ledger could not be consulted. Retry later: a wrap is never dropped
+    /// on a guess, because dropping it is the one irreversible choice here.
+    Retry(String),
+}
+
+/// Decide what to do about a slate grin-wallet refuses as already received.
+///
+/// The whole question is whether the earlier receive produced a payment row. It
+/// is a pure ledger read, so every branch is testable without a wallet.
+async fn duplicate_action(pool: &SqlitePool, slate_id: &str) -> DuplicateAction {
+    match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM payment WHERE slate_id = ?1")
+        .bind(slate_id)
+        .fetch_one(pool)
+        .await
+    {
+        Ok(0) => DuplicateAction::Recover,
+        Ok(_) => DuplicateAction::Drop,
+        Err(e) => DuplicateAction::Retry(e.to_string()),
     }
 }
 
@@ -93,10 +182,13 @@ impl SlatepackReceiver for WalletReceiver {
         // receive_tx (offline), S2 armor. `receive_slatepack` blocks for a
         // few milliseconds; the ingest loop is this runtime's only consumer,
         // so a direct call is fine (Goblin does the same).
-        let received = self
-            .wallet
-            .receive_slatepack(s1_armor)
-            .map_err(map_receive_error)?;
+        let received = match self.wallet.receive_slatepack(s1_armor) {
+            Ok(received) => received,
+            Err(e) => match map_receive_error(e) {
+                ReceiveError::Duplicate => self.recover_duplicate(s1_armor).await?,
+                other => return Err(other),
+            },
+        };
 
         // Persist, match (all three modes), and enqueue the webhook. Side
         // effects only: the reply is what completes the payment, so a matching
@@ -216,6 +308,62 @@ mod tests {
             map_receive_error(WalletError::Wallet(rendered)),
             ReceiveError::Duplicate
         ));
+    }
+
+    async fn pool() -> SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        gp_core::db::MIGRATOR.run(&pool).await.unwrap();
+        pool
+    }
+
+    async fn insert_payment(pool: &SqlitePool, slate_id: &str) {
+        sqlx::query(
+            "INSERT INTO payment (id, amount, slate_id, s2_armor, status, created_at) \
+             VALUES (?1, 10, ?1, 'BEGINSLATEPACK.s2.ENDSLATEPACK.', 'received', \
+                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+        )
+        .bind(slate_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_is_only_dropped_when_the_ledger_proves_it() {
+        let pool = pool().await;
+
+        // No row: the first receive recorded nothing, so no S2 can ever have
+        // reached the payer. Redo it rather than drop the wrap.
+        assert_eq!(
+            duplicate_action(&pool, "slate-orphan").await,
+            DuplicateAction::Recover
+        );
+
+        // A row exists: the first receive completed and its S2 is on file, so
+        // this really is a replay.
+        insert_payment(&pool, "slate-recorded").await;
+        assert_eq!(
+            duplicate_action(&pool, "slate-recorded").await,
+            DuplicateAction::Drop
+        );
+
+        // The ledger itself is unreadable: never guess. Dropping the wrap is
+        // the one irreversible choice, so retry instead.
+        sqlx::query("DROP TABLE payment")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                duplicate_action(&pool, "slate-recorded").await,
+                DuplicateAction::Retry(_)
+            ),
+            "an unreadable ledger must never drop a wrap"
+        );
     }
 
     #[test]

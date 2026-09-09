@@ -21,15 +21,11 @@ use nostr_sdk::{
 };
 
 use crate::ingest::{Ingest, IngestOutcome, PendingReply};
-use crate::relays::MAX_DM_RELAYS;
+use crate::relays::{MAX_DM_RELAYS, MAX_HINTED_RELAYS};
 use crate::unix_time;
 use crate::wrap;
-use crate::{KeyDirectory, MasterDirectory, SlatepackReceiver};
+use crate::{KeyDirectory, MasterDirectory, SlatepackReceiver, LOOKBACK_SECS};
 
-/// Subscription look-back window: gift wrap timestamps are randomized up to
-/// 2 days into the past (NIP-59), use 3 (Goblin's constant). Cross-restart
-/// dedupe is the wallet's already-received guard plus the payment table.
-const LOOKBACK_SECS: i64 = 3 * 86_400;
 /// Catch-up fetch timeout.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Send dispatch timeout.
@@ -467,12 +463,7 @@ async fn handle<R: SlatepackReceiver>(
 /// method from the same 10050 (absent = v2). Returns true when a relay
 /// accepted the event.
 async fn deliver_reply(client: &Client, reply: &PendingReply, own_relays: &[String]) -> bool {
-    let (mut targets, encryption) = recipient_hints(client, &reply.payer, own_relays).await;
-    if targets.is_empty() {
-        // NIP-17 pragmatic fallback: the wrap reached us through a shared
-        // relay, so our own set is the best remaining route.
-        targets = own_relays.to_vec();
-    }
+    let (hinted, encryption) = recipient_hints(client, &reply.payer, own_relays).await;
     let version = wrap::choose_version(encryption.as_deref());
     let event = match wrap::gift_wrap(&reply.from, &reply.payer, reply.rumor.clone(), version) {
         Ok(event) => event,
@@ -482,8 +473,13 @@ async fn deliver_reply(client: &Client, reply: &PendingReply, own_relays: &[Stri
         }
     };
     // Dial any target relays we don't already hold (the payer's relays may
-    // differ from ours), then publish to exactly that set.
-    connect_relays(client, &targets).await;
+    // differ from ours), then publish to exactly what the pool holds.
+    let mut targets = connect_relays(client, &hinted, own_relays).await;
+    if targets.is_empty() {
+        // NIP-17 pragmatic fallback: the wrap reached us through a shared
+        // relay, so our own set is the best remaining route.
+        targets = own_relays.to_vec();
+    }
     match tokio::time::timeout(SEND_TIMEOUT, client.send_event_to(&targets, &event)).await {
         Ok(Ok(output)) => {
             info!(
@@ -518,10 +514,7 @@ async fn send_dm(
     let rumor = EventBuilder::new(Kind::PrivateDirectMessage, content)
         .tags([Tag::public_key(*to)])
         .build(from.public_key());
-    let (mut targets, encryption) = recipient_hints(client, to, own_relays).await;
-    if targets.is_empty() {
-        targets = own_relays.to_vec();
-    }
+    let (hinted, encryption) = recipient_hints(client, to, own_relays).await;
     let version = wrap::choose_version(encryption.as_deref());
     let event = match wrap::gift_wrap(from, to, rumor, version) {
         Ok(event) => event,
@@ -530,7 +523,10 @@ async fn send_dm(
             return;
         }
     };
-    connect_relays(client, &targets).await;
+    let mut targets = connect_relays(client, &hinted, own_relays).await;
+    if targets.is_empty() {
+        targets = own_relays.to_vec();
+    }
     match tokio::time::timeout(SEND_TIMEOUT, client.send_event_to(&targets, &event)).await {
         Ok(Ok(_)) => info!("nostr: notify DM sent to {}…", &to.to_hex()[..8]),
         Ok(Err(e)) => warn!("nostr: notify DM send failed: {e}"),
@@ -561,7 +557,26 @@ async fn recipient_hints(
             return (vec![], None);
         }
     };
-    let Some(event) = events.first() else {
+    hints_from(events.iter(), payer)
+}
+
+/// The relay hints and encryption capability a payer advertises, read from a
+/// kind 10050 THEY authored.
+///
+/// A relay answers a REQ with whatever it likes, so the author check is what
+/// makes this the payer's own advice rather than any event the relay chose to
+/// return: without it a relay could redirect a reply (still end-to-end
+/// encrypted to the payer, but delivered where the relay says) and downgrade
+/// its encryption to v2 by supplying its own capability tag. Non-WebSocket
+/// URLs are dropped: they cannot be a relay.
+fn hints_from<'a>(
+    events: impl IntoIterator<Item = &'a Event>,
+    payer: &PublicKey,
+) -> (Vec<String>, Option<String>) {
+    let Some(event) = events
+        .into_iter()
+        .find(|e| e.pubkey == *payer && e.kind == Kind::InboxRelays)
+    else {
         return (vec![], None);
     };
     let mut relays = vec![];
@@ -569,8 +584,9 @@ async fn recipient_hints(
         let parts = tag.as_slice();
         if parts.first().map(|s| s.as_str()) == Some("relay") {
             if let Some(url) = parts.get(1) {
-                if relays.len() < MAX_DM_RELAYS {
-                    relays.push(url.trim_end_matches('/').to_string());
+                let url = url.trim_end_matches('/').to_string();
+                if relays.len() < MAX_DM_RELAYS && gp_core::config::is_relay_url(&url) {
+                    relays.push(url);
                 }
             }
         }
@@ -646,11 +662,29 @@ async fn reconcile<R: SlatepackReceiver>(
     }
 }
 
-/// Add + dial every relay in `urls` so a targeted send reaches relays we
-/// don't already hold (Goblin's `connect_relays`: idempotent add, short
-/// bounded dial, concurrent so one dead relay doesn't stall the rest).
-async fn connect_relays(client: &Client, urls: &[String]) {
-    let dials = urls.iter().map(|url| {
+/// Add + dial the relays in `urls` so a targeted send reaches relays we don't
+/// already hold (Goblin's `connect_relays`: idempotent add, short bounded dial,
+/// concurrent so one dead relay doesn't stall the rest), and report which of
+/// them the pool actually ended up holding.
+///
+/// Two bounds beyond Goblin's version. A payer-advertised relay only enters the
+/// pool while there is room in a fixed budget of `own_relays + MAX_HINTED_RELAYS`
+/// (nothing ever removes a relay, so an unbounded add grew the pool and its live
+/// connections with every new payer), and our own configured relays are always
+/// dialed and never counted against that budget: a hint can add reach, never
+/// take it away.
+///
+/// Returning the in-pool subset is load bearing, not tidiness:
+/// `send_event_to` fails the WHOLE publish with `RelayNotFound` if any single
+/// target is missing from the pool (nostr-relay-pool 0.44.3 `pool/mod.rs:763`),
+/// so a hint that could not be added must not stay in the target list.
+async fn connect_relays(client: &Client, urls: &[String], own_relays: &[String]) -> Vec<String> {
+    let pool = client.relays().await;
+    let in_pool = |url: &str| RelayUrl::parse(url).is_ok_and(|parsed| pool.contains_key(&parsed));
+    let budget = (own_relays.len() + MAX_HINTED_RELAYS).saturating_sub(pool.len());
+    let wanted = plan_dials(urls, own_relays, in_pool, budget);
+
+    let dials = wanted.iter().map(|url| {
         let url = url.clone();
         async move {
             let _ = client.add_relay(&url).await;
@@ -660,6 +694,53 @@ async fn connect_relays(client: &Client, urls: &[String]) {
         }
     });
     async_wsocket::futures_util::future::join_all(dials).await;
+
+    let pool = client.relays().await;
+    wanted
+        .into_iter()
+        .filter(|url| RelayUrl::parse(url).is_ok_and(|parsed| pool.contains_key(&parsed)))
+        .collect()
+}
+
+/// Which of `urls` to dial, given how many NEW relays the pool may still take.
+/// Pure, so the bound is unit-testable without a relay pool.
+///
+/// Our own relays and anything the pool already holds are always kept and cost
+/// nothing: the budget exists to stop payer hints accumulating, never to drop
+/// the set the till listens on. A hint that is not a WebSocket URL is skipped,
+/// and once the budget is spent further NEW hints are skipped individually
+/// (not `break`, which would also discard our own relays listed after them).
+fn plan_dials(
+    urls: &[String],
+    own_relays: &[String],
+    in_pool: impl Fn(&str) -> bool,
+    mut budget: usize,
+) -> Vec<String> {
+    let mut wanted: Vec<String> = Vec::with_capacity(urls.len());
+    let mut refused = 0usize;
+    for url in urls {
+        if own_relays.iter().any(|own| own == url) || in_pool(url) {
+            wanted.push(url.clone());
+            continue;
+        }
+        if !gp_core::config::is_relay_url(url) {
+            warn!("nostr: ignoring a relay hint that is not a WebSocket URL");
+            continue;
+        }
+        if budget == 0 {
+            refused += 1;
+            continue;
+        }
+        budget -= 1;
+        wanted.push(url.clone());
+    }
+    if refused > 0 {
+        warn!(
+            "nostr: relay pool budget reached, ignored {refused} payer relay hint(s) \
+             (own relays are unaffected)"
+        );
+    }
+    wanted
 }
 
 #[cfg(test)]
@@ -715,6 +796,110 @@ mod tests {
         assert_eq!(
             db.check_id(&event.id).await.unwrap(),
             nostr_sdk::prelude::DatabaseEventStatus::Saved
+        );
+    }
+
+    /// Build a kind 10050 with the given relay tags, signed by `author`.
+    fn inbox(author: &Keys, relays: &[&str]) -> Event {
+        let mut tags: Vec<Tag> = relays
+            .iter()
+            .map(|r| Tag::custom(TagKind::custom("relay"), [r.to_string()]))
+            .collect();
+        tags.push(wrap::capability_tag());
+        EventBuilder::new(Kind::InboxRelays, "")
+            .tags(tags)
+            .sign_with_keys(author)
+            .unwrap()
+    }
+
+    #[test]
+    fn relay_hints_are_only_taken_from_the_payer_s_own_event() {
+        let payer = Keys::generate();
+        let stranger = Keys::generate();
+
+        // The payer's own list is used, capped at MAX_DM_RELAYS.
+        let mine = inbox(
+            &payer,
+            &[
+                "wss://a.example",
+                "wss://b.example/",
+                "wss://c.example",
+                "wss://d.example",
+            ],
+        );
+        let (relays, encryption) = hints_from([&mine], &payer.public_key());
+        assert_eq!(
+            relays,
+            vec![
+                "wss://a.example".to_string(),
+                "wss://b.example".to_string(),
+                "wss://c.example".to_string(),
+            ],
+            "capped at {MAX_DM_RELAYS} and trailing slashes trimmed"
+        );
+        assert_eq!(encryption.as_deref(), Some(wrap::ENCRYPTION_CAPABILITIES));
+
+        // A relay can answer a REQ with anything. An event by someone else is
+        // NOT the payer's advice: taking it would let a relay redirect the
+        // reply and downgrade its encryption with its own capability tag.
+        let theirs = inbox(&stranger, &["wss://attacker.example"]);
+        let (relays, encryption) = hints_from([&theirs], &payer.public_key());
+        assert!(relays.is_empty(), "a stranger's 10050 is ignored");
+        assert_eq!(encryption, None);
+        assert_eq!(
+            wrap::choose_version(encryption.as_deref()),
+            wrap::WrapVersion::V2,
+            "and the fallback is the mandatory baseline, not a downgrade"
+        );
+
+        // Non-WebSocket hints are dropped; they cannot be a relay.
+        let junk = inbox(
+            &payer,
+            &["https://not-a-relay.example", "wss://good.example"],
+        );
+        let (relays, _) = hints_from([&junk], &payer.public_key());
+        assert_eq!(relays, vec!["wss://good.example".to_string()]);
+    }
+
+    #[test]
+    fn payer_relay_hints_are_capped_and_never_displace_our_own() {
+        let own: Vec<String> = vec!["wss://ours-a.example".into(), "wss://ours-b.example".into()];
+        let none_in_pool = |_: &str| false;
+
+        // Room for MAX_HINTED_RELAYS new hints, and no more.
+        let hints: Vec<String> = (0..MAX_HINTED_RELAYS + 4)
+            .map(|i| format!("wss://payer-{i}.example"))
+            .collect();
+        let planned = plan_dials(&hints, &own, none_in_pool, MAX_HINTED_RELAYS);
+        assert_eq!(planned.len(), MAX_HINTED_RELAYS, "hints are capped");
+        assert_eq!(planned[0], "wss://payer-0.example");
+
+        // Budget spent: our own relays and anything already dialed still go
+        // through, and they are kept even when listed AFTER a refused hint.
+        let mixed: Vec<String> = vec![
+            "wss://payer-x.example".into(), // new, refused (budget 0)
+            "wss://ours-a.example".into(),  // ours, always kept
+            "wss://known.example".into(),   // already in the pool, free
+            "wss://payer-y.example".into(), // new, refused
+        ];
+        let in_pool = |url: &str| url == "wss://known.example";
+        assert_eq!(
+            plan_dials(&mixed, &own, in_pool, 0),
+            vec![
+                "wss://ours-a.example".to_string(),
+                "wss://known.example".to_string(),
+            ],
+            "a refused hint must not swallow the entries after it"
+        );
+
+        // Non-WebSocket hints never consume budget and are never dialed.
+        let junk: Vec<String> = vec![
+            "https://not-a-relay.example".into(),
+            "wss://payer-z.example".into(),
+        ];
+        assert_eq!(
+            plan_dials(&junk, &own, none_in_pool, 1),
+            vec!["wss://payer-z.example".to_string()]
         );
     }
 

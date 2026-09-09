@@ -25,6 +25,13 @@ use gp_core::config::RelayMode;
 /// guidance) and read from a payer's list.
 pub const MAX_DM_RELAYS: usize = 3;
 
+/// Maximum payer-advertised relays the pool may hold ON TOP of our own
+/// configured set. Every reply dispatch dials the payer's hinted relays, and
+/// nothing ever removed them, so a stream of payers grew the pool (and its live
+/// connections) without limit. Our own relays are always dialed and never
+/// removed: a hint can add reach, never take it away.
+pub const MAX_HINTED_RELAYS: usize = 8;
+
 /// The relay set to listen on, publish to, and advertise in the `nprofile`.
 ///
 /// In `bundled` mode the co-located `bundled_url` comes first (so it heads the

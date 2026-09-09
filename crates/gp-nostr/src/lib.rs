@@ -32,6 +32,14 @@ pub mod wrap;
 /// without depending on nostr-sdk directly.
 pub use nostr_sdk::{Keys, PublicKey};
 
+/// Subscription look-back window: gift wrap timestamps are randomized up to
+/// 2 days into the past (NIP-59), use 3 (Goblin's constant). Cross-restart
+/// dedupe is the wallet's already-received guard plus the payment table.
+///
+/// Shared by [`service`] (what the REQ asks relays for) and [`ingest`] (how old
+/// a wrap may be before it is refused), so the two cannot drift apart.
+pub const LOOKBACK_SECS: i64 = 3 * 86_400;
+
 /// What the wallet hands back for one received S1 slatepack. Mirrors
 /// `gp_wallet::Received`, redefined here so the transport crate never links
 /// the Grin stack (the wallet side plugs in through [`SlatepackReceiver`]).

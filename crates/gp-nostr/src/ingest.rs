@@ -12,15 +12,15 @@
 //!   reply-to-us (S2) or an invoice would target a sender wallet we do not
 //!   have. They drop.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use log::{info, warn};
+use log::{debug, info, warn};
 use nostr_sdk::{Event, EventBuilder, Keys, Kind, PublicKey, Tag, UnsignedEvent};
 
 use crate::{
     protocol, unix_time, IncomingContext, KeyDirectory, MasterDirectory, ReceiveError,
-    SlatepackReceiver,
+    SlatepackReceiver, LOOKBACK_SECS,
 };
 
 /// Rate limit for incoming wraps per sender (events/hour). A payment server
@@ -32,6 +32,29 @@ const RATE_PER_SENDER_PER_HOUR: usize = 10;
 const GLOBAL_UNWRAP_PER_MIN: usize = 120;
 /// Cap on remembered rate-limiter senders before pruning.
 const RATE_MAP_CAP: usize = 10_000;
+/// Cap on remembered dedupe markers before pruning.
+const SEEN_MAP_CAP: usize = RATE_MAP_CAP;
+/// How long a dedupe marker is kept. Deliberately equal to the oldest wrap
+/// [`accepts_created_at`] still accepts, so pruning a marker can never reopen a
+/// replay: any wrap old enough for its marker to be dropped is already refused
+/// on its timestamp.
+const SEEN_TTL_SECS: i64 = MAX_WRAP_AGE_SECS;
+/// Oldest wrap `created_at` accepted: the subscription look-back plus a day of
+/// slack (NIP-59 randomizes timestamps up to two days into the past, and the
+/// look-back already covers three).
+const MAX_WRAP_AGE_SECS: i64 = LOOKBACK_SECS + 86_400;
+/// How far into the future a wrap `created_at` may be (clock skew allowance).
+const MAX_WRAP_SKEW_SECS: i64 = 15 * 60;
+/// The invariant the pruning rests on, checked at compile time: a marker is
+/// never dropped while a wrap that old would still be accepted.
+const _: () = assert!(SEEN_TTL_SECS >= MAX_WRAP_AGE_SECS);
+
+/// Is this wrap's `created_at` inside the window we will act on? Outside it the
+/// wrap is either older than anything the subscription asked for, or dated in a
+/// future no honest clock explains.
+fn accepts_created_at(created_at: i64, now: i64) -> bool {
+    created_at >= now - MAX_WRAP_AGE_SECS && created_at <= now + MAX_WRAP_SKEW_SECS
+}
 /// Cap on wraps held for in-process retry after a transient receive failure.
 const RETRY_CAP: usize = 256;
 /// Give up on a wrap after this many in-process retries.
@@ -133,8 +156,10 @@ pub struct Ingest<R> {
     /// Resolves an incoming wrap's `p` tag to the identity we hold for it
     /// (master, or a per-invoice / per-user derived child).
     directory: Arc<dyn KeyDirectory>,
-    /// Processed markers: wrap ids, rumor ids, `slate:<id>` markers.
-    seen: Mutex<HashSet<String>>,
+    /// Processed markers (wrap ids, rumor ids, `slate:<id>` markers) with the
+    /// unix second each was set, so the set can be pruned by age instead of
+    /// growing for the process lifetime.
+    seen: Mutex<HashMap<String, i64>>,
     /// Per-sender sliding-window rate state (unix seconds of accepted events;
     /// the `"\0global"` key carries the global unwrap ceiling).
     rate: Mutex<HashMap<String, Vec<i64>>>,
@@ -161,7 +186,7 @@ impl<R: SlatepackReceiver> Ingest<R> {
             keys,
             receiver,
             directory,
-            seen: Mutex::new(HashSet::new()),
+            seen: Mutex::new(HashMap::new()),
             rate: Mutex::new(HashMap::new()),
             retry: Mutex::new(HashMap::new()),
         }
@@ -209,6 +234,19 @@ impl<R: SlatepackReceiver> Ingest<R> {
         if event.content.len() > protocol::MAX_WRAP_CONTENT {
             self.mark(&wrap_id);
             return IngestOutcome::Dropped("oversized wrap");
+        }
+        // 1.5 Timestamp window, before any crypto. Older than the subscription
+        // look-back (plus a day of slack for NIP-59's backdating) means nothing
+        // we would still act on; dated into the future means a clock no honest
+        // sender has. Deliberately NOT marked processed: the verdict comes from
+        // the event alone, so re-deciding it is free and costs no dedupe slot.
+        if !accepts_created_at(event.created_at.as_secs() as i64, unix_time()) {
+            debug!(
+                "ingest: wrap {}… outside the accepted time window (created_at {})",
+                &wrap_id[..8],
+                event.created_at.as_secs()
+            );
+            return IngestOutcome::Dropped("created_at outside the accepted window");
         }
         // 2. Wrap-level dedupe.
         if self.is_seen(&wrap_id) {
@@ -389,7 +427,11 @@ impl<R: SlatepackReceiver> Ingest<R> {
         let mut due = Vec::new();
         let mut settled = Vec::new();
         for (id, event) in candidates {
-            if self.is_seen(&id) {
+            // Settled = already marked processed, or aged out of the window
+            // (re-running that one would only be dropped on its timestamp,
+            // which does not mark, so it would never leave the queue).
+            let stale = !accepts_created_at(event.created_at.as_secs() as i64, now);
+            if stale || self.is_seen(&id) {
                 settled.push(id);
             } else {
                 due.push(event);
@@ -410,11 +452,35 @@ impl<R: SlatepackReceiver> Ingest<R> {
     }
 
     fn is_seen(&self, key: &str) -> bool {
-        self.seen.lock().expect("seen lock").contains(key)
+        self.seen.lock().expect("seen lock").contains_key(key)
     }
 
+    /// Remember a marker, pruning the set when it grows past its cap: first by
+    /// age (a marker older than the wrap window is unreachable anyway), then, if
+    /// a flood kept everything young, oldest-first down to the cap. The wallet's
+    /// own already-received guard is the money-level backstop either way.
     fn mark(&self, key: &str) {
-        self.seen.lock().expect("seen lock").insert(key.to_string());
+        let now = unix_time();
+        let mut seen = self.seen.lock().expect("seen lock");
+        seen.insert(key.to_string(), now);
+        if seen.len() <= SEEN_MAP_CAP {
+            return;
+        }
+        seen.retain(|_, marked| now - *marked < SEEN_TTL_SECS);
+        if seen.len() > SEEN_MAP_CAP {
+            let excess = seen.len() - SEEN_MAP_CAP;
+            let mut by_age: Vec<(String, i64)> =
+                seen.iter().map(|(k, t)| (k.clone(), *t)).collect();
+            by_age.sort_unstable_by_key(|(_, t)| *t);
+            for (key, _) in by_age.into_iter().take(excess) {
+                seen.remove(&key);
+            }
+        }
+    }
+
+    /// How many dedupe markers are held (observability + tests).
+    pub fn seen_len(&self) -> usize {
+        self.seen.lock().expect("seen lock").len()
     }
 
     /// Sliding-window per-sender rate limiter (Goblin's `allow_sender`).
@@ -744,6 +810,81 @@ mod tests {
             IngestOutcome::RateLimited
         ));
         assert_eq!(ingest.receiver().calls(), RATE_PER_SENDER_PER_HOUR);
+    }
+
+    #[test]
+    fn created_at_window_rejects_stale_and_future_wraps() {
+        let now = 1_800_000_000;
+        assert!(accepts_created_at(now, now));
+        // NIP-59 backdates up to 2 days; the look-back covers 3, plus a day of
+        // slack. Everything in that range is still actionable.
+        assert!(accepts_created_at(now - 2 * 86_400, now));
+        assert!(accepts_created_at(now - MAX_WRAP_AGE_SECS, now));
+        assert!(!accepts_created_at(now - MAX_WRAP_AGE_SECS - 1, now));
+        // Modest clock skew is tolerated, an implausible future is not.
+        assert!(accepts_created_at(now + MAX_WRAP_SKEW_SECS, now));
+        assert!(!accepts_created_at(now + MAX_WRAP_SKEW_SECS + 1, now));
+        assert!(!accepts_created_at(now + 86_400, now));
+        // (That the dedupe TTL is never shorter than this window is asserted at
+        // compile time next to the constants.)
+    }
+
+    #[tokio::test]
+    async fn a_stale_wrap_never_reaches_the_wallet() {
+        use nostr_sdk::Timestamp;
+
+        let payer = Keys::generate();
+        let server = Keys::generate();
+        let ingest = Ingest::new(server.clone(), StubReceiver::new(vec![]));
+
+        // A well-formed payment wrap, but dated a week ago.
+        let mut tags = protocol::build_rumor_tags(Some("stale"));
+        tags.push(Tag::public_key(server.public_key()));
+        let rumor = EventBuilder::new(
+            Kind::PrivateDirectMessage,
+            protocol::build_payment_content(PACK),
+        )
+        .tags(tags)
+        .build(payer.public_key());
+        let fresh = crate::wrap::gift_wrap(
+            &payer,
+            &server.public_key(),
+            rumor,
+            crate::wrap::WrapVersion::V2,
+        )
+        .unwrap();
+        let stale = EventBuilder::new(Kind::GiftWrap, fresh.content.clone())
+            .tags(fresh.tags.clone().to_vec())
+            .custom_created_at(Timestamp::from_secs(
+                (unix_time() - 7 * 86_400).max(0) as u64
+            ))
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+
+        assert!(matches!(
+            ingest.handle_wrap(&stale).await,
+            IngestOutcome::Dropped("created_at outside the accepted window")
+        ));
+        assert_eq!(ingest.receiver().calls(), 0);
+        // Refused on the event alone, so no dedupe slot was spent on it.
+        assert_eq!(ingest.seen_len(), 0);
+    }
+
+    #[test]
+    fn the_dedupe_set_is_bounded() {
+        // It used to be an unbounded HashSet: every wrap ever seen stayed for
+        // the process lifetime. Now it prunes back to the cap.
+        let ingest = Ingest::new(Keys::generate(), StubReceiver::new(vec![]));
+        for i in 0..SEEN_MAP_CAP + 500 {
+            ingest.mark(&format!("marker-{i}"));
+        }
+        assert!(
+            ingest.seen_len() <= SEEN_MAP_CAP,
+            "seen grew to {}",
+            ingest.seen_len()
+        );
+        // The most recent markers survive the prune, so live dedupe still works.
+        assert!(ingest.is_seen(&format!("marker-{}", SEEN_MAP_CAP + 499)));
     }
 
     #[test]

@@ -201,12 +201,19 @@ async fn start_ingest(cfg: &Config, pool: sqlx::SqlitePool) -> (Keys, GpWallet) 
 }
 
 /// Build a rustls server config from PEM certificate-chain and key files.
+///
+/// The PEM decoding is rustls's own (`rustls::pki_types::pem`), not the
+/// separate `rustls-pemfile` crate, which the rustls project retired into
+/// pki-types and no longer maintains (RUSTSEC-2025-0134). Same parser, one
+/// fewer dependency.
 fn tls_server_config(cert_path: &str, key_path: &str) -> Result<rustls::ServerConfig, String> {
-    let mut cert_reader = io::BufReader::new(
-        std::fs::File::open(cert_path)
-            .map_err(|e| format!("GP_TLS_CERT `{cert_path}` unreadable: {e}"))?,
-    );
-    let certs = rustls_pemfile::certs(&mut cert_reader)
+    use rustls::pki_types::pem::{Error as PemError, PemObject};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    // `pem_file_iter` reports an open failure here and any decode failure from
+    // the iterator, so the two stay distinguishable.
+    let certs = CertificateDer::pem_file_iter(cert_path)
+        .map_err(|e| format!("GP_TLS_CERT `{cert_path}` unreadable: {e}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("GP_TLS_CERT `{cert_path}` invalid PEM: {e}"))?;
     if certs.is_empty() {
@@ -215,13 +222,11 @@ fn tls_server_config(cert_path: &str, key_path: &str) -> Result<rustls::ServerCo
         ));
     }
 
-    let mut key_reader = io::BufReader::new(
-        std::fs::File::open(key_path)
-            .map_err(|e| format!("GP_TLS_KEY `{key_path}` unreadable: {e}"))?,
-    );
-    let key = rustls_pemfile::private_key(&mut key_reader)
-        .map_err(|e| format!("GP_TLS_KEY `{key_path}` invalid PEM: {e}"))?
-        .ok_or_else(|| format!("GP_TLS_KEY `{key_path}` contains no private key"))?;
+    let key = PrivateKeyDer::from_pem_file(key_path).map_err(|e| match e {
+        PemError::Io(_) => format!("GP_TLS_KEY `{key_path}` unreadable: {e}"),
+        PemError::NoItemsFound => format!("GP_TLS_KEY `{key_path}` contains no private key"),
+        _ => format!("GP_TLS_KEY `{key_path}` invalid PEM: {e}"),
+    })?;
 
     rustls::ServerConfig::builder()
         .with_no_client_auth()

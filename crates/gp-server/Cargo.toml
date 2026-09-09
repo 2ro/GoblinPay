@@ -25,7 +25,10 @@ rustls = { version = "0.23", default-features = false, features = [
     "std",
     "tls12",
 ] }
-rustls-pemfile = "2"
+# No rustls-pemfile: PEM decoding comes from rustls's own
+# `rustls::pki_types::pem` (rustls-pki-types, already in the graph). The
+# standalone crate was retired into pki-types and is unmaintained
+# (RUSTSEC-2025-0134). See `tls_server_config` in src/main.rs.
 serde = { workspace = true }
 serde_json.workspace = true
 sqlx = { workspace = true }

@@ -111,7 +111,8 @@ RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
-# If the Nym mixnet stack ever fails to start with a W^X error, comment this out.
+# If an in-process component (the grin1 rail's Tor client, say) ever fails to
+# start with a W^X error, comment this out.
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service

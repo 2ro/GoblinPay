@@ -3,7 +3,7 @@
 //!
 //! The strongest automatable version of the plan's "pay from Goblin ->
 //! GoblinPay receives -> S2 back": a live over-the-wire run needs the Goblin
-//! GUI, a funded wallet, relays, and the mixnet, none of which are
+//! GUI, a funded wallet, and live relays, none of which are
 //! automatable here (headless-test limits) — that run is deferred to the
 //! supervised mainnet round. Instead:
 //!

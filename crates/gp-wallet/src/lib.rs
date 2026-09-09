@@ -44,7 +44,7 @@ use serde::Serialize;
 pub use confirm::{confirm_status, ConfirmStatus};
 
 /// Health-probe a Grin node URL: a fresh `HTTPNodeClient` `get_tip` round trip
-/// over DIRECT HTTP (never Nym), same read path the confirmation poll uses.
+/// over DIRECT HTTP (untunnelled), same read path the confirmation poll uses.
 /// Returns `true` if the node answered with a tip. Used by the setup wizard to
 /// pick the first healthy node from its curated list; a failed probe (down,
 /// unreachable, or a non-tip response) simply returns `false` so the wizard
@@ -190,7 +190,7 @@ pub struct Balance {
 pub struct GpWallet {
     instance: Instance,
     mask: Option<SecretKey>,
-    /// Configured node URL for confirmation reads (DIRECT HTTP, never Nym).
+    /// Configured node URL for confirmation reads (DIRECT HTTP, untunnelled).
     node_url: String,
 }
 
@@ -256,7 +256,7 @@ impl GpWallet {
     /// `<data_dir>/wallet/wallet_data/wallet.seed`, mode 0600. The receive path
     /// is fully offline; `node_url` is used only for lightweight confirmation
     /// reads (a single `get_kernel` per pending payment), which go DIRECT over
-    /// HTTP, never through the Nym tunnel.
+    /// HTTP, never through a tunnel.
     ///
     /// `mnemonic` is consumed only on first run (when no wallet exists yet):
     /// - wallet absent + `Some(seed)`: create the wallet from `seed`.
@@ -684,7 +684,7 @@ impl GpWallet {
     }
 
     /// Confirmation status for a received payment's kernel, via a DIRECT node
-    /// read (never Nym). `kernel_excess_hex` is [`Received::kernel_excess`].
+    /// read (untunnelled). `kernel_excess_hex` is [`Received::kernel_excess`].
     pub fn confirm_status(&self, kernel_excess_hex: &str) -> Result<ConfirmStatus, WalletError> {
         confirm::confirm_status(&self.node_url, kernel_excess_hex)
     }

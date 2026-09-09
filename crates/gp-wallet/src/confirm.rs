@@ -8,11 +8,11 @@
 //! own updater uses to detect reverted kernels.
 //!
 //! Transport: this read goes DIRECT over normal HTTP to the configured node
-//! (`grin_wallet_impls::HTTPNodeClient`), NEVER through the Nym tunnel. The
-//! mixnet in gp-nostr carries only the Nostr gift-wrap layer; the wallet<->node
-//! reads are a server concern that rides clearnet, mirroring Goblin's own
-//! wallet->node traffic (owner ruling). This crate has no Nym linkage at all,
-//! so the direct path is structural, not merely configured.
+//! (`grin_wallet_impls::HTTPNodeClient`), NEVER through a tunnel. The
+//! wallet<->node reads are a server concern that rides clearnet, mirroring
+//! Goblin's own wallet->node traffic (owner ruling). This crate links no
+//! anonymity transport at all, so the direct path is structural, not merely
+//! configured.
 //!
 //! We depend on upstream grin-wallet for the network round-trip and kernel
 //! parse; the only logic here is turning the located kernel into a

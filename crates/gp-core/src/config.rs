@@ -24,10 +24,9 @@ pub const DEFAULT_DATA_DIR: &str = "./gp-data";
 /// `api.grin.money`'s bulk UTXO scan (`get_unspent_outputs`) returns errors,
 /// while `main.gri.mw` serves the foreign API (`get_tip`, `get_kernel`)
 /// cleanly. GoblinPay only ever reads (kernel confirmation + a cached balance),
-/// and this traffic goes DIRECT over normal HTTP, never through the Nym tunnel
+/// and this traffic goes DIRECT over normal HTTP, never through a tunnel
 /// (owner ruling: node reads are a server concern, like Goblin's own
-/// wallet->node reads which never ride the mixnet; the mixnet carries only the
-/// Nostr gift-wrap layer in gp-nostr).
+/// wallet->node reads).
 pub const DEFAULT_NODE_URL: &str = "https://main.gri.mw";
 
 /// Default URL of the bundled relay in `bundled` relay mode: the co-located

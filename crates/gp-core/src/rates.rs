@@ -9,10 +9,10 @@
 //!
 //! Transport (owner ruling, same as the M4 node client): the oracle HTTP goes
 //! DIRECT over normal HTTP (reqwest with the process-installed rustls `ring`
-//! provider, no aws-lc-rs), NEVER through the Nym tunnel. The mixnet in
-//! gp-nostr carries only the Nostr gift-wrap layer; the price fetch is a server
+//! provider, no aws-lc-rs), NEVER through a tunnel. The price fetch is a server
 //! concern that rides clearnet, mirroring the wallet<->node reads. This crate
-//! has no Nym linkage at all, so the direct path is structural, not configured.
+//! links no anonymity transport at all, so the direct path is structural, not
+//! configured.
 //!
 //! Design:
 //! - **Source** (`GP_RATE_SOURCE`, default `coingecko`): where the GRIN price
@@ -184,8 +184,8 @@ pub struct Oracle {
     /// The invoice quote-lock window in seconds (`GP_QUOTE_TTL`).
     quote_ttl_secs: i64,
     cache: Mutex<HashMap<String, CachedRate>>,
-    /// A shared HTTP client (DIRECT, never Nym). `None` for a fixed/test oracle
-    /// whose cache is pre-seeded so it never fetches.
+    /// A shared HTTP client (DIRECT, untunnelled). `None` for a fixed/test
+    /// oracle whose cache is pre-seeded so it never fetches.
     client: Option<reqwest::Client>,
 }
 

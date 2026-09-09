@@ -50,6 +50,10 @@ front it with their own network privacy. Encryption negotiates NIP-44 v3 (the
 NIP-17 extension, via the companion `nip44` crate) per recipient, with v2 as the
 mandatory baseline.
 
+History: GoblinPay once carried an in-process Nym mixnet client of its own
+behind `GP_NYM`; Goblin Wallet's Nostr transport moved to Tor, that client was
+retired, and the migration plan that tracked the move has been retired with it.
+
 ## Workspace
 
 | Crate | Purpose |

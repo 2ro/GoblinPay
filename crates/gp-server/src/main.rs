@@ -408,7 +408,7 @@ async fn main() -> io::Result<()> {
     // Confirmation poll (M4): advances received payments to `confirmed` when
     // their kernel lands, and advances the paying invoice `paid` -> `confirmed`
     // once it reaches GP_CONFIRMATIONS depth (firing a payment.confirmed
-    // webhook). Node reads go DIRECT (never Nym).
+    // webhook). Node reads go DIRECT (untunnelled).
     payments::spawn_confirm_poll(
         pool.clone(),
         cfg.node_url.clone(),
@@ -490,7 +490,7 @@ async fn main() -> io::Result<()> {
         }
     }
     // The conversion-rate oracle (M7): shared across workers, prices fiat
-    // invoices at create time over DIRECT HTTP (never Nym).
+    // invoices at create time over DIRECT HTTP (untunnelled).
     let oracle_data = web::Data::new(gp_core::rates::Oracle::from_config(&cfg));
     let server = HttpServer::new(move || {
         App::new()

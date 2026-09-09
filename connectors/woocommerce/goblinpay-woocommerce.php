@@ -3,7 +3,7 @@
  * Plugin Name: GoblinPay for WooCommerce
  * Plugin URI:  https://git.us-ea.st/GRIN/GoblinPay
  * Description: Accept Grin (GRIN / MimbleWimble) payments in WooCommerce through a self-hosted GoblinPay server. The customer pays from their Goblin Wallet by scanning an nprofile QR; payment travels as a gift-wrapped slatepack over Nostr. Works with the classic and the Blocks checkout. HPOS-compatible.
- * Version:     1.0.0
+ * Version:     1.0.1
  * Author:      GoblinPay
  * License:     GPL-2.0-or-later
  * Requires PHP: 8.0
@@ -32,7 +32,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('GOBLINPAY_WC_VERSION', '1.0.0');
+define('GOBLINPAY_WC_VERSION', '1.0.1');
 define('GOBLINPAY_WC_PLUGIN_FILE', __FILE__);
 define('GOBLINPAY_WC_WH_NS', 'goblinpay/v1');    // keep stable: this is the webhook URL registered in GoblinPay
 define('GOBLINPAY_WC_GATEWAY_ID', 'goblinpay');  // keep stable: ties to the saved settings option

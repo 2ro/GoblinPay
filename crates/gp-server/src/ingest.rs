@@ -62,6 +62,27 @@ impl WalletReceiver {
     }
 }
 
+/// The text grin-wallet's duplicate-receive guard puts in its error message
+/// (`Error::TransactionAlreadyReceived`, "Transaction <uuid> has already been
+/// received"). gp-wallet flattens grin-wallet errors to strings by design, so
+/// this is the only handle on that case; the pinning test below asserts the real
+/// upstream variant still renders it.
+const ALREADY_RECEIVED: &str = "already been received";
+
+/// Classify a wallet receive failure for the transport.
+///
+/// A slatepack the wallet refuses is permanently bad (drop the wrap); a slate
+/// grin has already received is a replay (drop the wrap, it is not lost); every
+/// other failure is transient, so the wrap stays unmarked and the next catch-up
+/// retries it. Split out so the classification is testable without a wallet.
+fn map_receive_error(e: WalletError) -> ReceiveError {
+    match e {
+        WalletError::Slatepack(m) => ReceiveError::Rejected(m),
+        WalletError::Wallet(m) if m.contains(ALREADY_RECEIVED) => ReceiveError::Duplicate,
+        other => ReceiveError::Failed(other.to_string()),
+    }
+}
+
 impl SlatepackReceiver for WalletReceiver {
     async fn receive(
         &self,
@@ -75,15 +96,7 @@ impl SlatepackReceiver for WalletReceiver {
         let received = self
             .wallet
             .receive_slatepack(s1_armor)
-            .map_err(|e| match e {
-                WalletError::Slatepack(m) => ReceiveError::Rejected(m),
-                // gp-wallet errors are strings by design; grin's own
-                // duplicate-receive guard surfaces through this message.
-                WalletError::Wallet(m) if m.contains("already been received") => {
-                    ReceiveError::Duplicate
-                }
-                other => ReceiveError::Failed(other.to_string()),
-            })?;
+            .map_err(map_receive_error)?;
 
         // Persist, match (all three modes), and enqueue the webhook. Side
         // effects only: the reply is what completes the payment, so a matching
@@ -173,5 +186,54 @@ impl SlatepackReceiver for WalletReceiver {
                 },
             )
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_receive_error_text_is_pinned_to_grin_wallet() {
+        // gp-wallet flattens grin-wallet errors to strings, so the duplicate
+        // guard reads TEXT. Build the REAL upstream error the wallet raises when
+        // a slate is received twice (libwallet/src/api_impl/foreign.rs:92 raises
+        // Error::TransactionAlreadyReceived) and assert the phrase we match on
+        // is still in it. A grin-wallet bump that reworded it fails HERE, loudly,
+        // instead of silently reclassifying every replayed slate as a transient
+        // failure: gp-nostr would then leave the wrap unmarked and retry it
+        // forever, and the ingest log would fill with false alarms.
+        let slate = "0199a1b2-c3d4-4e5f-8a9b-0c1d2e3f4a5b";
+        let upstream = grin_wallet_libwallet::Error::TransactionAlreadyReceived(slate.into());
+        let rendered = upstream.to_string();
+        assert!(
+            rendered.contains(ALREADY_RECEIVED),
+            "grin-wallet reworded its duplicate-receive error: {rendered}"
+        );
+
+        // And that message, as gp-wallet surfaces it, classifies as a duplicate.
+        assert!(matches!(
+            map_receive_error(WalletError::Wallet(rendered)),
+            ReceiveError::Duplicate
+        ));
+    }
+
+    #[test]
+    fn other_wallet_failures_keep_their_own_class() {
+        // A bad slatepack is permanently rejected...
+        assert!(matches!(
+            map_receive_error(WalletError::Slatepack("not an S1".into())),
+            ReceiveError::Rejected(m) if m == "not an S1"
+        ));
+        // ...while anything else is transient, so the wrap is retried rather
+        // than dropped. An incoming payment is never lost to a hiccup.
+        assert!(matches!(
+            map_receive_error(WalletError::Wallet("Client Callback Error".into())),
+            ReceiveError::Failed(_)
+        ));
+        assert!(matches!(
+            map_receive_error(WalletError::Config("no node URL".into())),
+            ReceiveError::Failed(_)
+        ));
     }
 }

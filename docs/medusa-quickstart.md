@@ -76,8 +76,10 @@ Then `sudo systemctl restart gp-server`. The `GP_API_TOKEN` and
 Place a test order and choose Grin (GoblinPay). The storefront shows the
 GoblinPay QR or redirects to the `/pay/<token>` page. Pay from your
 [Goblin wallet](https://goblin.st); the order's payment flips to captured once
-GoblinPay delivers the webhook. If a delivery is ever missed, the provider falls
-back to polling `GET {baseUrl}/invoice/{invoice_id}`.
+GoblinPay delivers the `payment.confirmed` webhook, which is sent when the
+paying kernel has reached `GP_CONFIRMATIONS` on chain. If a delivery is ever
+missed, the provider falls back to polling
+`GET {baseUrl}/invoice/{invoice_id}`.
 
 ## Notes
 

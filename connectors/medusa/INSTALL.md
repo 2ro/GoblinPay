@@ -72,7 +72,8 @@ side:
 
 GoblinPay signs each delivery with `X-GoblinPay-Signature: sha256=<hmac>` over
 the raw body and sends an idempotency key in `X-GoblinPay-Delivery`. The provider
-verifies the signature (constant-time) and flips the payment to captured.
+verifies the signature (constant-time), dedupes on that key, and flips the
+payment to captured on `payment.confirmed`.
 
 Make sure the Medusa host is reachable from the GoblinPay host. If a webhook is
 ever missed, Medusa's `getPaymentStatus` polls
@@ -85,7 +86,9 @@ Place a test order, choose Grin (GoblinPay), and confirm:
 - The storefront shows the GoblinPay QR / redirects to the `/pay/<token>` page
   (the checkout details are on the payment session's `data.goblinpay`).
 - Paying from a Goblin Wallet moves the order's payment to captured once
-  GoblinPay delivers the `payment.received` webhook.
+  GoblinPay delivers the `payment.confirmed` webhook (the paying kernel has
+  reached `GP_CONFIRMATIONS` on chain). The earlier `payment.received` delivery
+  is acknowledged but changes nothing: the payer may still never broadcast.
 
 ## Refund caveat
 

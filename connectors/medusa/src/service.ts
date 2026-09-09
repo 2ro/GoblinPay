@@ -8,9 +8,13 @@
  * the checkout details (pay_url, nprofile, qr_svg) on the session so the
  * storefront can render or redirect. The customer pays from their Goblin Wallet;
  * GoblinPay receives it, returns the reply slatepack, watches the chain, and
- * POSTs a signed webhook. `getWebhookActionAndData` verifies the HMAC and flips
- * the Medusa payment to captured. Status polling (`authorizePayment`,
- * `getPaymentStatus`) is the webhook-miss fallback.
+ * POSTs a signed webhook. `getWebhookActionAndData` verifies the HMAC and, on
+ * `payment.confirmed` ONLY (the paying kernel reached the required depth on
+ * chain), flips the Medusa payment to captured. `payment.received` means the
+ * funds are in hand off-chain but the payer may never broadcast the finalized
+ * transaction, so it is not settlement and is acknowledged without acting, the
+ * same rule the WooCommerce connector follows. Status polling
+ * (`authorizePayment`, `getPaymentStatus`) is the webhook-miss fallback.
  *
  * Refunds are NOT automated: GoblinPay is receive-only (it never sends Grin), so
  * `refundPayment` throws. A refund is a manual, out-of-band Grin send by the
@@ -21,6 +25,7 @@ import crypto from "node:crypto"
 import {
   AbstractPaymentProvider,
   ContainerRegistrationKeys,
+  MathBN,
   MedusaError,
   Modules,
   PaymentActions,
@@ -40,6 +45,7 @@ import type {
   InitiatePaymentOutput,
   IPaymentModuleService,
   Logger,
+  PaymentSessionDTO,
   ProviderWebhookPayload,
   RefundPaymentInput,
   RefundPaymentOutput,
@@ -52,8 +58,60 @@ import type {
 
 import type { GoblinPayInvoice, GoblinPayOptions } from "./types"
 
+/**
+ * How long a processed delivery id is remembered. GoblinPay retries a delivery
+ * with exponential backoff for roughly five hours before abandoning it, so a
+ * day is comfortably longer than any retry chain.
+ */
+const EVENT_TTL_MS = 24 * 60 * 60 * 1000
+
+/** Hard cap on remembered delivery ids so the cache cannot grow without bound. */
+const EVENT_CACHE_MAX = 1000
+
 class GoblinPayProviderService extends AbstractPaymentProvider<GoblinPayOptions> {
   static identifier = "goblinpay"
+
+  /**
+   * Delivery ids (`event_id` / `X-GoblinPay-Delivery`) already settled by this
+   * process, with the time they were recorded.
+   *
+   * Best effort by design: a Medusa payment provider has no shared store, and
+   * the capture it guards is itself idempotent, so a miss after a restart or
+   * across workers costs nothing. Entries expire and the map is capped.
+   */
+  private static readonly seenEvents_ = new Map<string, number>()
+
+  /** Has this delivery id already been settled (and not yet expired)? */
+  private static alreadySettled(eventId: string): boolean {
+    const at = GoblinPayProviderService.seenEvents_.get(eventId)
+    if (at === undefined) {
+      return false
+    }
+    if (Date.now() - at > EVENT_TTL_MS) {
+      GoblinPayProviderService.seenEvents_.delete(eventId)
+      return false
+    }
+    return true
+  }
+
+  /** Record a delivery id, evicting expired then oldest entries at the cap. */
+  private static rememberSettled(eventId: string): void {
+    const seen = GoblinPayProviderService.seenEvents_
+    const now = Date.now()
+    for (const [id, at] of seen) {
+      if (now - at > EVENT_TTL_MS) {
+        seen.delete(id)
+      }
+    }
+    while (seen.size >= EVENT_CACHE_MAX) {
+      const oldest = seen.keys().next()
+      if (oldest.done) {
+        break
+      }
+      seen.delete(oldest.value)
+    }
+    seen.set(eventId, now)
+  }
 
   protected readonly options_: GoblinPayOptions
   protected readonly logger_: Logger
@@ -102,15 +160,30 @@ class GoblinPayProviderService extends AbstractPaymentProvider<GoblinPayOptions>
     return json as T
   }
 
-  /** Map a GoblinPay invoice status to a Medusa payment session status. */
+  /**
+   * Map a GoblinPay invoice status to a Medusa payment session status.
+   *
+   * The server's lifecycle is `open` | `paid` | `confirmed` | `expired`
+   * (crates/gp-core/src/invoice.rs:40-57):
+   *
+   * - `open`      awaiting payment.
+   * - `paid`      the slatepack was received and the reply handed back, but the
+   *               payer may still never broadcast the finalized transaction, so
+   *               this is NOT settlement: it stays `pending`.
+   * - `confirmed` the paying kernel reached `GP_CONFIRMATIONS` on chain. This is
+   *               the settlement signal, matching `payment.confirmed` and the
+   *               WooCommerce connector.
+   * - `expired`   the invoice lapsed unpaid.
+   */
   private static mapStatus(
     status: string
   ): "captured" | "canceled" | "pending" {
     switch (status) {
-      case "paid":
+      case "confirmed":
         return "captured"
       case "expired":
         return "canceled"
+      // "open" and "paid" are both still in flight.
       default:
         return "pending"
     }
@@ -257,44 +330,93 @@ class GoblinPayProviderService extends AbstractPaymentProvider<GoblinPayOptions>
     }
 
     const data = (payload.data ?? {}) as {
+      event_id?: string
       event_type?: string
+      invoice_id?: string
       order_ref?: string
     }
+
+    // Idempotency key: the body's event_id, else the delivery header that
+    // carries the same value.
+    const eventId =
+      data.event_id ||
+      ((payload.headers?.["x-goblinpay-delivery"] as string) ?? "")
+    if (eventId && GoblinPayProviderService.alreadySettled(eventId)) {
+      return { action: PaymentActions.NOT_SUPPORTED }
+    }
+
     const sessionId = data.order_ref
     if (!sessionId) {
       return { action: PaymentActions.NOT_SUPPORTED }
     }
 
-    // payment.received (funds in hand, S2 returned) and payment.confirmed
-    // (on-chain) both mean paid for a receive-only till: flip to captured. The
-    // capture is idempotent, so a later confirmation after a received event is a
-    // no-op. Capture the session's own (store-currency) amount.
-    if (
-      data.event_type === "payment.received" ||
-      data.event_type === "payment.confirmed"
-    ) {
-      const amount = await this.sessionAmount(sessionId)
-      return {
-        action: PaymentActions.SUCCESSFUL,
-        data: { session_id: sessionId, amount },
-      }
+    // SETTLE ON payment.confirmed ONLY. payment.received means the funds are in
+    // hand off-chain (the S2 went back) but the payer may never broadcast the
+    // finalized transaction, so it is not fulfilment: acknowledge it and wait.
+    // Same rule as the WooCommerce connector.
+    if (data.event_type !== "payment.confirmed") {
+      return { action: PaymentActions.NOT_SUPPORTED }
     }
 
-    return { action: PaymentActions.NOT_SUPPORTED }
+    // One read serves both guards below: it binds the delivery to the invoice
+    // this session created, and it supplies the amount to capture.
+    const session = await this.settlingSession(sessionId)
+
+    // Bind the webhook to the invoice we created for this session (defence in
+    // depth behind the HMAC, mirroring the WooCommerce connector). A mismatch
+    // is permanent, so acknowledge it rather than making GoblinPay retry.
+    const known = (
+      (session.data ?? {}) as { goblinpay?: Partial<GoblinPayInvoice> }
+    ).goblinpay?.invoice_id
+    if (known && data.invoice_id && known !== data.invoice_id) {
+      this.logger_.warn(
+        `goblinpay: invoice mismatch on session ${sessionId}: known ${known}, got ${data.invoice_id}`
+      )
+      return { action: PaymentActions.NOT_SUPPORTED }
+    }
+
+    // Capture the session's own (store-currency) amount, never an amount from
+    // the webhook body. `amount` is a BigNumberValue, so it goes through MathBN
+    // rather than Number(), which would silently produce NaN for the object form.
+    const amount = MathBN.convert(session.amount).toNumber()
+    if (!Number.isFinite(amount) || amount <= 0) {
+      throw new MedusaError(
+        MedusaError.Types.UNEXPECTED_STATE,
+        `GoblinPay webhook: payment session ${sessionId} has no usable amount; refusing to capture`
+      )
+    }
+
+    // Record the delivery LAST, once everything above succeeded. Anything that
+    // throws on the way here leaves the id unrecorded, so GoblinPay's retry can
+    // still settle the payment.
+    if (eventId) {
+      GoblinPayProviderService.rememberSettled(eventId)
+    }
+
+    return {
+      action: PaymentActions.SUCCESSFUL,
+      data: { session_id: sessionId, amount },
+    }
   }
 
-  /** The payment session's authorized amount, for the webhook capture. */
-  private async sessionAmount(sessionId: string): Promise<number> {
+  /**
+   * The payment session a confirmed webhook is about to settle.
+   *
+   * FAIL CLOSED: a lookup failure throws instead of returning a default, so a
+   * capture can never run on a guessed (or zero) amount. The delivery then
+   * fails and GoblinPay retries it with backoff.
+   */
+  private async settlingSession(sessionId: string): Promise<PaymentSessionDTO> {
     try {
-      const session = await this.paymentService_.retrievePaymentSession(sessionId)
-      return Number(session.amount)
+      return await this.paymentService_.retrievePaymentSession(sessionId)
     } catch (e) {
-      this.logger_.warn(
-        `goblinpay: could not read session ${sessionId} amount: ${
-          (e as Error).message
-        }`
+      this.logger_.error(
+        `goblinpay: could not read session ${sessionId}: ${(e as Error).message}`
       )
-      return 0
+      throw new MedusaError(
+        MedusaError.Types.UNEXPECTED_STATE,
+        `GoblinPay webhook: payment session ${sessionId} is unreadable; refusing to capture`
+      )
     }
   }
 }

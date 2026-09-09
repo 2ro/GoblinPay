@@ -60,14 +60,17 @@ the exact raw body (constant-time) before acting.
 | GoblinPay | Medusa payment session |
 |---|---|
 | invoice `open` | `pending` |
-| invoice `paid` | `captured` |
+| invoice `paid` | `pending` (received off-chain, not yet settled) |
+| invoice `confirmed` | `captured` |
 | invoice `expired` | `canceled` |
-| webhook `payment.received` | captured (SUCCESSFUL) |
+| webhook `payment.received` | acknowledged, no state change (NOT_SUPPORTED) |
 | webhook `payment.confirmed` | captured (SUCCESSFUL, idempotent) |
 
-For a receive-only till, a received payment (the reply slatepack is back and the
-funds are in the merchant wallet) is treated as paid, the same as the
-WooCommerce connector. The later on-chain confirmation is an idempotent no-op.
+A received payment means the slatepack was received and the reply handed back,
+but the payer may never broadcast the finalized transaction, so it is not yet
+fulfilment. The order settles only on `payment.confirmed`, when the paying
+kernel has reached `GP_CONFIRMATIONS` on chain, exactly like the WooCommerce
+connector.
 
 ## Refunds
 
@@ -82,7 +85,13 @@ same caveat the Grin BTCPay connector carries.
   request body, compared in constant time. A bad or missing signature is
   rejected and the payment is not flipped.
 - The capture amount is read from the Medusa payment session (its own
-  store-currency amount), not from untrusted webhook fields.
+  store-currency amount), not from untrusted webhook fields. If that session
+  cannot be read, or carries no usable amount, the delivery fails instead of
+  capturing: there is no zero-amount fallback.
+- Each delivery is bound to the invoice the session created (`invoice_id`), and
+  a delivery id already settled by this process is ignored. The id is recorded
+  only after the settlement decision is complete, so a failure part-way through
+  leaves GoblinPay free to retry.
 - Secrets live in the provider options / environment, never in code.
 
 ## Credit

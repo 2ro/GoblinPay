@@ -474,21 +474,34 @@ enum PasteRoute {
     Reject(String),
 }
 
+/// What a paste on a closed (paid, confirmed, or expired) invoice is told.
+/// Shared by both paste routes so a stale S1 and a stale I2 read identically.
+const CLOSED_INVOICE_REJECT: &str = "This invoice has already been paid or is no longer open; \
+     nothing more to submit.";
+
 /// Route a decoded paste. Pure so the decision is unit-testable: `state` is
 /// the compact slate-state name ("S1"/"I2"/...), `slate_id` the pasted slate's
 /// id, `inv` the invoice whose pay page received the paste.
+///
+/// Both routes refuse a closed invoice: the money path only runs while the
+/// invoice is `open`.
 fn route_paste(state: &str, slate_id: &str, inv: &Invoice) -> PasteRoute {
     match state {
-        "S1" => PasteRoute::ReceiveS1,
+        "S1" => {
+            if inv.status() != InvoiceStatus::Open {
+                // The page hides the paste form once an invoice closes, so this
+                // is a stale form POST (or a hand-crafted one). Receiving here
+                // would take money for an order that is already settled,
+                // expired, or confirmed, with nothing left to bind it to.
+                return PasteRoute::Reject(CLOSED_INVOICE_REJECT.into());
+            }
+            PasteRoute::ReceiveS1
+        }
         "I2" => {
             if inv.status() != InvoiceStatus::Open {
                 // Already settled (possibly by the Tor return of this same
                 // slate racing the paste): nothing to do, never settle twice.
-                return PasteRoute::Reject(
-                    "This invoice has already been paid or is no longer open; \
-                     nothing more to submit."
-                        .into(),
-                );
+                return PasteRoute::Reject(CLOSED_INVOICE_REJECT.into());
             }
             if inv.is_grin1() && inv.slate_id.as_deref() == Some(slate_id) {
                 PasteRoute::FinalizeI2
@@ -712,7 +725,7 @@ mod tests {
     #[test]
     fn paste_router_sends_each_rail_to_its_path() {
         let inv = grin1_invoice("slate-abc");
-        // A plain-send S1 always goes to the existing receive path.
+        // A plain-send S1 on an OPEN invoice goes to the existing receive path.
         assert_eq!(route_paste("S1", "any-id", &inv), PasteRoute::ReceiveS1);
         // The invoice response with the matching slate id finalizes.
         assert_eq!(route_paste("I2", "slate-abc", &inv), PasteRoute::FinalizeI2);
@@ -731,6 +744,33 @@ mod tests {
         match route_paste("S2", "any-id", &inv) {
             PasteRoute::Reject(m) => assert!(m.contains("state S2"), "{m}"),
             other => panic!("expected reject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn paste_router_never_receives_an_s1_on_a_closed_invoice() {
+        // The S1 arm used to accept a paste on ANY invoice, so a stale form
+        // POST (the page hides the form once an invoice closes) took real money
+        // for an order that was already paid, confirmed, or expired. It is now
+        // rejected before the wallet is touched, with the same message the I2
+        // arm gives.
+        for status in ["paid", "confirmed", "expired"] {
+            let mut inv = grin1_invoice("slate-abc");
+            inv.status = status.into();
+            match route_paste("S1", "any-id", &inv) {
+                PasteRoute::Reject(m) => {
+                    assert!(m.contains("already been paid"), "{status}: {m}")
+                }
+                other => panic!("{status}: expected reject, got {other:?}"),
+            }
+            // A non-grin1 invoice closes exactly the same way (the guard is on
+            // the status, not the rail).
+            let mut plain = invoice(Some(1_000_000_000), None);
+            plain.status = status.into();
+            assert!(
+                matches!(route_paste("S1", "any-id", &plain), PasteRoute::Reject(_)),
+                "{status}: off-rail S1 on a closed invoice must reject too"
+            );
         }
     }
 

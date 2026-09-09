@@ -3,7 +3,7 @@
  * Plugin Name: GoblinPay for WooCommerce
  * Plugin URI:  https://git.us-ea.st/GRIN/GoblinPay
  * Description: Accept Grin (GRIN / MimbleWimble) payments in WooCommerce through a self-hosted GoblinPay server. The customer pays from their Goblin Wallet by scanning an nprofile QR; payment travels as a gift-wrapped slatepack over Nostr. Works with the classic and the Blocks checkout. HPOS-compatible.
- * Version:     1.0.1
+ * Version:     1.0.2
  * Author:      GoblinPay
  * License:     GPL-2.0-or-later
  * Requires PHP: 8.0
@@ -32,7 +32,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('GOBLINPAY_WC_VERSION', '1.0.1');
+define('GOBLINPAY_WC_VERSION', '1.0.2');
 define('GOBLINPAY_WC_PLUGIN_FILE', __FILE__);
 define('GOBLINPAY_WC_WH_NS', 'goblinpay/v1');    // keep stable: this is the webhook URL registered in GoblinPay
 define('GOBLINPAY_WC_GATEWAY_ID', 'goblinpay');  // keep stable: ties to the saved settings option
@@ -179,9 +179,9 @@ add_action('plugins_loaded', function () {
                 'payment_window' => array(
                     'title'       => __('Payment window (minutes)', 'goblinpay-woocommerce'),
                     'type'        => 'number',
-                    'default'     => '1440',
+                    'default'     => '15',
                     'desc_tip'    => true,
-                    'description' => __('If still unpaid after this many minutes, the order is cancelled. Set 0 to disable.', 'goblinpay-woocommerce'),
+                    'description' => __('If still unpaid after this many minutes, the order is cancelled. Set 0 to disable. A store priced in fiat cannot usefully set this higher: GoblinPay clamps a fiat invoice to its quote lock (GP_QUOTE_TTL, 15 minutes by default), so the invoice expires at the lock however long a window is requested here. An order whose payment has already arrived is never cancelled; it waits for its on-chain confirmations.', 'goblinpay-woocommerce'),
                 ),
                 'debug' => array(
                     'title'   => __('Debug logging', 'goblinpay-woocommerce'),
@@ -422,13 +422,14 @@ function goblinpay_wc_handle_webhook(WP_REST_Request $request) {
     goblinpay_wc_log(array('webhook' => $data));
 
     // Idempotency: dedupe on the event id (also carried in X-GoblinPay-Delivery).
+    // The id is only RECORDED once the event has been handled (see the end of
+    // this function). Recording it here would mean a fatal error part-way
+    // through settlement makes the redelivery look like a duplicate, and the
+    // payment is then never applied to the order.
     $event_id = isset($data['event_id']) ? (string) $data['event_id'] : (string) $request->get_header('x-goblinpay-delivery');
-    if ('' !== $event_id) {
-        $key = 'goblinpay_evt_' . md5($event_id);
-        if (false !== get_transient($key)) {
-            return new WP_REST_Response(array('ok' => true, 'dedupe' => true), 200); // already processed
-        }
-        set_transient($key, 1, WEEK_IN_SECONDS);
+    $dedupe_key = '' !== $event_id ? 'goblinpay_evt_' . md5($event_id) : '';
+    if ('' !== $dedupe_key && false !== get_transient($dedupe_key)) {
+        return new WP_REST_Response(array('ok' => true, 'dedupe' => true), 200); // already processed
     }
 
     $event_type = isset($data['event_type']) ? (string) $data['event_type'] : '';
@@ -487,6 +488,12 @@ function goblinpay_wc_handle_webhook(WP_REST_Request $request) {
             goblinpay_wc_log(array('unhandled_event' => $event_type));
     }
 
+    // Handled: only now is the delivery marked as seen, so a redelivery after a
+    // failure part-way through the switch is processed rather than deduped away.
+    if ('' !== $dedupe_key) {
+        set_transient($dedupe_key, 1, WEEK_IN_SECONDS);
+    }
+
     return new WP_REST_Response(array('ok' => true), 200);
 }
 
@@ -499,19 +506,58 @@ function goblinpay_wc_settle_order($order, $slate_id, $note) {
     $order->add_order_note($note);
 }
 
-/* Poll fallback: if a webhook was missed, ask GoblinPay for the invoice status. */
+/** Cancel an unpaid order once, idempotently. */
+function goblinpay_wc_cancel_order($order, $note) {
+    if ($order->is_paid() || !$order->has_status(array('on-hold', 'pending'))) {
+        return;
+    }
+    $order->update_status('cancelled', $note);
+}
+
+/**
+ * Note the on-chain depth of a received-but-unconfirmed payment, once per
+ * change. GoblinPay reports `confirmations` (the paying kernel's live depth)
+ * and `confirmations_required` (its `GP_CONFIRMATIONS` threshold) on every
+ * invoice read, so the merchant can see a slow payment progressing instead of
+ * an order that just sits on hold.
+ */
+function goblinpay_wc_note_confirmations($order, $body) {
+    if (!isset($body['confirmations'])) {
+        return;
+    }
+    $have = (int) $body['confirmations'];
+    $need = isset($body['confirmations_required']) ? (int) $body['confirmations_required'] : 0;
+    if ($have < 1 || (string) $have === (string) $order->get_meta('_goblinpay_confirmations')) {
+        return;
+    }
+    $order->update_meta_data('_goblinpay_confirmations', (string) $have);
+    $order->add_order_note(sprintf(
+        /* translators: 1: confirmations so far, 2: confirmations required */
+        __('Grin confirmations %1$d/%2$d.', 'goblinpay-woocommerce'),
+        $have,
+        $need
+    ));
+    $order->save();
+}
+
+/**
+ * Poll fallback: if a webhook was missed, ask GoblinPay for the invoice status.
+ * Returns the observed invoice status (`open`, `paid`, `confirmed`, `expired`)
+ * or `''` when it could not be read, so the expiry hook can act on the server's
+ * view of the invoice rather than on the clock alone.
+ */
 add_action(GOBLINPAY_WC_POLL_HOOK, 'goblinpay_wc_poll_invoice');
 function goblinpay_wc_poll_invoice($order_id) {
     $order = wc_get_order($order_id);
     if (!$order || $order->get_payment_method() !== GOBLINPAY_WC_GATEWAY_ID || $order->is_paid()) {
-        return;
+        return '';
     }
     $settings   = get_option('woocommerce_' . GOBLINPAY_WC_GATEWAY_ID . '_settings', array());
     $gp_url     = isset($settings['gp_url']) ? rtrim((string) $settings['gp_url'], '/') : '';
     $token      = isset($settings['api_token']) ? trim((string) $settings['api_token']) : '';
     $invoice_id = (string) $order->get_meta('_goblinpay_invoice_id');
     if ('' === $gp_url || '' === $token || '' === $invoice_id) {
-        return;
+        return '';
     }
 
     $resp = wp_remote_get($gp_url . '/invoice/' . rawurlencode($invoice_id), array(
@@ -523,28 +569,53 @@ function goblinpay_wc_poll_invoice($order_id) {
     ));
     if (is_wp_error($resp)) {
         goblinpay_wc_log(array('poll_error' => $resp->get_error_message()));
-        return;
+        return '';
     }
     $body = json_decode(wp_remote_retrieve_body($resp), true);
+    if (!is_array($body) || !isset($body['status'])) {
+        return '';
+    }
+    $status = (string) $body['status'];
+    goblinpay_wc_note_confirmations($order, $body);
     // Fulfil only on a confirmed (on-chain) invoice: a merely `paid` invoice is
     // received off-chain but not yet broadcast/confirmed, so it must not complete
     // the order (mirrors the webhook: fulfilment is payment.confirmed only).
-    if (is_array($body) && isset($body['status']) && 'confirmed' === $body['status']) {
+    if ('confirmed' === $status) {
         goblinpay_wc_settle_order($order, '', __('Grin payment reconciled via GoblinPay status poll (confirmed on chain).', 'goblinpay-woocommerce'));
+    } elseif ('expired' === $status) {
+        // The server has closed the invoice: no payment can land on it any
+        // more, so release the order now rather than waiting for the clock.
+        goblinpay_wc_cancel_order($order, __('GoblinPay invoice expired without payment.', 'goblinpay-woocommerce'));
     }
+    return $status;
 }
 
 /* WooCommerce-side expiry fallback (polls once more before cancelling). */
 add_action(GOBLINPAY_WC_EXPIRE_HOOK, 'goblinpay_wc_maybe_expire_order');
 function goblinpay_wc_maybe_expire_order($order_id) {
-    goblinpay_wc_poll_invoice($order_id); // last chance to catch a missed webhook
-    $order = wc_get_order($order_id);
+    $status = goblinpay_wc_poll_invoice($order_id); // last chance to catch a missed webhook
+    $order  = wc_get_order($order_id);
     if (!$order || $order->get_payment_method() !== GOBLINPAY_WC_GATEWAY_ID) {
         return;
     }
-    if (!$order->is_paid() && $order->has_status(array('on-hold', 'pending'))) {
-        $order->update_status('cancelled', __('Grin payment window elapsed without payment.', 'goblinpay-woocommerce'));
+    // A `paid` invoice is money already received and merely waiting for its
+    // kernel to reach the confirmation depth. GoblinPay never expires one (it
+    // expires only `open` invoices), so neither may WooCommerce: cancelling
+    // here would throw away a payment that is on its way to confirmed. The poll
+    // above already cancelled a server-side `expired` invoice.
+    if ('paid' === $status) {
+        // Come back a few times, so a lost payment.confirmed webhook is still
+        // caught by the poll. Bounded (about two hours): a payer who never
+        // broadcasts must not reschedule for ever.
+        $rechecks = (int) $order->get_meta('_goblinpay_paid_rechecks');
+        if ($rechecks < 4) {
+            $order->update_meta_data('_goblinpay_paid_rechecks', (string) ($rechecks + 1));
+            $order->save();
+            wp_schedule_single_event(time() + 30 * MINUTE_IN_SECONDS, GOBLINPAY_WC_EXPIRE_HOOK, array($order_id));
+        }
+        return;
     }
+    goblinpay_wc_cancel_order($order, __('Grin payment window elapsed without payment.', 'goblinpay-woocommerce'));
 }
 
 /**

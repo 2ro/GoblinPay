@@ -254,6 +254,17 @@ pub struct Config {
     /// onion service proxies to (`GP_GRIN1_FOREIGN_PORT`, default 3416). Only
     /// used when `grin1_rail` is on.
     pub grin1_foreign_port: u16,
+    /// Extra origins allowed to frame the hosted `/pay/<token>` page
+    /// (`GP_EMBED_ORIGINS`, comma separated, e.g. `https://myshop.com`).
+    /// Empty (the default) means the page may be framed only by its own origin:
+    /// `Content-Security-Policy: frame-ancestors 'self'`.
+    pub embed_origins: Vec<String>,
+    /// Per-client-IP cap, per minute, on the manual slatepack paste
+    /// (`GP_RATE_LIMIT_PASTE`, default 30; 0 = off).
+    pub rate_limit_paste: u32,
+    /// Per-client-IP cap, per minute, on invoice creation
+    /// (`GP_RATE_LIMIT_INVOICE`, default 60; 0 = off).
+    pub rate_limit_invoice: u32,
     /// Names of the money/at-rest-encryption secrets that were supplied INLINE
     /// (the bare `GP_MNEMONIC` / `GP_WALLET_PASSWORD` / `GP_NSEC` env vars)
     /// rather than via their `_FILE` variant or a systemd credential. An inline
@@ -283,6 +294,12 @@ pub const DEFAULT_CONFIRMATIONS: i64 = 10;
 /// Default loopback port for the Grin Foreign API v2 the onion service proxies
 /// to. 3416 sits just past the stock wallet listener (3415) / owner (3420).
 pub const DEFAULT_GRIN1_FOREIGN_PORT: u16 = 3416;
+/// Default per-IP, per-minute cap on the manual slatepack paste. A human pays
+/// once; anything near this rate from one address is a script.
+pub const DEFAULT_RATE_LIMIT_PASTE: u32 = 30;
+/// Default per-IP, per-minute cap on invoice creation. Generous enough for a
+/// busy store's checkout traffic through one proxy-reported client address.
+pub const DEFAULT_RATE_LIMIT_INVOICE: u32 = 60;
 
 /// Sentinel `qr_logo` value selecting the inlined Goblin mark
 /// (`GP_QR_LOGO=builtin`, opt-in; the default is a plain QR). Kept out of the
@@ -328,6 +345,9 @@ impl Default for Config {
             confirmations_required: DEFAULT_CONFIRMATIONS,
             grin1_rail: false,
             grin1_foreign_port: DEFAULT_GRIN1_FOREIGN_PORT,
+            embed_origins: Vec::new(),
+            rate_limit_paste: DEFAULT_RATE_LIMIT_PASTE,
+            rate_limit_invoice: DEFAULT_RATE_LIMIT_INVOICE,
             inline_secret_vars: Vec::new(),
         }
     }
@@ -484,6 +504,10 @@ impl Config {
                 .parse::<u16>()
                 .map_err(|_| format!("GP_GRIN1_FOREIGN_PORT must be a port 1-65535 (got `{v}`)"))?,
         };
+        let embed_origins = parse_embed_origins(get("GP_EMBED_ORIGINS"))?;
+        let rate_limit_paste = parse_u32(get, "GP_RATE_LIMIT_PASTE", DEFAULT_RATE_LIMIT_PASTE)?;
+        let rate_limit_invoice =
+            parse_u32(get, "GP_RATE_LIMIT_INVOICE", DEFAULT_RATE_LIMIT_INVOICE)?;
 
         let cfg = Config {
             bind,
@@ -522,6 +546,9 @@ impl Config {
             confirmations_required,
             grin1_rail,
             grin1_foreign_port,
+            embed_origins,
+            rate_limit_paste,
+            rate_limit_invoice,
             inline_secret_vars,
         };
         cfg.validate()?;
@@ -642,7 +669,8 @@ impl Config {
              webhook_secret={} qr_logo={} merchant_npub={} notify_merchant_dm={} \
              notify_payer_receipt={} endpub_rotate_interval={} endpub_overlap_epochs={} \
              rate_source={} rate_currencies={:?} rate_cache_ttl={} quote_ttl={} \
-             rate_stale_max={} confirmations_required={} grin1_rail={} grin1_foreign_port={}",
+             rate_stale_max={} confirmations_required={} grin1_rail={} grin1_foreign_port={} \
+             embed_origins={:?} rate_limit_paste={} rate_limit_invoice={}",
             self.bind,
             match &self.tls {
                 Tls::Off => "off".to_string(),
@@ -685,6 +713,9 @@ impl Config {
             self.confirmations_required,
             if self.grin1_rail { "on" } else { "off" },
             self.grin1_foreign_port,
+            self.embed_origins,
+            self.rate_limit_paste,
+            self.rate_limit_invoice,
         )
     }
 }
@@ -729,6 +760,52 @@ fn parse_bool(
         Some("on") => Ok(true),
         Some("off") => Ok(false),
         Some(other) => Err(format!("{key} must be `on` or `off` (got `{other}`)")),
+    }
+}
+
+/// Parse `GP_EMBED_ORIGINS`: a comma-separated list of origins allowed to frame
+/// the hosted pay page, appended verbatim to a `frame-ancestors` source list.
+/// Because the values land in a response header, they are validated up front
+/// (fail fast, like every other key) rather than sanitized at send time: each
+/// must be an `http(s)://` origin with no whitespace and none of the characters
+/// that could end the directive or the header (`;`, `,`, quotes).
+fn parse_embed_origins(raw: Option<String>) -> Result<Vec<String>, String> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for token in raw.split(',') {
+        let origin = token.trim().trim_end_matches('/');
+        if origin.is_empty() {
+            continue;
+        }
+        if !origin.starts_with("http://") && !origin.starts_with("https://") {
+            return Err(format!(
+                "GP_EMBED_ORIGINS entries must start with http:// or https:// (got `{origin}`)"
+            ));
+        }
+        if origin
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, ';' | '\'' | '"'))
+        {
+            return Err(format!(
+                "GP_EMBED_ORIGINS entry `{origin}` contains a character that is not \
+                 allowed in a Content-Security-Policy source"
+            ));
+        }
+        out.push(origin.to_string());
+    }
+    Ok(out)
+}
+
+/// Parse a non-negative integer with a default.
+fn parse_u32(get: &dyn Fn(&str) -> Option<String>, key: &str, default: u32) -> Result<u32, String> {
+    match get(key) {
+        None => Ok(default),
+        Some(v) => v
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| format!("{key} must be a non-negative integer (got `{v}`)")),
     }
 }
 
@@ -1029,6 +1106,44 @@ mod tests {
         assert!(load(&[("GP_GRIN1_RAIL", "yes")]).is_err());
         assert!(load(&[("GP_GRIN1_FOREIGN_PORT", "notaport")]).is_err());
         assert!(load(&[("GP_GRIN1_FOREIGN_PORT", "70000")]).is_err());
+    }
+
+    #[test]
+    fn embed_origins_default_empty_and_are_validated() {
+        // Unset = no extra framers: the pay page allows only `frame-ancestors 'self'`.
+        let cfg = load(&[]).unwrap();
+        assert!(cfg.embed_origins.is_empty());
+
+        let cfg = load(&[(
+            "GP_EMBED_ORIGINS",
+            " https://myshop.com/ , http://localhost:3000 ,",
+        )])
+        .unwrap();
+        assert_eq!(
+            cfg.embed_origins,
+            vec!["https://myshop.com", "http://localhost:3000"]
+        );
+
+        // A value that is not an http(s) origin, or that could break out of the
+        // header/directive, is rejected at boot rather than sanitized later.
+        assert!(load(&[("GP_EMBED_ORIGINS", "myshop.com")]).is_err());
+        assert!(load(&[("GP_EMBED_ORIGINS", "https://a.com; script-src *")]).is_err());
+        assert!(load(&[("GP_EMBED_ORIGINS", "https://a.com 'unsafe-inline'")]).is_err());
+        assert!(load(&[("GP_EMBED_ORIGINS", "https://a.com\nX-Evil: 1")]).is_err());
+    }
+
+    #[test]
+    fn rate_limits_have_defaults_and_zero_disables() {
+        let cfg = load(&[]).unwrap();
+        assert_eq!(cfg.rate_limit_paste, DEFAULT_RATE_LIMIT_PASTE);
+        assert_eq!(cfg.rate_limit_invoice, DEFAULT_RATE_LIMIT_INVOICE);
+
+        let cfg = load(&[("GP_RATE_LIMIT_PASTE", "0"), ("GP_RATE_LIMIT_INVOICE", "5")]).unwrap();
+        assert_eq!(cfg.rate_limit_paste, 0, "0 disables the limiter");
+        assert_eq!(cfg.rate_limit_invoice, 5);
+
+        assert!(load(&[("GP_RATE_LIMIT_PASTE", "-1")]).is_err());
+        assert!(load(&[("GP_RATE_LIMIT_INVOICE", "lots")]).is_err());
     }
 
     #[test]

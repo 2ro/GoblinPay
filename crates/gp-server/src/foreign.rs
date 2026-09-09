@@ -133,6 +133,21 @@ fn err(id: Value, code: i64, message: impl Into<String>) -> HttpResponse {
     }))
 }
 
+/// A JSON-RPC internal error that keeps the wallet's own words out of the
+/// reply. Anyone who can reach the onion can call this endpoint, and a raw
+/// wallet or task error describes the till's internals (file paths, database
+/// state, node URLs). The caller gets a stable, generic string; the operator
+/// gets the detail in the log, where it is actually useful.
+fn internal_error(
+    id: Value,
+    context: &str,
+    detail: impl std::fmt::Display,
+    message: &'static str,
+) -> HttpResponse {
+    error!("foreign {context}: {detail}");
+    err(id, -32603, message)
+}
+
 /// The single POST handler dispatching the Foreign API methods.
 async fn handle(
     body: web::Json<RpcRequest>,
@@ -217,8 +232,8 @@ async fn receive_tx(
     let received = actix_web::rt::task::spawn_blocking(move || w.receive_slate(in_slate)).await;
     let (out_slate, received) = match received {
         Ok(Ok(pair)) => pair,
-        Ok(Err(e)) => return err(id, -32603, format!("receive failed: {e}")),
-        Err(e) => return err(id, -32603, format!("receive task panicked: {e}")),
+        Ok(Err(e)) => return internal_error(id, "receive_tx", e, "receive failed"),
+        Err(e) => return internal_error(id, "receive_tx task", e, "receive failed"),
     };
 
     // Record + match by AMOUNT (the plain-send / sender-initiated mapping), then
@@ -302,9 +317,9 @@ async fn finalize_tx(
                 error!("foreign finalize: cancelled slate: {message}");
                 return err(id, -32602, CANCELLED_SLATE_MESSAGE);
             }
-            return err(id, -32603, format!("finalize failed: {message}"));
+            return internal_error(id, "finalize_tx", e, "finalize failed");
         }
-        Err(e) => return err(id, -32603, format!("finalize task panicked: {e}")),
+        Err(e) => return internal_error(id, "finalize_tx task", e, "finalize failed"),
     };
 
     let webhook = webhook_pair(cfg);
@@ -570,6 +585,21 @@ mod tests {
         assert!(!is_cancelled_slate(
             "slatepack error: cannot read slatepack"
         ));
+    }
+
+    #[actix_web::test]
+    async fn an_internal_error_reply_carries_no_wallet_detail() {
+        let detail = "wallet store error: /var/lib/goblinpay/gp-data/wallet.db is locked";
+        let resp = internal_error(json!(3), "finalize_tx", detail, "finalize failed");
+        let body = actix_web::body::to_bytes(resp.into_body()).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["id"], 3);
+        assert_eq!(body["error"]["code"], -32603);
+        assert_eq!(body["error"]["message"], "finalize failed");
+        assert!(
+            !body.to_string().contains("/var/lib/goblinpay"),
+            "the reply must not describe the till's internals"
+        );
     }
 
     #[tokio::test]

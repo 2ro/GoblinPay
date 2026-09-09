@@ -14,6 +14,7 @@ use gp_server::ingest::WalletReceiver;
 use gp_server::payments::{self, ReceiptSigner};
 use gp_server::{admin, checkout, foreign, invoices, ratelimit, security, tor, webhookd};
 use gp_wallet::GpWallet;
+use log::error;
 
 /// Landing page ("GoblinPay").
 #[derive(Template)]
@@ -33,8 +34,15 @@ async fn index(cfg: web::Data<Config>) -> impl Responder {
         Ok(html) => HttpResponse::Ok()
             .content_type("text/html; charset=utf-8")
             .body(html),
-        Err(err) => HttpResponse::InternalServerError().body(format!("template error: {err}")),
+        Err(err) => template_error(err),
     }
+}
+
+/// A 500 for a failed render. Askama's error names the template and can quote
+/// its source, so it goes to the log, not to whoever asked for the page.
+fn template_error(detail: impl std::fmt::Display) -> HttpResponse {
+    error!("template render failed: {detail}");
+    HttpResponse::InternalServerError().body("template error")
 }
 
 async fn health() -> impl Responder {
@@ -594,6 +602,17 @@ mod tests {
             html.contains("/pay/static/style.css"),
             "asset link is prefixed"
         );
+    }
+
+    #[actix_web::test]
+    async fn a_render_failure_reply_carries_no_template_detail() {
+        let resp = template_error("templates/index.html:12: unknown field `secret_base`");
+        assert_eq!(
+            resp.status(),
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = actix_web::body::to_bytes(resp.into_body()).await.unwrap();
+        assert_eq!(body, "template error");
     }
 
     #[actix_web::test]

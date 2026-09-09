@@ -585,15 +585,26 @@ async fn manual_slatepack(
                     )
                     .await
                     {
-                        crate::record::PersistOutcome::Matched(_) => (
-                            true,
-                            "Payment received, but it is not complete yet. Copy the \
+                        crate::record::PersistOutcome::Matched(matched) => {
+                            // Settled by a plain-send paste: the I1 this invoice
+                            // issued is now stale, so cancel its wallet context.
+                            crate::record::cancel_stale_grin1(
+                                pool.get_ref(),
+                                &matched,
+                                &received.slate_id,
+                                wallet,
+                            )
+                            .await;
+                            (
+                                true,
+                                "Payment received, but it is not complete yet. Copy the \
                              response slatepack below back into your wallet to finalize \
                              and broadcast it. The payment only settles once your wallet \
                              posts it to the chain."
-                                .into(),
-                            received.s2_armor,
-                        ),
+                                    .into(),
+                                received.s2_armor,
+                            )
+                        }
                         // Amount-binding guard: the slatepack pays the wrong amount.
                         // Nothing was recorded and the invoice stays open; tell the
                         // payer the exact figure to send. No S2 is returned, so this
@@ -627,6 +638,28 @@ async fn manual_slatepack(
             // replayed finalize fails cleanly in the wallet (context already
             // deleted), so racing the Tor return cannot double-settle or
             // double-post.
+            //
+            // The route decision was taken against the invoice as loaded at the
+            // top of this handler; re-read the status immediately before the
+            // wallet call, because a payment arriving in between settles the
+            // invoice AND cancels this slate's wallet context.
+            let still_open = match invoice::get(pool.get_ref(), &inv.id).await {
+                Ok(Some(fresh)) => fresh.status() == InvoiceStatus::Open,
+                Ok(None) => false,
+                Err(e) => {
+                    error!("manual finalize: invoice re-read failed: {e}");
+                    false
+                }
+            };
+            if !still_open {
+                return render(PayResultPage {
+                    base,
+                    token,
+                    ok: false,
+                    message: CLOSED_INVOICE_REJECT.into(),
+                    s2_armor: String::new(),
+                });
+            }
             let w = wallet.clone();
             let a = armor.clone();
             let finalized =
@@ -645,11 +678,26 @@ async fn manual_slatepack(
                         String::new(),
                     )
                 }
-                Ok(Err(e)) => (
-                    false,
-                    format!("That invoice response could not be finalized: {e}"),
-                    String::new(),
-                ),
+                Ok(Err(e)) => {
+                    // A cancelled invoice slate (expired, or the invoice was
+                    // paid another way between the re-read and this call) is a
+                    // clean reject, not a raw wallet error in the payer's face.
+                    let message = e.to_string();
+                    if crate::foreign::is_cancelled_slate(&message) {
+                        error!("manual finalize: cancelled slate: {message}");
+                        (
+                            false,
+                            crate::foreign::CANCELLED_SLATE_MESSAGE.into(),
+                            String::new(),
+                        )
+                    } else {
+                        (
+                            false,
+                            format!("That invoice response could not be finalized: {message}"),
+                            String::new(),
+                        )
+                    }
+                }
                 Err(e) => {
                     error!("manual finalize task panicked: {e}");
                     (

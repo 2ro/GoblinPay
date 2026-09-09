@@ -62,6 +62,11 @@ pub struct MatchResult {
     /// expected amount does not equal the received amount. The payment is then
     /// rejected: `invoice_id`/`user_id` are cleared and nothing is marked paid.
     pub amount_mismatch: Option<AmountMismatch>,
+    /// Whether THIS payment is the one that flipped the matched invoice
+    /// `open` -> `paid`. False for a replay of an already-settled invoice (the
+    /// `invoice_id` still resolves, but nothing transitioned). Callers hang
+    /// once-per-settlement side effects off this, never off `invoice_id` alone.
+    pub newly_paid: bool,
 }
 
 /// Resolve `incoming` against the open invoices and endpubs, mark a matched
@@ -117,13 +122,15 @@ pub async fn match_payment(
                         expected,
                         received: incoming.amount,
                     }),
+                    newly_paid: false,
                 });
             }
         }
     }
 
+    let mut newly_paid = false;
     if let Some(id) = &invoice_id {
-        invoice::mark_paid(pool, id, incoming.slate_id).await?;
+        newly_paid = invoice::mark_paid(pool, id, incoming.slate_id).await?;
     }
 
     // Link the payment row to whatever it resolved to (both optional).
@@ -138,6 +145,7 @@ pub async fn match_payment(
         invoice_id,
         user_id,
         amount_mismatch: None,
+        newly_paid,
     })
 }
 
@@ -320,6 +328,25 @@ mod tests {
         .unwrap();
         assert_eq!(result.invoice_id.as_deref(), Some(inv.id.as_str()));
         assert!(result.amount_mismatch.is_none());
+        assert!(result.newly_paid, "this payment flipped the invoice");
+
+        // A replay still resolves the same invoice, but transitioned nothing:
+        // once-per-settlement side effects (the stale-I1 cancel) hang off
+        // `newly_paid`, never off `invoice_id`.
+        let replay = match_payment(
+            &pool,
+            MatchMode::Memo,
+            &IncomingPayment {
+                slate_id: "slate-b",
+                amount: 100,
+                recipient_hex: &recipient,
+                memo: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay.invoice_id, None, "the invoice is no longer open");
+        assert!(!replay.newly_paid);
     }
 
     #[tokio::test]

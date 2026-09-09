@@ -104,7 +104,17 @@ impl SlatepackReceiver for WalletReceiver {
         )
         .await
         {
-            PersistOutcome::Matched(_) => {}
+            PersistOutcome::Matched(matched) => {
+                // This payment settled a grin1 invoice by a route other than
+                // its issued I1: cancel that stale invoice slate.
+                crate::record::cancel_stale_grin1(
+                    &self.pool,
+                    &matched,
+                    &received.slate_id,
+                    &self.wallet,
+                )
+                .await;
+            }
             PersistOutcome::Rejected(mismatch) => {
                 warn!(
                     "ingest rejected {}: pays {} nanogrin, invoice expects {} nanogrin",

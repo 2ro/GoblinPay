@@ -210,6 +210,8 @@ Everything is environment variables, defaults are safe for local use.
 | `GP_QUOTE_TTL` | `900` | Seconds a created fiat invoice locks its Grin quote (its expiry window) |
 | `GP_RATE_STALE_MAX` | `0` | Bounded stale-rate fallback in seconds if a live fetch fails (0 = off) |
 | `GP_EMBED_ORIGINS` | unset | Extra origins allowed to frame the hosted `/pay/<token>` page (comma separated, e.g. `https://myshop.com`). Unset means `Content-Security-Policy: frame-ancestors 'self'`; every other page is `X-Frame-Options: DENY` |
+| `GP_RATE_LIMIT_PASTE` | `30` | Per-client-IP requests a minute allowed on the manual slatepack paste (`POST /pay/<token>/slatepack`); 0 disables |
+| `GP_RATE_LIMIT_INVOICE` | `60` | Per-client-IP requests a minute allowed on invoice creation (`POST /invoice`); 0 disables |
 
 ### Checkout methods
 

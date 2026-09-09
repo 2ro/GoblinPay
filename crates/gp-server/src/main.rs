@@ -12,7 +12,7 @@ use gp_nostr::{KeyDirectory, Keys};
 use gp_server::directory::{self, DbKeyDirectory};
 use gp_server::ingest::WalletReceiver;
 use gp_server::payments::{self, ReceiptSigner};
-use gp_server::{admin, checkout, foreign, invoices, security, tor, webhookd};
+use gp_server::{admin, checkout, foreign, invoices, ratelimit, security, tor, webhookd};
 use gp_wallet::GpWallet;
 
 /// Landing page ("GoblinPay").
@@ -492,16 +492,22 @@ async fn main() -> io::Result<()> {
     // The conversion-rate oracle (M7): shared across workers, prices fiat
     // invoices at create time over DIRECT HTTP (never Nym).
     let oracle_data = web::Data::new(gp_core::rates::Oracle::from_config(&cfg));
+    // One limiter shared by every worker: the factory below runs once per
+    // worker, so building it inside would multiply the allowance by the worker
+    // count.
+    let limiter_data = web::Data::new(ratelimit::RateLimiter::from_config(&cfg));
     let server = HttpServer::new(move || {
         let (json_limit, form_limit, payload_limit) = security::payload_limits();
         App::new()
             // Registered inner-to-outer: the constant headers wrap everything,
             // so even a 429 from the limiter carries them.
+            .wrap(actix_web::middleware::from_fn(ratelimit::enforce))
             .wrap(actix_web::middleware::from_fn(security::frame_policy))
             .wrap(security::default_headers())
             .app_data(json_limit)
             .app_data(form_limit)
             .app_data(payload_limit)
+            .app_data(limiter_data.clone())
             .app_data(web::Data::new(pool.clone()))
             .app_data(web::Data::new(receipt_signer.clone()))
             .app_data(cfg_data.clone())
@@ -676,6 +682,47 @@ mod tests {
             "a 100 KB form is over the {} byte limit",
             security::PAYLOAD_LIMIT
         );
+    }
+
+    #[actix_web::test]
+    async fn a_paste_burst_is_throttled_but_loopback_never_is() {
+        let pool = test_pool().await;
+        let app = test::init_service(
+            App::new()
+                .wrap(actix_web::middleware::from_fn(ratelimit::enforce))
+                .app_data(web::Data::new(ratelimit::RateLimiter::new(2, 2)))
+                .app_data(web::Data::new(pool))
+                .app_data(web::Data::new(Config::default()))
+                .app_data(web::Data::new(None::<GpWallet>))
+                .configure(routes),
+        )
+        .await;
+        let paste = |client_ip: Option<&'static str>| {
+            let mut req = test::TestRequest::post()
+                .uri("/pay/any-token/slatepack")
+                .peer_addr("127.0.0.1:5000".parse().unwrap())
+                .insert_header(("content-type", "application/x-www-form-urlencoded"))
+                .set_payload("slatepack=BEGINSLATEPACK.+x+ENDSLATEPACK.");
+            if let Some(ip) = client_ip {
+                req = req.insert_header(("x-forwarded-for", ip));
+            }
+            req.to_request()
+        };
+        let too_many = actix_web::http::StatusCode::TOO_MANY_REQUESTS;
+
+        // A proxied client burns its allowance and is then refused.
+        for i in 0..2 {
+            let resp = test::call_service(&app, paste(Some("203.0.113.9"))).await;
+            assert_ne!(resp.status(), too_many, "call {i} is within the allowance");
+        }
+        let resp = test::call_service(&app, paste(Some("203.0.113.9"))).await;
+        assert_eq!(resp.status(), too_many);
+
+        // Loopback with no forwarding header is exempt however hard it tries.
+        for i in 0..10 {
+            let resp = test::call_service(&app, paste(None)).await;
+            assert_ne!(resp.status(), too_many, "loopback call {i}");
+        }
     }
 
     #[actix_web::test]

@@ -10,6 +10,7 @@ pub mod foreign;
 pub mod ingest;
 pub mod invoices;
 pub mod payments;
+pub mod ratelimit;
 pub mod record;
 pub mod security;
 pub mod setup;

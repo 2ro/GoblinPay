@@ -32,6 +32,27 @@ const RATE_PER_SENDER_PER_HOUR: usize = 10;
 const GLOBAL_UNWRAP_PER_MIN: usize = 120;
 /// Cap on remembered rate-limiter senders before pruning.
 const RATE_MAP_CAP: usize = 10_000;
+/// Cap on wraps held for in-process retry after a transient receive failure.
+const RETRY_CAP: usize = 256;
+/// Give up on a wrap after this many in-process retries.
+const RETRY_MAX_ATTEMPTS: u32 = 5;
+/// First retry delay (seconds); doubles with each further attempt.
+const RETRY_BASE_SECS: i64 = 30;
+
+/// Delay before the Nth in-process retry: 30s, 60s, 120s, 240s, 480s.
+fn retry_backoff_secs(attempts: u32) -> i64 {
+    RETRY_BASE_SECS << attempts.saturating_sub(1).min(10)
+}
+
+/// A wrap awaiting an in-process retry.
+#[derive(Debug)]
+struct RetryEntry {
+    event: Event,
+    /// Failures so far (1 after the first).
+    attempts: u32,
+    /// Unix seconds the retry becomes due.
+    next_at: i64,
+}
 
 /// What the pipeline should do with a validated incoming message.
 /// Pure policy — unit tested, no side effects.
@@ -117,6 +138,12 @@ pub struct Ingest<R> {
     /// Per-sender sliding-window rate state (unix seconds of accepted events;
     /// the `"\0global"` key carries the global unwrap ceiling).
     rate: Mutex<HashMap<String, Vec<i64>>>,
+    /// Wraps whose receive failed transiently, awaiting an in-process retry,
+    /// keyed by wrap id. The relay pool does NOT resend an event it has already
+    /// seen (nostr-relay-pool 0.44.3 `relay/inner.rs:1211`: a wrap whose id is
+    /// already in the SDK's memory database is saved-and-silent, no
+    /// `RelayPoolNotification::Event`), so nothing else would ever re-offer it.
+    retry: Mutex<HashMap<String, RetryEntry>>,
 }
 
 impl<R: SlatepackReceiver> Ingest<R> {
@@ -136,6 +163,7 @@ impl<R: SlatepackReceiver> Ingest<R> {
             directory,
             seen: Mutex::new(HashSet::new()),
             rate: Mutex::new(HashMap::new()),
+            retry: Mutex::new(HashMap::new()),
         }
     }
 
@@ -294,9 +322,91 @@ impl<R: SlatepackReceiver> Ingest<R> {
                 warn!("ingest: rejected slatepack from {}…: {m}", &sender_hex[..8]);
                 IngestOutcome::Dropped("invalid slatepack")
             }
-            // Transient: leave UNMARKED so the next catch-up retries.
-            Err(ReceiveError::Failed(m)) => IngestOutcome::Failed(m),
+            // Transient: leave UNMARKED and queue an in-process retry. A
+            // catch-up fetch only happens at boot and for newly derived keys,
+            // and the relay pool never re-offers a wrap it has already
+            // delivered, so without this queue a wallet hiccup on a live
+            // payment loses it until the service is restarted.
+            Err(ReceiveError::Failed(m)) => {
+                self.remember_for_retry(event);
+                IngestOutcome::Failed(m)
+            }
         }
+    }
+
+    /// Queue (or re-queue) a wrap for an in-process retry, with a doubling
+    /// backoff and a hard ceiling. Full queue or ceiling reached: it is dropped
+    /// and named, and only a service restart (whose catch-up fetch re-reads the
+    /// look-back window) will see it again.
+    fn remember_for_retry(&self, event: &Event) {
+        let id = event.id.to_hex();
+        let short = &id[..8.min(id.len())];
+        let mut retry = self.retry.lock().expect("retry lock");
+        let attempts = retry.get(&id).map_or(0, |e| e.attempts) + 1;
+        if attempts > RETRY_MAX_ATTEMPTS {
+            retry.remove(&id);
+            warn!(
+                "ingest: giving up on wrap {short}… after {RETRY_MAX_ATTEMPTS} in-process \
+                 retries; a service restart re-fetches it"
+            );
+            return;
+        }
+        if !retry.contains_key(&id) && retry.len() >= RETRY_CAP {
+            warn!(
+                "ingest: retry queue full ({RETRY_CAP}), dropping wrap {short}…; \
+                 a service restart re-fetches it"
+            );
+            return;
+        }
+        let next_at = unix_time() + retry_backoff_secs(attempts);
+        retry.insert(
+            id,
+            RetryEntry {
+                event: event.clone(),
+                attempts,
+                next_at,
+            },
+        );
+    }
+
+    /// Wraps whose retry backoff has elapsed, for the service loop to re-run
+    /// through [`Ingest::handle_wrap`]. An entry the pipeline has since settled
+    /// (the wrap is marked processed) is discarded rather than re-run.
+    ///
+    /// Entries stay queued across a take: a repeat failure only bumps their
+    /// attempt count, and success marks the wrap so the next call clears it.
+    pub fn due_retries(&self, now: i64) -> Vec<Event> {
+        let candidates: Vec<(String, Event)> = {
+            let retry = self.retry.lock().expect("retry lock");
+            retry
+                .iter()
+                .filter(|(_, entry)| entry.next_at <= now)
+                .map(|(id, entry)| (id.clone(), entry.event.clone()))
+                .collect()
+        };
+        // The `seen` check is deliberately made outside the retry lock: the two
+        // mutexes are never held at the same time anywhere.
+        let mut due = Vec::new();
+        let mut settled = Vec::new();
+        for (id, event) in candidates {
+            if self.is_seen(&id) {
+                settled.push(id);
+            } else {
+                due.push(event);
+            }
+        }
+        if !settled.is_empty() {
+            let mut retry = self.retry.lock().expect("retry lock");
+            for id in settled {
+                retry.remove(&id);
+            }
+        }
+        due
+    }
+
+    /// How many wraps are queued for retry (observability + tests).
+    pub fn retry_queued(&self) -> usize {
+        self.retry.lock().expect("retry lock").len()
     }
 
     fn is_seen(&self, key: &str) -> bool {
@@ -634,6 +744,111 @@ mod tests {
             IngestOutcome::RateLimited
         ));
         assert_eq!(ingest.receiver().calls(), RATE_PER_SENDER_PER_HOUR);
+    }
+
+    #[test]
+    fn retry_backoff_doubles_from_thirty_seconds() {
+        assert_eq!(retry_backoff_secs(1), 30);
+        assert_eq!(retry_backoff_secs(2), 60);
+        assert_eq!(retry_backoff_secs(3), 120);
+        assert_eq!(retry_backoff_secs(4), 240);
+        assert_eq!(retry_backoff_secs(RETRY_MAX_ATTEMPTS), 480);
+    }
+
+    /// A transient receive failure queues the wrap for an in-process retry,
+    /// backs off, retries, and stops queuing once it succeeds. Without this the
+    /// payment was lost until a restart: the relay pool never re-offers a wrap
+    /// it has already delivered.
+    #[tokio::test]
+    async fn transient_failures_are_queued_and_retried_in_process() {
+        let payer = Keys::generate();
+        let server = Keys::generate();
+        let ingest = Ingest::new(
+            server.clone(),
+            StubReceiver::new(vec![
+                Err(ReceiveError::Failed("wallet busy".into())),
+                Err(ReceiveError::Failed("wallet busy".into())),
+                Ok(ReceivedPayment {
+                    slate_id: "slate-r".into(),
+                    amount: 9,
+                    s2_armor: "BEGINSLATEPACK. r. ENDSLATEPACK.".into(),
+                }),
+            ]),
+        );
+        let wrap = payment_wrap(&payer, &server, crate::wrap::WrapVersion::V2);
+        let now = unix_time();
+
+        // First failure: queued, not yet due.
+        assert!(matches!(
+            ingest.handle_wrap(&wrap).await,
+            IngestOutcome::Failed(_)
+        ));
+        assert_eq!(ingest.retry_queued(), 1);
+        assert!(ingest.due_retries(now).is_empty(), "30s backoff applies");
+
+        // Once the backoff elapses the wrap comes back for another run.
+        let due = ingest.due_retries(now + 30);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, wrap.id);
+
+        // It fails again: still queued, now on the longer backoff.
+        assert!(matches!(
+            ingest.handle_wrap(&due[0]).await,
+            IngestOutcome::Failed(_)
+        ));
+        assert_eq!(ingest.retry_queued(), 1, "one entry, not two");
+        assert!(ingest.due_retries(now + 30).is_empty(), "backed off to 60s");
+
+        // Third run succeeds, and the settled entry is cleared on the next take.
+        let due = ingest.due_retries(now + 60);
+        assert_eq!(due.len(), 1);
+        assert!(matches!(
+            ingest.handle_wrap(&due[0]).await,
+            IngestOutcome::Received { .. }
+        ));
+        assert!(ingest.due_retries(now + 10_000).is_empty());
+        assert_eq!(ingest.retry_queued(), 0, "a settled wrap stops retrying");
+        assert_eq!(ingest.receiver().calls(), 3);
+    }
+
+    /// The queue gives up rather than retrying forever, and is bounded.
+    #[tokio::test]
+    async fn the_retry_queue_gives_up_and_is_bounded() {
+        let payer = Keys::generate();
+        let server = Keys::generate();
+        let outcomes = (0..RETRY_MAX_ATTEMPTS + 1)
+            .map(|_| Err(ReceiveError::Failed("wallet down".into())))
+            .collect();
+        let ingest = Ingest::new(server.clone(), StubReceiver::new(outcomes));
+        let wrap = payment_wrap(&payer, &server, crate::wrap::WrapVersion::V2);
+
+        // Fail it RETRY_MAX_ATTEMPTS times: it stays queued throughout.
+        for _ in 0..RETRY_MAX_ATTEMPTS {
+            assert!(matches!(
+                ingest.handle_wrap(&wrap).await,
+                IngestOutcome::Failed(_)
+            ));
+            assert_eq!(ingest.retry_queued(), 1);
+        }
+        // One more and it is abandoned rather than retried forever.
+        assert!(matches!(
+            ingest.handle_wrap(&wrap).await,
+            IngestOutcome::Failed(_)
+        ));
+        assert_eq!(ingest.retry_queued(), 0, "gave up after the ceiling");
+
+        // The queue never grows past its cap.
+        let ingest = Ingest::new(server.clone(), StubReceiver::new(vec![]));
+        for i in 0..RETRY_CAP + 10 {
+            let event = payment_wrap_noted(
+                &payer,
+                &server,
+                crate::wrap::WrapVersion::V2,
+                &format!("wrap {i}"),
+            );
+            ingest.remember_for_retry(&event);
+        }
+        assert_eq!(ingest.retry_queued(), RETRY_CAP);
     }
 
     /// The conversation key the Goblin wallet derives for a v3 layer, copied

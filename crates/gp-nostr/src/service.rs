@@ -285,6 +285,15 @@ pub async fn run<R: SlatepackReceiver>(
                 // the steady state (an unchanged watch set), which is exactly
                 // when a monitor most wants a fresh reading.
                 snapshot_relay_health(&client, &opts.relays, &opts.health).await;
+                // Then re-run wraps whose receive failed transiently. The relay
+                // pool will not re-offer them, so this is the only path back.
+                for event in ingest.due_retries(unix_time()) {
+                    info!(
+                        "nostr: retrying wrap {}… after a transient receive failure",
+                        &event.id.to_hex()[..8]
+                    );
+                    handle(&client, &ingest, &keys, &opts.notify, &event, &opts.relays).await;
+                }
                 refresh_subscription(
                     &client,
                     &ingest,
@@ -668,6 +677,44 @@ mod tests {
         assert_eq!(
             payer_receipt_text(1_000_000_000),
             "[GoblinPay] Payment of 1 GRIN received. Thank you."
+        );
+    }
+
+    /// The premise the in-process retry queue rests on: the SDK's relay pool
+    /// does NOT re-deliver an event it has already stored, so a wrap whose
+    /// receive failed transiently is never offered again.
+    ///
+    /// `relay/inner.rs:1211` matches on `database().check_id(&event.id)` and
+    /// the `DatabaseEventStatus::Saved` arm is empty: it falls straight through
+    /// WITHOUT calling `send_notification`, so no `RelayPoolNotification::Event`
+    /// is emitted on re-receipt. This test pins the other half, that the default
+    /// client database really does report `Saved` for an event it has seen (its
+    /// default `MemoryDatabase` is an id tracker, `nostr-database-0.44.0`
+    /// `memory.rs:110`, and stores no event bodies).
+    #[tokio::test]
+    async fn the_relay_pool_does_not_re_deliver_an_event_it_has_stored() {
+        let client = Client::builder().build();
+        let db = client.database();
+        let event = EventBuilder::new(Kind::TextNote, "once")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+
+        assert_eq!(
+            db.check_id(&event.id).await.unwrap(),
+            nostr_sdk::prelude::DatabaseEventStatus::NotExistent,
+            "unseen events are new, so the first delivery notifies"
+        );
+        db.save_event(&event).await.unwrap();
+        assert_eq!(
+            db.check_id(&event.id).await.unwrap(),
+            nostr_sdk::prelude::DatabaseEventStatus::Saved,
+            "a stored event reports Saved, the branch that skips the notification"
+        );
+        // Saving again is not an error and does not change the verdict.
+        db.save_event(&event).await.unwrap();
+        assert_eq!(
+            db.check_id(&event.id).await.unwrap(),
+            nostr_sdk::prelude::DatabaseEventStatus::Saved
         );
     }
 

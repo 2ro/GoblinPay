@@ -10,13 +10,14 @@
 //! configuration plus defaults.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use log::{error, info, warn};
 use nostr_sdk::{
-    Client, Event, EventBuilder, Filter, Keys, Kind, PublicKey, RelayPoolNotification, RelayUrl,
-    SubscriptionId, Tag, TagKind, Timestamp,
+    Client, Event, EventBuilder, Filter, Keys, Kind, PublicKey, RelayPoolNotification, RelayStatus,
+    RelayUrl, SubscriptionId, Tag, TagKind, Timestamp,
 };
 
 use crate::ingest::{Ingest, IngestOutcome, PendingReply};
@@ -78,6 +79,47 @@ fn watch_filter(watched: impl IntoIterator<Item = PublicKey>, since_secs: u64) -
         .since(Timestamp::from_secs(since_secs))
 }
 
+/// A cheap, lock-free snapshot of relay connectivity, shared with the HTTP
+/// side so `/health` can answer "is the till actually reachable on Nostr?".
+///
+/// A till whose relays are all down still binds, still serves checkout pages
+/// and still reports `status: ok`, but cannot receive a single payment. The
+/// service refreshes this on its existing refresh tick; nothing else polls.
+#[derive(Debug, Default)]
+pub struct RelayHealth {
+    configured: AtomicUsize,
+    connected: AtomicUsize,
+    /// Unix seconds of the last refresh; 0 means never (no reading yet).
+    updated_at: AtomicI64,
+}
+
+impl RelayHealth {
+    /// A fresh, never-refreshed snapshot.
+    pub fn new() -> RelayHealth {
+        RelayHealth::default()
+    }
+
+    /// Record a reading (called from the service's refresh tick).
+    pub fn set(&self, configured: usize, connected: usize) {
+        self.configured.store(configured, Ordering::Relaxed);
+        self.connected.store(connected, Ordering::Relaxed);
+        self.updated_at.store(unix_time(), Ordering::Relaxed);
+    }
+
+    /// `(configured, connected)` as of the last refresh, or `None` while no
+    /// reading has been taken yet (so `/health` never reports a fabricated
+    /// "0 connected" in the seconds before the service's first tick).
+    pub fn snapshot(&self) -> Option<(usize, usize)> {
+        if self.updated_at.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        Some((
+            self.configured.load(Ordering::Relaxed),
+            self.connected.load(Ordering::Relaxed),
+        ))
+    }
+}
+
 /// Service configuration (already resolved from the environment).
 #[derive(Debug, Clone)]
 pub struct ServiceOptions {
@@ -85,6 +127,8 @@ pub struct ServiceOptions {
     pub relays: Vec<String>,
     /// Optional NIP-17 payment DMs (milestone 6, all off by default).
     pub notify: NotifyOptions,
+    /// Shared connectivity snapshot for `/health`, refreshed on the tick.
+    pub health: Arc<RelayHealth>,
 }
 
 /// Optional payment-notification DMs (milestone 6). Both are off by default.
@@ -237,6 +281,10 @@ pub async fn run<R: SlatepackReceiver>(
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             },
             _ = refresh.tick() => {
+                // Connectivity first: `refresh_subscription` returns early in
+                // the steady state (an unchanged watch set), which is exactly
+                // when a monitor most wants a fresh reading.
+                snapshot_relay_health(&client, &opts.relays, &opts.health).await;
                 refresh_subscription(
                     &client,
                     &ingest,
@@ -251,6 +299,30 @@ pub async fn run<R: SlatepackReceiver>(
         }
     }
     error!("nostr: notification stream closed; service stopped");
+}
+
+/// Count how many of our OWN configured relays are connected and publish the
+/// reading. Deliberately scoped to `configured` rather than the whole pool:
+/// `connect_relays` dials a payer's advertised relays for reply fan-out, and
+/// counting those would make "connected" drift above the set the till actually
+/// listens on.
+async fn snapshot_relay_health(client: &Client, configured: &[String], health: &RelayHealth) {
+    let mut connected = 0usize;
+    for url in configured {
+        if let Ok(relay) = client.relay(url).await {
+            if relay.status() == RelayStatus::Connected {
+                connected += 1;
+            }
+        }
+    }
+    if connected == 0 && !configured.is_empty() {
+        warn!(
+            "nostr: none of the {} configured relay(s) are connected; \
+             the till cannot receive payments over Nostr right now",
+            configured.len()
+        );
+    }
+    health.set(configured.len(), connected);
 }
 
 /// One live refresh pass: diff the current watched set against the active
@@ -597,6 +669,25 @@ mod tests {
             payer_receipt_text(1_000_000_000),
             "[GoblinPay] Payment of 1 GRIN received. Thank you."
         );
+    }
+
+    #[test]
+    fn relay_health_reports_nothing_until_it_is_refreshed() {
+        // Before the first tick there is no reading, so `/health` stays silent
+        // rather than claiming "0 of 2 connected" during boot.
+        let health = RelayHealth::new();
+        assert_eq!(health.snapshot(), None);
+
+        health.set(2, 1);
+        assert_eq!(health.snapshot(), Some((2, 1)));
+        // An all-down till is a real reading, not an absent one.
+        health.set(2, 0);
+        assert_eq!(health.snapshot(), Some((2, 0)));
+        // Shared across threads: the service writes, the HTTP side reads.
+        let shared = Arc::new(health);
+        let writer = Arc::clone(&shared);
+        std::thread::spawn(move || writer.set(3, 3)).join().unwrap();
+        assert_eq!(shared.snapshot(), Some((3, 3)));
     }
 
     fn set(keys: &[&Keys]) -> HashSet<PublicKey> {

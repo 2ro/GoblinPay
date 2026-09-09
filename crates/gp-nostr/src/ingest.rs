@@ -678,7 +678,8 @@ mod tests {
         // Gift wrap (kind 1059), context kind=1059 / empty scope, ephemeral key.
         let ephemeral = Keys::generate();
         let ck = wallet_conversation_key(ephemeral.secret_key(), receiver);
-        let wrapped = nip44::encrypt_v3(&ck, seal.as_json().as_bytes(), 1059, b"").expect("v3 wrap");
+        let wrapped =
+            nip44::encrypt_v3(&ck, seal.as_json().as_bytes(), 1059, b"").expect("v3 wrap");
         EventBuilder::new(Kind::GiftWrap, wrapped)
             .tag(Tag::public_key(*receiver))
             .custom_created_at(Timestamp::tweaked(RANGE_RANDOM_TIMESTAMP_TWEAK))

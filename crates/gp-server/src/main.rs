@@ -104,8 +104,12 @@ fn routes(cfg: &mut web::ServiceConfig) {
 /// identity, build the multi-identity key directory (M5b), seed the initial
 /// watch set, and start the relay listener on its own thread. Fails
 /// fast on misconfiguration. Returns the identity keys (for receipts + invoice
-/// derivation) and a clone of the wallet (for the manual-slatepack handler).
-async fn start_ingest(cfg: &Config, pool: sqlx::SqlitePool) -> (Keys, GpWallet) {
+/// derivation), a clone of the wallet (for the manual-slatepack handler), and
+/// the relay connectivity snapshot the service refreshes (for `/health`).
+async fn start_ingest(
+    cfg: &Config,
+    pool: sqlx::SqlitePool,
+) -> (Keys, GpWallet, Arc<gp_nostr::service::RelayHealth>) {
     // Init-once: whether the encrypted seed already exists decides if the
     // mnemonic is still needed. Check before opening (open creates it on first
     // run), so we can nudge the operator to remove a now-redundant seed.
@@ -154,6 +158,7 @@ async fn start_ingest(cfg: &Config, pool: sqlx::SqlitePool) -> (Keys, GpWallet) 
     if cfg.notify_merchant_dm && merchant.is_none() {
         eprintln!("warning: GP_NOTIFY_MERCHANT_DM=on but GP_MERCHANT_NPUB is unset/invalid");
     }
+    let health = Arc::new(gp_nostr::service::RelayHealth::new());
     let opts = gp_nostr::service::ServiceOptions {
         relays: gp_nostr::relays::resolve(cfg.relay_mode, &cfg.bundled_relay_url, &cfg.relays),
         notify: gp_nostr::service::NotifyOptions {
@@ -161,6 +166,7 @@ async fn start_ingest(cfg: &Config, pool: sqlx::SqlitePool) -> (Keys, GpWallet) 
             merchant_dm: cfg.notify_merchant_dm,
             payer_receipt: cfg.notify_payer_receipt,
         },
+        health: Arc::clone(&health),
     };
     let receiver = WalletReceiver::with_matching(
         wallet.clone(),
@@ -190,7 +196,7 @@ async fn start_ingest(cfg: &Config, pool: sqlx::SqlitePool) -> (Keys, GpWallet) 
     );
     let directory: Arc<dyn KeyDirectory> = Arc::new(dir);
     gp_nostr::service::spawn_with_directory(keys.clone(), opts, receiver, directory);
-    (keys, wallet)
+    (keys, wallet, health)
 }
 
 /// Build a rustls server config from PEM certificate-chain and key files.
@@ -390,12 +396,17 @@ async fn main() -> io::Result<()> {
         .map_err(io::Error::other)?;
     println!("database ready at {}", cfg.db_path);
 
-    let (signer, wallet_opt): (Option<Keys>, Option<GpWallet>) = if cfg.ingest {
-        let (keys, wallet) = start_ingest(&cfg, pool.clone()).await;
-        (Some(keys), Some(wallet))
+    #[allow(clippy::type_complexity)] // three boot outputs, destructured immediately
+    let (signer, wallet_opt, relay_health): (
+        Option<Keys>,
+        Option<GpWallet>,
+        Option<Arc<gp_nostr::service::RelayHealth>>,
+    ) = if cfg.ingest {
+        let (keys, wallet, health) = start_ingest(&cfg, pool.clone()).await;
+        (Some(keys), Some(wallet), Some(health))
     } else {
         println!("ingest disabled (GP_INGEST=off): serving HTTP only");
-        (None, None)
+        (None, None, None)
     };
 
     // Confirmation poll (M4): advances received payments to `confirmed` when
@@ -418,6 +429,7 @@ async fn main() -> io::Result<()> {
     let receipt_signer = ReceiptSigner(signer);
     let cfg_data = web::Data::new(cfg.clone());
     let wallet_data = web::Data::new(wallet_opt);
+    let health_data = web::Data::new(health::HealthState::new(relay_health));
 
     // grin1 rail (Phase 1): the Grin Foreign API v2 on loopback, plus the
     // in-process arti onion service proxying onion:80 -> 127.0.0.1:<port>.
@@ -492,6 +504,7 @@ async fn main() -> io::Result<()> {
             .app_data(cfg_data.clone())
             .app_data(wallet_data.clone())
             .app_data(oracle_data.clone())
+            .app_data(health_data.clone())
             .configure(routes)
     });
 

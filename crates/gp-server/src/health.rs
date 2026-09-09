@@ -7,16 +7,39 @@
 //! server has the data. Nothing here is a secret: no tokens, no URLs, no payer
 //! identities, just counts.
 
+use std::sync::Arc;
+
 use actix_web::{web, HttpResponse, Responder};
 use gp_core::webhook;
+use gp_nostr::service::RelayHealth;
 use sqlx::SqlitePool;
+
+/// The non-database inputs `/health` reports on.
+#[derive(Debug, Clone, Default)]
+pub struct HealthState {
+    /// The ingest service's relay connectivity snapshot. `None` when ingest is
+    /// off (`GP_INGEST=off`): there is no relay set to be healthy or not.
+    relays: Option<Arc<RelayHealth>>,
+}
+
+impl HealthState {
+    /// Build the state from the running ingest service's snapshot (or `None`
+    /// when ingest is disabled).
+    pub fn new(relays: Option<Arc<RelayHealth>>) -> HealthState {
+        HealthState { relays }
+    }
+}
 
 /// `GET /health`.
 ///
-/// The pool is optional so the route can be mounted in isolation (the route
-/// table tests build an `App` with no app data at all); in the running server
-/// it is always present, and `webhooks_dead` is then always reported.
-pub async fn health(pool: Option<web::Data<SqlitePool>>) -> impl Responder {
+/// `status` and `version` are the fixed contract. The pool and the state are
+/// optional so the route can be mounted in isolation (the route-table tests
+/// build an `App` with no app data at all); in the running server the pool is
+/// always present, so `webhooks_dead` is always reported.
+pub async fn health(
+    pool: Option<web::Data<SqlitePool>>,
+    state: Option<web::Data<HealthState>>,
+) -> impl Responder {
     let mut body = serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
@@ -26,6 +49,19 @@ pub async fn health(pool: Option<web::Data<SqlitePool>>) -> impl Responder {
         // told about a payment and an operator has to re-drive it.
         let dead = webhook::dead_count(pool.get_ref()).await.unwrap_or(0);
         body["webhooks_dead"] = serde_json::json!(dead);
+    }
+    // Relay connectivity, once the ingest service has taken a reading.
+    // `connected: 0` with a non-zero `configured` means the till is up but
+    // cannot receive a payment over Nostr, which nothing else surfaces.
+    if let Some((configured, connected)) = state
+        .as_ref()
+        .and_then(|s| s.relays.as_ref())
+        .and_then(|h| h.snapshot())
+    {
+        body["relays"] = serde_json::json!({
+            "configured": configured,
+            "connected": connected,
+        });
     }
     HttpResponse::Ok().json(body)
 }
@@ -97,5 +133,54 @@ mod tests {
         assert_eq!(body["status"], "ok");
         assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
         assert!(body.get("webhooks_dead").is_none());
+        assert!(body.get("relays").is_none());
+    }
+
+    /// Relay connectivity appears once the ingest service has taken a reading,
+    /// and an all-down relay set is reported rather than hidden.
+    #[actix_web::test]
+    async fn health_reports_relay_connectivity_when_ingest_is_running() {
+        let relays = Arc::new(RelayHealth::new());
+        let state = HealthState::new(Some(Arc::clone(&relays)));
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .route("/health", web::get().to(health)),
+        )
+        .await;
+
+        // Before the service's first tick there is no reading to report.
+        let req = test::TestRequest::get().uri("/health").to_request();
+        let body: serde_json::Value = test::call_and_read_body_json(&app, req).await;
+        assert!(body.get("relays").is_none(), "no fabricated boot reading");
+
+        relays.set(3, 2);
+        let req = test::TestRequest::get().uri("/health").to_request();
+        let body: serde_json::Value = test::call_and_read_body_json(&app, req).await;
+        assert_eq!(body["relays"]["configured"], 3);
+        assert_eq!(body["relays"]["connected"], 2);
+        assert_eq!(body["status"], "ok");
+
+        // All down: still `ok` (the HTTP surface works), but visibly 0 of 3.
+        relays.set(3, 0);
+        let req = test::TestRequest::get().uri("/health").to_request();
+        let body: serde_json::Value = test::call_and_read_body_json(&app, req).await;
+        assert_eq!(body["status"], "ok", "status semantics are unchanged");
+        assert_eq!(body["relays"]["connected"], 0);
+    }
+
+    /// Ingest off: no relay set exists, so nothing is claimed about one.
+    #[actix_web::test]
+    async fn health_omits_relays_when_ingest_is_off() {
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(HealthState::new(None)))
+                .route("/health", web::get().to(health)),
+        )
+        .await;
+        let req = test::TestRequest::get().uri("/health").to_request();
+        let body: serde_json::Value = test::call_and_read_body_json(&app, req).await;
+        assert_eq!(body["status"], "ok");
+        assert!(body.get("relays").is_none());
     }
 }

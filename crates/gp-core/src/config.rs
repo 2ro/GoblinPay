@@ -254,6 +254,11 @@ pub struct Config {
     /// onion service proxies to (`GP_GRIN1_FOREIGN_PORT`, default 3416). Only
     /// used when `grin1_rail` is on.
     pub grin1_foreign_port: u16,
+    /// Extra origins allowed to frame the hosted `/pay/<token>` page
+    /// (`GP_EMBED_ORIGINS`, comma separated, e.g. `https://myshop.com`).
+    /// Empty (the default) means the page may be framed only by its own origin:
+    /// `Content-Security-Policy: frame-ancestors 'self'`.
+    pub embed_origins: Vec<String>,
     /// Names of the money/at-rest-encryption secrets that were supplied INLINE
     /// (the bare `GP_MNEMONIC` / `GP_WALLET_PASSWORD` / `GP_NSEC` env vars)
     /// rather than via their `_FILE` variant or a systemd credential. An inline
@@ -328,6 +333,7 @@ impl Default for Config {
             confirmations_required: DEFAULT_CONFIRMATIONS,
             grin1_rail: false,
             grin1_foreign_port: DEFAULT_GRIN1_FOREIGN_PORT,
+            embed_origins: Vec::new(),
             inline_secret_vars: Vec::new(),
         }
     }
@@ -484,6 +490,7 @@ impl Config {
                 .parse::<u16>()
                 .map_err(|_| format!("GP_GRIN1_FOREIGN_PORT must be a port 1-65535 (got `{v}`)"))?,
         };
+        let embed_origins = parse_embed_origins(get("GP_EMBED_ORIGINS"))?;
 
         let cfg = Config {
             bind,
@@ -522,6 +529,7 @@ impl Config {
             confirmations_required,
             grin1_rail,
             grin1_foreign_port,
+            embed_origins,
             inline_secret_vars,
         };
         cfg.validate()?;
@@ -642,7 +650,8 @@ impl Config {
              webhook_secret={} qr_logo={} merchant_npub={} notify_merchant_dm={} \
              notify_payer_receipt={} endpub_rotate_interval={} endpub_overlap_epochs={} \
              rate_source={} rate_currencies={:?} rate_cache_ttl={} quote_ttl={} \
-             rate_stale_max={} confirmations_required={} grin1_rail={} grin1_foreign_port={}",
+             rate_stale_max={} confirmations_required={} grin1_rail={} grin1_foreign_port={} \
+             embed_origins={:?}",
             self.bind,
             match &self.tls {
                 Tls::Off => "off".to_string(),
@@ -685,6 +694,7 @@ impl Config {
             self.confirmations_required,
             if self.grin1_rail { "on" } else { "off" },
             self.grin1_foreign_port,
+            self.embed_origins,
         )
     }
 }
@@ -730,6 +740,41 @@ fn parse_bool(
         Some("off") => Ok(false),
         Some(other) => Err(format!("{key} must be `on` or `off` (got `{other}`)")),
     }
+}
+
+/// Parse `GP_EMBED_ORIGINS`: a comma-separated list of origins allowed to frame
+/// the hosted pay page, appended verbatim to a `frame-ancestors` source list.
+/// Because the values land in a response header, they are validated up front
+/// (fail fast, like every other key) rather than sanitized at send time: each
+/// must be an `http(s)://` origin with no whitespace and none of the characters
+/// that could end the directive or the header (`;`, `,`, quotes).
+fn parse_embed_origins(raw: Option<String>) -> Result<Vec<String>, String> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for token in raw.split(',') {
+        let origin = token.trim().trim_end_matches('/');
+        if origin.is_empty() {
+            continue;
+        }
+        if !origin.starts_with("http://") && !origin.starts_with("https://") {
+            return Err(format!(
+                "GP_EMBED_ORIGINS entries must start with http:// or https:// (got `{origin}`)"
+            ));
+        }
+        if origin
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, ';' | '\'' | '"'))
+        {
+            return Err(format!(
+                "GP_EMBED_ORIGINS entry `{origin}` contains a character that is not \
+                 allowed in a Content-Security-Policy source"
+            ));
+        }
+        out.push(origin.to_string());
+    }
+    Ok(out)
 }
 
 /// Parse an integer with a default.
@@ -1029,6 +1074,30 @@ mod tests {
         assert!(load(&[("GP_GRIN1_RAIL", "yes")]).is_err());
         assert!(load(&[("GP_GRIN1_FOREIGN_PORT", "notaport")]).is_err());
         assert!(load(&[("GP_GRIN1_FOREIGN_PORT", "70000")]).is_err());
+    }
+
+    #[test]
+    fn embed_origins_default_empty_and_are_validated() {
+        // Unset = no extra framers: the pay page allows only `frame-ancestors 'self'`.
+        let cfg = load(&[]).unwrap();
+        assert!(cfg.embed_origins.is_empty());
+
+        let cfg = load(&[(
+            "GP_EMBED_ORIGINS",
+            " https://myshop.com/ , http://localhost:3000 ,",
+        )])
+        .unwrap();
+        assert_eq!(
+            cfg.embed_origins,
+            vec!["https://myshop.com", "http://localhost:3000"]
+        );
+
+        // A value that is not an http(s) origin, or that could break out of the
+        // header/directive, is rejected at boot rather than sanitized later.
+        assert!(load(&[("GP_EMBED_ORIGINS", "myshop.com")]).is_err());
+        assert!(load(&[("GP_EMBED_ORIGINS", "https://a.com; script-src *")]).is_err());
+        assert!(load(&[("GP_EMBED_ORIGINS", "https://a.com 'unsafe-inline'")]).is_err());
+        assert!(load(&[("GP_EMBED_ORIGINS", "https://a.com\nX-Evil: 1")]).is_err());
     }
 
     #[test]

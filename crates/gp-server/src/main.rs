@@ -12,7 +12,7 @@ use gp_nostr::{KeyDirectory, Keys};
 use gp_server::directory::{self, DbKeyDirectory};
 use gp_server::ingest::WalletReceiver;
 use gp_server::payments::{self, ReceiptSigner};
-use gp_server::{admin, checkout, foreign, invoices, tor, webhookd};
+use gp_server::{admin, checkout, foreign, invoices, security, tor, webhookd};
 use gp_wallet::GpWallet;
 
 /// Landing page ("GoblinPay").
@@ -493,7 +493,15 @@ async fn main() -> io::Result<()> {
     // invoices at create time over DIRECT HTTP (never Nym).
     let oracle_data = web::Data::new(gp_core::rates::Oracle::from_config(&cfg));
     let server = HttpServer::new(move || {
+        let (json_limit, form_limit, payload_limit) = security::payload_limits();
         App::new()
+            // Registered inner-to-outer: the constant headers wrap everything,
+            // so even a 429 from the limiter carries them.
+            .wrap(actix_web::middleware::from_fn(security::frame_policy))
+            .wrap(security::default_headers())
+            .app_data(json_limit)
+            .app_data(form_limit)
+            .app_data(payload_limit)
             .app_data(web::Data::new(pool.clone()))
             .app_data(web::Data::new(receipt_signer.clone()))
             .app_data(cfg_data.clone())
@@ -520,6 +528,17 @@ mod tests {
     use actix_web::{test, App};
 
     use super::*;
+
+    /// A migrated single-connection in-memory pool (as `tests/checkout_e2e.rs`).
+    async fn test_pool() -> sqlx::SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        gp_core::db::MIGRATOR.run(&pool).await.unwrap();
+        pool
+    }
 
     #[actix_web::test]
     async fn health_returns_ok_and_version() {
@@ -568,6 +587,94 @@ mod tests {
         assert!(
             html.contains("/pay/static/style.css"),
             "asset link is prefixed"
+        );
+    }
+
+    #[actix_web::test]
+    async fn security_headers_are_set_and_non_pay_pages_deny_framing() {
+        let app = test::init_service(
+            App::new()
+                .wrap(actix_web::middleware::from_fn(security::frame_policy))
+                .wrap(security::default_headers())
+                .app_data(web::Data::new(Config::default()))
+                .configure(routes),
+        )
+        .await;
+        let req = test::TestRequest::get().uri("/").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert!(resp.status().is_success());
+        let headers = resp.headers();
+        assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
+        assert_eq!(headers.get("referrer-policy").unwrap(), "no-referrer");
+        assert_eq!(headers.get("x-frame-options").unwrap(), "DENY");
+        assert!(
+            headers.get("content-security-policy").is_none(),
+            "only the pay page carries a framing policy"
+        );
+    }
+
+    #[actix_web::test]
+    async fn the_pay_page_allows_self_plus_the_configured_embed_origins() {
+        let cfg = Config {
+            embed_origins: vec!["https://myshop.com".into()],
+            ..Config::default()
+        };
+        let pool = test_pool().await;
+        let app = test::init_service(
+            App::new()
+                .wrap(actix_web::middleware::from_fn(security::frame_policy))
+                .wrap(security::default_headers())
+                .app_data(web::Data::new(pool))
+                .app_data(web::Data::new(cfg))
+                .app_data(web::Data::new(None::<GpWallet>))
+                .configure(routes),
+        )
+        .await;
+        // An unknown token 404s, but the framing policy is a property of the
+        // route, not of the outcome.
+        let req = test::TestRequest::get()
+            .uri("/pay/no-such-token")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        let headers = resp.headers();
+        assert_eq!(
+            headers.get("content-security-policy").unwrap(),
+            "frame-ancestors 'self' https://myshop.com"
+        );
+        assert!(
+            headers.get("x-frame-options").is_none(),
+            "a bare DENY would break the embed the allow-list permits"
+        );
+        assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
+    }
+
+    #[actix_web::test]
+    async fn an_oversized_form_post_is_rejected() {
+        let (json_limit, form_limit, payload_limit) = security::payload_limits();
+        let pool = test_pool().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(json_limit)
+                .app_data(form_limit)
+                .app_data(payload_limit)
+                .app_data(web::Data::new(pool))
+                .app_data(web::Data::new(Config::default()))
+                .app_data(web::Data::new(None::<GpWallet>))
+                .configure(routes),
+        )
+        .await;
+        let body = format!("slatepack={}", "A".repeat(100 * 1024));
+        let req = test::TestRequest::post()
+            .uri("/pay/any-token/slatepack")
+            .insert_header(("content-type", "application/x-www-form-urlencoded"))
+            .set_payload(body)
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(
+            resp.status(),
+            actix_web::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "a 100 KB form is over the {} byte limit",
+            security::PAYLOAD_LIMIT
         );
     }
 

@@ -209,6 +209,7 @@ Everything is environment variables, defaults are safe for local use.
 | `GP_RATE_CACHE_TTL` | `60` | Seconds a fetched rate is reused before refetching (0 = always) |
 | `GP_QUOTE_TTL` | `900` | Seconds a created fiat invoice locks its Grin quote (its expiry window) |
 | `GP_RATE_STALE_MAX` | `0` | Bounded stale-rate fallback in seconds if a live fetch fails (0 = off) |
+| `GP_EMBED_ORIGINS` | unset | Extra origins allowed to frame the hosted `/pay/<token>` page (comma separated, e.g. `https://myshop.com`). Unset means `Content-Security-Policy: frame-ancestors 'self'`; every other page is `X-Frame-Options: DENY` |
 
 ### Checkout methods
 

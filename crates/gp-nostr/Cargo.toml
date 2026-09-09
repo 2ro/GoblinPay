@@ -17,12 +17,12 @@ nostr-relay-pool = "0.44"
 async-wsocket = "0.13"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 
-# NIP-44 v3 (the companion crate, M0). Path dep on the local checkout, PINNED:
-# working tree is on branch `v3` at rev e3dfa5e ("Document the v3 API in the
-# README"). It provides encrypt_v3/decrypt_v3 with the authenticated
-# kind/scope context binding the NIP-17 extension rides on; v2 stays on
-# nostr-sdk. Do not float the checkout without re-running the wrap tests.
-nip44 = { path = "../../../nip44" }
+# NIP-44 v3 (the companion crate, M0), from crates.io. It provides
+# encrypt_v3/decrypt_v3 with the authenticated kind/scope context binding the
+# NIP-17 extension rides on; v2 stays on nostr-sdk. 0.3.2 is the published
+# v2+v3 release (0.3.0 and 0.3.1 are yanked). Do not float this without
+# re-running the wrap tests.
+nip44 = "0.3.2"
 # The nip44 crate speaks secp256k1 0.31 types (nostr-sdk is on 0.29; the two
 # versions coexist, conversion goes through raw bytes). `global-context` gives
 # the shared `SECP256K1` context and `hashes` the SHA-256 used to sign the

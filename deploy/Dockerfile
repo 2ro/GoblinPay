@@ -1,15 +1,14 @@
 # Multi-stage build for the GoblinPay server, run as a non-root user.
 #
-# IMPORTANT — build context is the WORKSPACE PARENT, not the repo.
-# The Nostr money path depends on a crate that lives next to this repo, not
-# inside it (see crates/gp-nostr/Cargo.toml):
-#   nip44  -> ../nip44          (the NIP-44 v3 companion crate)
-# So the image must be built from the directory that contains GoblinPay/ and
-# nip44/ side by side. docker-compose.yml already sets
-# `build.context: ../..` for this; to build by hand:
+# Build context is the WORKSPACE PARENT, the directory that holds GoblinPay/.
+# docker-compose.yml already sets `build.context: ../..` for this; to build by
+# hand:
 #
-#   cd "<workspace parent containing GoblinPay, nip44>"
+#   cd "<parent directory containing GoblinPay>"
 #   docker build -f GoblinPay/deploy/Dockerfile -t goblinpay:latest .
+#
+# No sibling checkout is required: the NIP-44 v3 companion crate now comes from
+# crates.io (`nip44 = "0.3.2"` in crates/gp-nostr/Cargo.toml).
 #
 # Only `-p gp-server` is built, which EXCLUDES the gp-goblin-sender dev crate
 # (it needs the goblin wallet tree, absent on servers). gp-wallet's grin_wallet
@@ -22,10 +21,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 
-# The trees the gp-server dependency graph needs, in the same relative layout
-# the path deps expect (nip44 is a sibling of GoblinPay).
+# The repo itself. Everything the gp-server graph needs beyond it comes from
+# crates.io or git.
 COPY GoblinPay ./GoblinPay
-COPY nip44 ./nip44
 
 WORKDIR /build/GoblinPay
 # Build ONLY gp-server (and its deps); never the goblin-tree dev crate.

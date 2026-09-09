@@ -72,7 +72,7 @@ ed25519-dalek = { version = "2.1", features = ["hazmat"] }
 # ingest pipeline receives it through the real WalletReceiver, and the reply
 # is decrypted and finalized by Goblin's wallet stack.
 nostr-sdk = { version = "0.44", features = ["nip44", "nip49", "nip59"] }
-nip44 = { path = "../../../nip44" }
+nip44 = "0.3.2"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 rand = "0.6"
 grin_keychain = "=5.4.1"

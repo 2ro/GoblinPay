@@ -37,6 +37,20 @@ pub const DEFAULT_NODE_URL: &str = "https://main.gri.mw";
 /// dialed by the server AND advertised to payers in the checkout `nprofile`.
 pub const DEFAULT_BUNDLED_RELAY: &str = "ws://127.0.0.1:7777";
 
+/// Is `url` a Nostr relay URL? Relays speak WebSocket, so anything that is not
+/// `ws://` or `wss://` is a configuration mistake (an `https://` node URL in the
+/// relay slot, a bare hostname, a pasted `nprofile`), and a mistake here is
+/// silent: the pool simply never connects and the till never sees a payment.
+///
+/// Also the filter for relay URLs suggested by a PAYER (their kind 10050 relay
+/// hints), where a non-WebSocket scheme is untrusted input rather than a typo.
+pub fn is_relay_url(url: &str) -> bool {
+    let url = url.trim();
+    url.strip_prefix("wss://")
+        .or_else(|| url.strip_prefix("ws://"))
+        .is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/'))
+}
+
 /// TLS mode for the HTTP server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -624,6 +638,24 @@ impl Config {
         if self.relay_mode == RelayMode::Bundled && self.bundled_relay_url.trim().is_empty() {
             return Err("GP_RELAY_MODE=bundled requires a non-empty GP_BUNDLED_RELAY_URL".into());
         }
+        // Fail closed on a relay URL that is not a WebSocket URL. Left to
+        // runtime it is invisible: the pool never connects, and the till just
+        // never receives a payment.
+        for relay in &self.relays {
+            if !is_relay_url(relay) {
+                return Err(format!(
+                    "GP_RELAYS entries must start with ws:// or wss:// (got `{relay}`)"
+                ));
+            }
+        }
+        // Only in bundled mode: the value is unused (and may be a leftover) when
+        // the till runs on an external pool.
+        if self.relay_mode == RelayMode::Bundled && !is_relay_url(&self.bundled_relay_url) {
+            return Err(format!(
+                "GP_BUNDLED_RELAY_URL must start with ws:// or wss:// (got `{}`)",
+                self.bundled_relay_url
+            ));
+        }
         if self.nsec.is_some() && self.ncryptsec.is_some() {
             return Err("set only one of GP_NSEC and GP_NCRYPTSEC".into());
         }
@@ -973,6 +1005,46 @@ mod tests {
         assert!(load(&[("GP_NODE_URL", "grin.money")]).is_err());
         assert!(load(&[("GP_RELAY_MODE", "external")]).is_err());
         assert!(load(&[("GP_DATA_DIR", "")]).is_err());
+    }
+
+    #[test]
+    fn relay_urls_must_be_websocket_urls() {
+        // Relays speak WebSocket. Anything else silently never connects, so it
+        // has to be a load-time error, not a mystery at runtime.
+        assert!(is_relay_url("wss://relay.floonet.dev"));
+        assert!(is_relay_url("ws://127.0.0.1:7777"));
+        assert!(is_relay_url("  wss://relay.example  "), "trimmed");
+        assert!(!is_relay_url("https://relay.example"));
+        assert!(!is_relay_url("relay.example"));
+        assert!(!is_relay_url("wss://"), "scheme with no host");
+        assert!(!is_relay_url("ws:///path"));
+        assert!(!is_relay_url(""));
+
+        // GP_RELAYS is rejected at load, naming the offending entry.
+        let err = load(&[
+            ("GP_RELAY_MODE", "external"),
+            ("GP_RELAYS", "wss://ok.example,https://relay.example"),
+        ])
+        .unwrap_err();
+        assert!(err.contains("ws:// or wss://"), "got {err}");
+        assert!(err.contains("https://relay.example"), "names it: {err}");
+        assert!(load(&[
+            ("GP_RELAY_MODE", "external"),
+            ("GP_RELAYS", "wss://a.example,ws://b.example"),
+        ])
+        .is_ok());
+
+        // So is the bundled relay, but only in bundled mode: on an external
+        // pool the value is unused and may be a leftover.
+        assert!(load(&[("GP_BUNDLED_RELAY_URL", "relay.example")]).is_err());
+        assert!(load(&[
+            ("GP_RELAY_MODE", "external"),
+            ("GP_RELAYS", "wss://a.example"),
+            ("GP_BUNDLED_RELAY_URL", "relay.example"),
+        ])
+        .is_ok());
+        // The shipped defaults pass.
+        assert!(is_relay_url(DEFAULT_BUNDLED_RELAY));
     }
 
     #[test]

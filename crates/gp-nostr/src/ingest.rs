@@ -12,15 +12,15 @@
 //!   reply-to-us (S2) or an invoice would target a sender wallet we do not
 //!   have. They drop.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use log::{info, warn};
+use log::{debug, info, warn};
 use nostr_sdk::{Event, EventBuilder, Keys, Kind, PublicKey, Tag, UnsignedEvent};
 
 use crate::{
     protocol, unix_time, IncomingContext, KeyDirectory, MasterDirectory, ReceiveError,
-    SlatepackReceiver,
+    SlatepackReceiver, LOOKBACK_SECS,
 };
 
 /// Rate limit for incoming wraps per sender (events/hour). A payment server
@@ -32,6 +32,50 @@ const RATE_PER_SENDER_PER_HOUR: usize = 10;
 const GLOBAL_UNWRAP_PER_MIN: usize = 120;
 /// Cap on remembered rate-limiter senders before pruning.
 const RATE_MAP_CAP: usize = 10_000;
+/// Cap on remembered dedupe markers before pruning.
+const SEEN_MAP_CAP: usize = RATE_MAP_CAP;
+/// How long a dedupe marker is kept. Deliberately equal to the oldest wrap
+/// [`accepts_created_at`] still accepts, so pruning a marker can never reopen a
+/// replay: any wrap old enough for its marker to be dropped is already refused
+/// on its timestamp.
+const SEEN_TTL_SECS: i64 = MAX_WRAP_AGE_SECS;
+/// Oldest wrap `created_at` accepted: the subscription look-back plus a day of
+/// slack (NIP-59 randomizes timestamps up to two days into the past, and the
+/// look-back already covers three).
+const MAX_WRAP_AGE_SECS: i64 = LOOKBACK_SECS + 86_400;
+/// How far into the future a wrap `created_at` may be (clock skew allowance).
+const MAX_WRAP_SKEW_SECS: i64 = 15 * 60;
+/// The invariant the pruning rests on, checked at compile time: a marker is
+/// never dropped while a wrap that old would still be accepted.
+const _: () = assert!(SEEN_TTL_SECS >= MAX_WRAP_AGE_SECS);
+
+/// Is this wrap's `created_at` inside the window we will act on? Outside it the
+/// wrap is either older than anything the subscription asked for, or dated in a
+/// future no honest clock explains.
+fn accepts_created_at(created_at: i64, now: i64) -> bool {
+    created_at >= now - MAX_WRAP_AGE_SECS && created_at <= now + MAX_WRAP_SKEW_SECS
+}
+/// Cap on wraps held for in-process retry after a transient receive failure.
+const RETRY_CAP: usize = 256;
+/// Give up on a wrap after this many in-process retries.
+const RETRY_MAX_ATTEMPTS: u32 = 5;
+/// First retry delay (seconds); doubles with each further attempt.
+const RETRY_BASE_SECS: i64 = 30;
+
+/// Delay before the Nth in-process retry: 30s, 60s, 120s, 240s, 480s.
+fn retry_backoff_secs(attempts: u32) -> i64 {
+    RETRY_BASE_SECS << attempts.saturating_sub(1).min(10)
+}
+
+/// A wrap awaiting an in-process retry.
+#[derive(Debug)]
+struct RetryEntry {
+    event: Event,
+    /// Failures so far (1 after the first).
+    attempts: u32,
+    /// Unix seconds the retry becomes due.
+    next_at: i64,
+}
 
 /// What the pipeline should do with a validated incoming message.
 /// Pure policy — unit tested, no side effects.
@@ -112,11 +156,19 @@ pub struct Ingest<R> {
     /// Resolves an incoming wrap's `p` tag to the identity we hold for it
     /// (master, or a per-invoice / per-user derived child).
     directory: Arc<dyn KeyDirectory>,
-    /// Processed markers: wrap ids, rumor ids, `slate:<id>` markers.
-    seen: Mutex<HashSet<String>>,
+    /// Processed markers (wrap ids, rumor ids, `slate:<id>` markers) with the
+    /// unix second each was set, so the set can be pruned by age instead of
+    /// growing for the process lifetime.
+    seen: Mutex<HashMap<String, i64>>,
     /// Per-sender sliding-window rate state (unix seconds of accepted events;
     /// the `"\0global"` key carries the global unwrap ceiling).
     rate: Mutex<HashMap<String, Vec<i64>>>,
+    /// Wraps whose receive failed transiently, awaiting an in-process retry,
+    /// keyed by wrap id. The relay pool does NOT resend an event it has already
+    /// seen (nostr-relay-pool 0.44.3 `relay/inner.rs:1211`: a wrap whose id is
+    /// already in the SDK's memory database is saved-and-silent, no
+    /// `RelayPoolNotification::Event`), so nothing else would ever re-offer it.
+    retry: Mutex<HashMap<String, RetryEntry>>,
 }
 
 impl<R: SlatepackReceiver> Ingest<R> {
@@ -134,8 +186,9 @@ impl<R: SlatepackReceiver> Ingest<R> {
             keys,
             receiver,
             directory,
-            seen: Mutex::new(HashSet::new()),
+            seen: Mutex::new(HashMap::new()),
             rate: Mutex::new(HashMap::new()),
+            retry: Mutex::new(HashMap::new()),
         }
     }
 
@@ -181,6 +234,19 @@ impl<R: SlatepackReceiver> Ingest<R> {
         if event.content.len() > protocol::MAX_WRAP_CONTENT {
             self.mark(&wrap_id);
             return IngestOutcome::Dropped("oversized wrap");
+        }
+        // 1.5 Timestamp window, before any crypto. Older than the subscription
+        // look-back (plus a day of slack for NIP-59's backdating) means nothing
+        // we would still act on; dated into the future means a clock no honest
+        // sender has. Deliberately NOT marked processed: the verdict comes from
+        // the event alone, so re-deciding it is free and costs no dedupe slot.
+        if !accepts_created_at(event.created_at.as_secs() as i64, unix_time()) {
+            debug!(
+                "ingest: wrap {}… outside the accepted time window (created_at {})",
+                &wrap_id[..8],
+                event.created_at.as_secs()
+            );
+            return IngestOutcome::Dropped("created_at outside the accepted window");
         }
         // 2. Wrap-level dedupe.
         if self.is_seen(&wrap_id) {
@@ -294,17 +360,127 @@ impl<R: SlatepackReceiver> Ingest<R> {
                 warn!("ingest: rejected slatepack from {}…: {m}", &sender_hex[..8]);
                 IngestOutcome::Dropped("invalid slatepack")
             }
-            // Transient: leave UNMARKED so the next catch-up retries.
-            Err(ReceiveError::Failed(m)) => IngestOutcome::Failed(m),
+            // Transient: leave UNMARKED and queue an in-process retry. A
+            // catch-up fetch only happens at boot and for newly derived keys,
+            // and the relay pool never re-offers a wrap it has already
+            // delivered, so without this queue a wallet hiccup on a live
+            // payment loses it until the service is restarted.
+            Err(ReceiveError::Failed(m)) => {
+                self.remember_for_retry(event);
+                IngestOutcome::Failed(m)
+            }
         }
     }
 
-    fn is_seen(&self, key: &str) -> bool {
-        self.seen.lock().expect("seen lock").contains(key)
+    /// Queue (or re-queue) a wrap for an in-process retry, with a doubling
+    /// backoff and a hard ceiling. Full queue or ceiling reached: it is dropped
+    /// and named, and only a service restart (whose catch-up fetch re-reads the
+    /// look-back window) will see it again.
+    fn remember_for_retry(&self, event: &Event) {
+        let id = event.id.to_hex();
+        let short = &id[..8.min(id.len())];
+        let mut retry = self.retry.lock().expect("retry lock");
+        let attempts = retry.get(&id).map_or(0, |e| e.attempts) + 1;
+        if attempts > RETRY_MAX_ATTEMPTS {
+            retry.remove(&id);
+            warn!(
+                "ingest: giving up on wrap {short}… after {RETRY_MAX_ATTEMPTS} in-process \
+                 retries; a service restart re-fetches it"
+            );
+            return;
+        }
+        if !retry.contains_key(&id) && retry.len() >= RETRY_CAP {
+            warn!(
+                "ingest: retry queue full ({RETRY_CAP}), dropping wrap {short}…; \
+                 a service restart re-fetches it"
+            );
+            return;
+        }
+        let next_at = unix_time() + retry_backoff_secs(attempts);
+        retry.insert(
+            id,
+            RetryEntry {
+                event: event.clone(),
+                attempts,
+                next_at,
+            },
+        );
     }
 
+    /// Wraps whose retry backoff has elapsed, for the service loop to re-run
+    /// through [`Ingest::handle_wrap`]. An entry the pipeline has since settled
+    /// (the wrap is marked processed) is discarded rather than re-run.
+    ///
+    /// Entries stay queued across a take: a repeat failure only bumps their
+    /// attempt count, and success marks the wrap so the next call clears it.
+    pub fn due_retries(&self, now: i64) -> Vec<Event> {
+        let candidates: Vec<(String, Event)> = {
+            let retry = self.retry.lock().expect("retry lock");
+            retry
+                .iter()
+                .filter(|(_, entry)| entry.next_at <= now)
+                .map(|(id, entry)| (id.clone(), entry.event.clone()))
+                .collect()
+        };
+        // The `seen` check is deliberately made outside the retry lock: the two
+        // mutexes are never held at the same time anywhere.
+        let mut due = Vec::new();
+        let mut settled = Vec::new();
+        for (id, event) in candidates {
+            // Settled = already marked processed, or aged out of the window
+            // (re-running that one would only be dropped on its timestamp,
+            // which does not mark, so it would never leave the queue).
+            let stale = !accepts_created_at(event.created_at.as_secs() as i64, now);
+            if stale || self.is_seen(&id) {
+                settled.push(id);
+            } else {
+                due.push(event);
+            }
+        }
+        if !settled.is_empty() {
+            let mut retry = self.retry.lock().expect("retry lock");
+            for id in settled {
+                retry.remove(&id);
+            }
+        }
+        due
+    }
+
+    /// How many wraps are queued for retry (observability + tests).
+    pub fn retry_queued(&self) -> usize {
+        self.retry.lock().expect("retry lock").len()
+    }
+
+    fn is_seen(&self, key: &str) -> bool {
+        self.seen.lock().expect("seen lock").contains_key(key)
+    }
+
+    /// Remember a marker, pruning the set when it grows past its cap: first by
+    /// age (a marker older than the wrap window is unreachable anyway), then, if
+    /// a flood kept everything young, oldest-first down to the cap. The wallet's
+    /// own already-received guard is the money-level backstop either way.
     fn mark(&self, key: &str) {
-        self.seen.lock().expect("seen lock").insert(key.to_string());
+        let now = unix_time();
+        let mut seen = self.seen.lock().expect("seen lock");
+        seen.insert(key.to_string(), now);
+        if seen.len() <= SEEN_MAP_CAP {
+            return;
+        }
+        seen.retain(|_, marked| now - *marked < SEEN_TTL_SECS);
+        if seen.len() > SEEN_MAP_CAP {
+            let excess = seen.len() - SEEN_MAP_CAP;
+            let mut by_age: Vec<(String, i64)> =
+                seen.iter().map(|(k, t)| (k.clone(), *t)).collect();
+            by_age.sort_unstable_by_key(|(_, t)| *t);
+            for (key, _) in by_age.into_iter().take(excess) {
+                seen.remove(&key);
+            }
+        }
+    }
+
+    /// How many dedupe markers are held (observability + tests).
+    pub fn seen_len(&self) -> usize {
+        self.seen.lock().expect("seen lock").len()
     }
 
     /// Sliding-window per-sender rate limiter (Goblin's `allow_sender`).
@@ -634,6 +810,308 @@ mod tests {
             IngestOutcome::RateLimited
         ));
         assert_eq!(ingest.receiver().calls(), RATE_PER_SENDER_PER_HOUR);
+    }
+
+    #[test]
+    fn created_at_window_rejects_stale_and_future_wraps() {
+        let now = 1_800_000_000;
+        assert!(accepts_created_at(now, now));
+        // NIP-59 backdates up to 2 days; the look-back covers 3, plus a day of
+        // slack. Everything in that range is still actionable.
+        assert!(accepts_created_at(now - 2 * 86_400, now));
+        assert!(accepts_created_at(now - MAX_WRAP_AGE_SECS, now));
+        assert!(!accepts_created_at(now - MAX_WRAP_AGE_SECS - 1, now));
+        // Modest clock skew is tolerated, an implausible future is not.
+        assert!(accepts_created_at(now + MAX_WRAP_SKEW_SECS, now));
+        assert!(!accepts_created_at(now + MAX_WRAP_SKEW_SECS + 1, now));
+        assert!(!accepts_created_at(now + 86_400, now));
+        // (That the dedupe TTL is never shorter than this window is asserted at
+        // compile time next to the constants.)
+    }
+
+    #[tokio::test]
+    async fn a_stale_wrap_never_reaches_the_wallet() {
+        use nostr_sdk::Timestamp;
+
+        let payer = Keys::generate();
+        let server = Keys::generate();
+        let ingest = Ingest::new(server.clone(), StubReceiver::new(vec![]));
+
+        // A well-formed payment wrap, but dated a week ago.
+        let mut tags = protocol::build_rumor_tags(Some("stale"));
+        tags.push(Tag::public_key(server.public_key()));
+        let rumor = EventBuilder::new(
+            Kind::PrivateDirectMessage,
+            protocol::build_payment_content(PACK),
+        )
+        .tags(tags)
+        .build(payer.public_key());
+        let fresh = crate::wrap::gift_wrap(
+            &payer,
+            &server.public_key(),
+            rumor,
+            crate::wrap::WrapVersion::V2,
+        )
+        .unwrap();
+        let stale = EventBuilder::new(Kind::GiftWrap, fresh.content.clone())
+            .tags(fresh.tags.clone().to_vec())
+            .custom_created_at(Timestamp::from_secs(
+                (unix_time() - 7 * 86_400).max(0) as u64
+            ))
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+
+        assert!(matches!(
+            ingest.handle_wrap(&stale).await,
+            IngestOutcome::Dropped("created_at outside the accepted window")
+        ));
+        assert_eq!(ingest.receiver().calls(), 0);
+        // Refused on the event alone, so no dedupe slot was spent on it.
+        assert_eq!(ingest.seen_len(), 0);
+    }
+
+    #[test]
+    fn the_dedupe_set_is_bounded() {
+        // It used to be an unbounded HashSet: every wrap ever seen stayed for
+        // the process lifetime. Now it prunes back to the cap.
+        let ingest = Ingest::new(Keys::generate(), StubReceiver::new(vec![]));
+        for i in 0..SEEN_MAP_CAP + 500 {
+            ingest.mark(&format!("marker-{i}"));
+        }
+        assert!(
+            ingest.seen_len() <= SEEN_MAP_CAP,
+            "seen grew to {}",
+            ingest.seen_len()
+        );
+        // The most recent markers survive the prune, so live dedupe still works.
+        assert!(ingest.is_seen(&format!("marker-{}", SEEN_MAP_CAP + 499)));
+    }
+
+    #[test]
+    fn retry_backoff_doubles_from_thirty_seconds() {
+        assert_eq!(retry_backoff_secs(1), 30);
+        assert_eq!(retry_backoff_secs(2), 60);
+        assert_eq!(retry_backoff_secs(3), 120);
+        assert_eq!(retry_backoff_secs(4), 240);
+        assert_eq!(retry_backoff_secs(RETRY_MAX_ATTEMPTS), 480);
+    }
+
+    /// A transient receive failure queues the wrap for an in-process retry,
+    /// backs off, retries, and stops queuing once it succeeds. Without this the
+    /// payment was lost until a restart: the relay pool never re-offers a wrap
+    /// it has already delivered.
+    #[tokio::test]
+    async fn transient_failures_are_queued_and_retried_in_process() {
+        let payer = Keys::generate();
+        let server = Keys::generate();
+        let ingest = Ingest::new(
+            server.clone(),
+            StubReceiver::new(vec![
+                Err(ReceiveError::Failed("wallet busy".into())),
+                Err(ReceiveError::Failed("wallet busy".into())),
+                Ok(ReceivedPayment {
+                    slate_id: "slate-r".into(),
+                    amount: 9,
+                    s2_armor: "BEGINSLATEPACK. r. ENDSLATEPACK.".into(),
+                }),
+            ]),
+        );
+        let wrap = payment_wrap(&payer, &server, crate::wrap::WrapVersion::V2);
+        let now = unix_time();
+
+        // First failure: queued, not yet due.
+        assert!(matches!(
+            ingest.handle_wrap(&wrap).await,
+            IngestOutcome::Failed(_)
+        ));
+        assert_eq!(ingest.retry_queued(), 1);
+        assert!(ingest.due_retries(now).is_empty(), "30s backoff applies");
+
+        // Once the backoff elapses the wrap comes back for another run.
+        let due = ingest.due_retries(now + 30);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, wrap.id);
+
+        // It fails again: still queued, now on the longer backoff.
+        assert!(matches!(
+            ingest.handle_wrap(&due[0]).await,
+            IngestOutcome::Failed(_)
+        ));
+        assert_eq!(ingest.retry_queued(), 1, "one entry, not two");
+        assert!(ingest.due_retries(now + 30).is_empty(), "backed off to 60s");
+
+        // Third run succeeds, and the settled entry is cleared on the next take.
+        let due = ingest.due_retries(now + 60);
+        assert_eq!(due.len(), 1);
+        assert!(matches!(
+            ingest.handle_wrap(&due[0]).await,
+            IngestOutcome::Received { .. }
+        ));
+        assert!(ingest.due_retries(now + 10_000).is_empty());
+        assert_eq!(ingest.retry_queued(), 0, "a settled wrap stops retrying");
+        assert_eq!(ingest.receiver().calls(), 3);
+    }
+
+    /// The queue gives up rather than retrying forever, and is bounded.
+    #[tokio::test]
+    async fn the_retry_queue_gives_up_and_is_bounded() {
+        let payer = Keys::generate();
+        let server = Keys::generate();
+        let outcomes = (0..RETRY_MAX_ATTEMPTS + 1)
+            .map(|_| Err(ReceiveError::Failed("wallet down".into())))
+            .collect();
+        let ingest = Ingest::new(server.clone(), StubReceiver::new(outcomes));
+        let wrap = payment_wrap(&payer, &server, crate::wrap::WrapVersion::V2);
+
+        // Fail it RETRY_MAX_ATTEMPTS times: it stays queued throughout.
+        for _ in 0..RETRY_MAX_ATTEMPTS {
+            assert!(matches!(
+                ingest.handle_wrap(&wrap).await,
+                IngestOutcome::Failed(_)
+            ));
+            assert_eq!(ingest.retry_queued(), 1);
+        }
+        // One more and it is abandoned rather than retried forever.
+        assert!(matches!(
+            ingest.handle_wrap(&wrap).await,
+            IngestOutcome::Failed(_)
+        ));
+        assert_eq!(ingest.retry_queued(), 0, "gave up after the ceiling");
+
+        // The queue never grows past its cap.
+        let ingest = Ingest::new(server.clone(), StubReceiver::new(vec![]));
+        for i in 0..RETRY_CAP + 10 {
+            let event = payment_wrap_noted(
+                &payer,
+                &server,
+                crate::wrap::WrapVersion::V2,
+                &format!("wrap {i}"),
+            );
+            ingest.remember_for_retry(&event);
+        }
+        assert_eq!(ingest.retry_queued(), RETRY_CAP);
+    }
+
+    /// The conversation key the Goblin wallet derives for a v3 layer, copied
+    /// from `goblin/src/nostr/wrapv3.rs:60` (`conversation_key`).
+    fn wallet_conversation_key(secret: &nostr_sdk::SecretKey, public: &PublicKey) -> [u8; 32] {
+        let sk = secp256k1::SecretKey::from_byte_array(secret.to_secret_bytes())
+            .expect("wallet secret key");
+        let pk = secp256k1::XOnlyPublicKey::from_byte_array(public.to_bytes())
+            .expect("wallet public key");
+        nip44::get_conversation_key_v3(sk, pk)
+    }
+
+    /// The wallet's NIP-44 v3 gift wrap, rebuilt here straight from the `nip44`
+    /// crate as `goblin/src/nostr/wrapv3.rs:100` (`wrap_kind`) builds it, so this
+    /// pin does NOT go through gp-nostr's own `wrap::gift_wrap` and therefore
+    /// keeps testing the on-the-wire shape even if that builder changes.
+    fn wallet_v3_wrap(
+        sender: &Keys,
+        receiver: &PublicKey,
+        content: String,
+        extra_tags: Vec<Tag>,
+    ) -> Event {
+        use nostr_sdk::nips::nip59::RANGE_RANDOM_TIMESTAMP_TWEAK;
+        use nostr_sdk::{JsonUtil, Timestamp};
+
+        // Rumor: receiver p-tag FIRST, then the extra tags (the wallet's shape,
+        // matching `EventBuilder::private_msg_rumor`). Never signed (NIP-59).
+        let mut rumor: UnsignedEvent = EventBuilder::new(Kind::PrivateDirectMessage, content)
+            .tag(Tag::public_key(*receiver))
+            .tags(extra_tags)
+            .build(sender.public_key());
+        rumor.ensure_id();
+
+        // Seal (kind 13), context kind=13 / empty scope, signed by the sender.
+        let ck = wallet_conversation_key(sender.secret_key(), receiver);
+        let sealed = nip44::encrypt_v3(&ck, rumor.as_json().as_bytes(), 13, b"").expect("v3 seal");
+        let seal = EventBuilder::new(Kind::Seal, sealed)
+            .custom_created_at(Timestamp::tweaked(RANGE_RANDOM_TIMESTAMP_TWEAK))
+            .sign_with_keys(sender)
+            .expect("sign seal");
+
+        // Gift wrap (kind 1059), context kind=1059 / empty scope, ephemeral key.
+        let ephemeral = Keys::generate();
+        let ck = wallet_conversation_key(ephemeral.secret_key(), receiver);
+        let wrapped =
+            nip44::encrypt_v3(&ck, seal.as_json().as_bytes(), 1059, b"").expect("v3 wrap");
+        EventBuilder::new(Kind::GiftWrap, wrapped)
+            .tag(Tag::public_key(*receiver))
+            .custom_created_at(Timestamp::tweaked(RANGE_RANDOM_TIMESTAMP_TWEAK))
+            .sign_with_keys(&ephemeral)
+            .expect("sign wrap")
+    }
+
+    /// Wallet-compatibility pin. The shipped Goblin wallet puts payments on the
+    /// wire two ways (`goblin/src/nostr/client/send.rs:216`): stock nostr-sdk
+    /// NIP-59 (NIP-44 v2) for a peer that advertises no v3, and its own v3
+    /// layering otherwise. Both are rebuilt here from nostr-sdk 0.44 and nip44
+    /// 0.3.2 directly, so any change to this crate that stops accepting what the
+    /// wallet actually sends fails HERE rather than in production.
+    #[tokio::test]
+    async fn wallet_gift_wraps_are_accepted_in_both_v2_and_v3() {
+        let payer = Keys::generate();
+        let till = Keys::generate();
+        let content = protocol::build_payment_content(PACK);
+
+        // v2: exactly what `Client::send_private_msg_to` builds.
+        let v2_rumor = EventBuilder::private_msg_rumor(till.public_key(), content.clone())
+            .tags(protocol::build_rumor_tags(Some("order-v2")))
+            .build(payer.public_key());
+        let v2 = EventBuilder::gift_wrap(&payer, &till.public_key(), v2_rumor, [])
+            .await
+            .expect("sdk v2 gift wrap");
+        // v3: the wallet's own layering. A distinct note keeps the two rumors
+        // distinct (same content + same second would collide on the rumor id).
+        let v3 = wallet_v3_wrap(
+            &payer,
+            &till.public_key(),
+            content,
+            protocol::build_rumor_tags(Some("order-v3")),
+        );
+
+        let ingest = Ingest::new(
+            till.clone(),
+            StubReceiver::new(vec![
+                Ok(ReceivedPayment {
+                    slate_id: "wallet-v2".into(),
+                    amount: 1,
+                    s2_armor: "BEGINSLATEPACK. r. ENDSLATEPACK.".into(),
+                }),
+                Ok(ReceivedPayment {
+                    slate_id: "wallet-v3".into(),
+                    amount: 2,
+                    s2_armor: "BEGINSLATEPACK. r. ENDSLATEPACK.".into(),
+                }),
+            ]),
+        );
+
+        for (label, wrap, expect_slate, expect_memo) in [
+            ("v2", v2, "wallet-v2", "order-v2"),
+            ("v3", v3, "wallet-v3", "order-v3"),
+        ] {
+            match ingest.handle_wrap(&wrap).await {
+                IngestOutcome::Received {
+                    slate_id, reply, ..
+                } => {
+                    assert_eq!(slate_id, expect_slate, "{label} wrap");
+                    assert_eq!(reply.payer, payer.public_key(), "{label} reply payer");
+                    assert_eq!(
+                        reply.from.public_key(),
+                        till.public_key(),
+                        "{label} reply identity"
+                    );
+                }
+                other => panic!("{label} wallet wrap rejected: {other:?}"),
+            }
+            assert_eq!(
+                ingest.receiver().last_memo.lock().unwrap().as_deref(),
+                Some(expect_memo),
+                "{label} memo must reach the wallet handoff"
+            );
+        }
+        assert_eq!(ingest.receiver().calls(), 2);
     }
 
     #[tokio::test]

@@ -407,11 +407,26 @@ pub fn run<R: BufRead, W: Write>(
     out.flush().map_err(io_err)?;
     let grin1_rail = core_setup::parse_yes_no(&read_line(&mut input)?, false);
 
-    // Generate the SERVICE bearer secrets (the operator never types or invents
-    // these). The wallet password is the operator's own choice, captured above.
-    let api_token = core_setup::gen_api_token();
-    let admin_token = core_setup::gen_admin_token();
-    let webhook_secret = core_setup::gen_webhook_secret();
+    // The SERVICE bearer secrets (the operator never types or invents these).
+    // On a --reconfigure the ones already in the env file are REUSED: rolling
+    // them would silently break the shop's configured API token and webhook
+    // secret. Only missing ones are generated, and only the NAMES kept are
+    // printed, never the values.
+    let secrets =
+        core_setup::resolve_service_secrets(fs::read_to_string(&paths.env_file).ok().as_deref());
+    if !secrets.preserved.is_empty() {
+        writeln!(
+            out,
+            "Keeping the existing service secrets: {}.",
+            secrets.preserved.join(", ")
+        )
+        .map_err(io_err)?;
+    }
+    let (api_token, admin_token, webhook_secret) = (
+        secrets.api_token,
+        secrets.admin_token,
+        secrets.webhook_secret,
+    );
 
     // Create (or, on reconfigure, reopen) the encrypted wallet. Creating
     // consumes the seed once: it lives encrypted at rest afterwards, never in
@@ -1282,7 +1297,8 @@ mod tests {
         let err = run(Cursor::new(answers), &mut out2, &opts).unwrap_err();
         assert!(err.contains("already exists"), "got {err}");
         // With --reconfigure it proceeds, reusing the existing wallet+password
-        // (no seed prompt) and rewriting the config. New tokens are generated.
+        // (no seed prompt) and rewriting the config. The service secrets are
+        // PRESERVED: the shop is already configured with them.
         let paths = Paths::resolve(Some(&dir.0));
         let token_before = fs::read_to_string(&paths.env_file).unwrap();
         let mut recfg = opts_with(&dir.0);
@@ -1298,7 +1314,43 @@ mod tests {
         assert!(transcript.contains("Restart mode: UNATTENDED"));
         let token_after = fs::read_to_string(&paths.env_file).unwrap();
         assert!(token_after.contains("GP_RATE_CURRENCIES=gbp"));
-        assert_ne!(token_before, token_after, "reconfigure regenerates config");
+        assert_ne!(token_before, token_after, "reconfigure rewrites config");
+        // ...but NOT the secrets the shop is already configured with. Rolling
+        // these on a reconfigure broke the connector silently.
+        assert!(
+            transcript.contains("Keeping the existing service secrets"),
+            "got {transcript}"
+        );
+        for key in ["GP_API_TOKEN", "GP_ADMIN_TOKEN", "GP_WEBHOOK_SECRET"] {
+            let line_of = |env: &str| {
+                env.lines()
+                    .find(|l| l.starts_with(&format!("{key}=")))
+                    .expect("{key} in env")
+                    .to_string()
+            };
+            assert_eq!(
+                line_of(&token_before),
+                line_of(&token_after),
+                "{key} must survive a reconfigure"
+            );
+        }
+        // The notice names the keys it kept and nothing more: no value of any
+        // preserved secret appears on that line. (The final WooCommerce paste
+        // block does print them, deliberately; this notice must not.)
+        let notice = transcript
+            .lines()
+            .find(|l| l.contains("Keeping the existing service secrets"))
+            .unwrap();
+        for key in ["GP_API_TOKEN", "GP_ADMIN_TOKEN", "GP_WEBHOOK_SECRET"] {
+            let value = token_after
+                .lines()
+                .find_map(|l| l.strip_prefix(&format!("{key}=")))
+                .unwrap();
+            assert!(
+                !notice.contains(value),
+                "{key} value leaked into the preserved-secrets notice"
+            );
+        }
     }
 
     #[test]

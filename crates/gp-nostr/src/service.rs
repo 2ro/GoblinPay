@@ -10,25 +10,22 @@
 //! configuration plus defaults.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use log::{error, info, warn};
 use nostr_sdk::{
-    Client, Event, EventBuilder, Filter, Keys, Kind, PublicKey, RelayPoolNotification, RelayUrl,
-    SubscriptionId, Tag, TagKind, Timestamp,
+    Client, Event, EventBuilder, Filter, Keys, Kind, PublicKey, RelayPoolNotification, RelayStatus,
+    RelayUrl, SubscriptionId, Tag, TagKind, Timestamp,
 };
 
 use crate::ingest::{Ingest, IngestOutcome, PendingReply};
-use crate::relays::MAX_DM_RELAYS;
+use crate::relays::{MAX_DM_RELAYS, MAX_HINTED_RELAYS};
 use crate::unix_time;
 use crate::wrap;
-use crate::{KeyDirectory, MasterDirectory, SlatepackReceiver};
+use crate::{KeyDirectory, MasterDirectory, SlatepackReceiver, LOOKBACK_SECS};
 
-/// Subscription look-back window: gift wrap timestamps are randomized up to
-/// 2 days into the past (NIP-59), use 3 (Goblin's constant). Cross-restart
-/// dedupe is the wallet's already-received guard plus the payment table.
-const LOOKBACK_SECS: i64 = 3 * 86_400;
 /// Catch-up fetch timeout.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Send dispatch timeout.
@@ -78,6 +75,47 @@ fn watch_filter(watched: impl IntoIterator<Item = PublicKey>, since_secs: u64) -
         .since(Timestamp::from_secs(since_secs))
 }
 
+/// A cheap, lock-free snapshot of relay connectivity, shared with the HTTP
+/// side so `/health` can answer "is the till actually reachable on Nostr?".
+///
+/// A till whose relays are all down still binds, still serves checkout pages
+/// and still reports `status: ok`, but cannot receive a single payment. The
+/// service refreshes this on its existing refresh tick; nothing else polls.
+#[derive(Debug, Default)]
+pub struct RelayHealth {
+    configured: AtomicUsize,
+    connected: AtomicUsize,
+    /// Unix seconds of the last refresh; 0 means never (no reading yet).
+    updated_at: AtomicI64,
+}
+
+impl RelayHealth {
+    /// A fresh, never-refreshed snapshot.
+    pub fn new() -> RelayHealth {
+        RelayHealth::default()
+    }
+
+    /// Record a reading (called from the service's refresh tick).
+    pub fn set(&self, configured: usize, connected: usize) {
+        self.configured.store(configured, Ordering::Relaxed);
+        self.connected.store(connected, Ordering::Relaxed);
+        self.updated_at.store(unix_time(), Ordering::Relaxed);
+    }
+
+    /// `(configured, connected)` as of the last refresh, or `None` while no
+    /// reading has been taken yet (so `/health` never reports a fabricated
+    /// "0 connected" in the seconds before the service's first tick).
+    pub fn snapshot(&self) -> Option<(usize, usize)> {
+        if self.updated_at.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        Some((
+            self.configured.load(Ordering::Relaxed),
+            self.connected.load(Ordering::Relaxed),
+        ))
+    }
+}
+
 /// Service configuration (already resolved from the environment).
 #[derive(Debug, Clone)]
 pub struct ServiceOptions {
@@ -85,6 +123,8 @@ pub struct ServiceOptions {
     pub relays: Vec<String>,
     /// Optional NIP-17 payment DMs (milestone 6, all off by default).
     pub notify: NotifyOptions,
+    /// Shared connectivity snapshot for `/health`, refreshed on the tick.
+    pub health: Arc<RelayHealth>,
 }
 
 /// Optional payment-notification DMs (milestone 6). Both are off by default.
@@ -237,6 +277,19 @@ pub async fn run<R: SlatepackReceiver>(
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             },
             _ = refresh.tick() => {
+                // Connectivity first: `refresh_subscription` returns early in
+                // the steady state (an unchanged watch set), which is exactly
+                // when a monitor most wants a fresh reading.
+                snapshot_relay_health(&client, &opts.relays, &opts.health).await;
+                // Then re-run wraps whose receive failed transiently. The relay
+                // pool will not re-offer them, so this is the only path back.
+                for event in ingest.due_retries(unix_time()) {
+                    info!(
+                        "nostr: retrying wrap {}… after a transient receive failure",
+                        &event.id.to_hex()[..8]
+                    );
+                    handle(&client, &ingest, &keys, &opts.notify, &event, &opts.relays).await;
+                }
                 refresh_subscription(
                     &client,
                     &ingest,
@@ -251,6 +304,30 @@ pub async fn run<R: SlatepackReceiver>(
         }
     }
     error!("nostr: notification stream closed; service stopped");
+}
+
+/// Count how many of our OWN configured relays are connected and publish the
+/// reading. Deliberately scoped to `configured` rather than the whole pool:
+/// `connect_relays` dials a payer's advertised relays for reply fan-out, and
+/// counting those would make "connected" drift above the set the till actually
+/// listens on.
+async fn snapshot_relay_health(client: &Client, configured: &[String], health: &RelayHealth) {
+    let mut connected = 0usize;
+    for url in configured {
+        if let Ok(relay) = client.relay(url).await {
+            if relay.status() == RelayStatus::Connected {
+                connected += 1;
+            }
+        }
+    }
+    if connected == 0 && !configured.is_empty() {
+        warn!(
+            "nostr: none of the {} configured relay(s) are connected; \
+             the till cannot receive payments over Nostr right now",
+            configured.len()
+        );
+    }
+    health.set(configured.len(), connected);
 }
 
 /// One live refresh pass: diff the current watched set against the active
@@ -386,12 +463,7 @@ async fn handle<R: SlatepackReceiver>(
 /// method from the same 10050 (absent = v2). Returns true when a relay
 /// accepted the event.
 async fn deliver_reply(client: &Client, reply: &PendingReply, own_relays: &[String]) -> bool {
-    let (mut targets, encryption) = recipient_hints(client, &reply.payer, own_relays).await;
-    if targets.is_empty() {
-        // NIP-17 pragmatic fallback: the wrap reached us through a shared
-        // relay, so our own set is the best remaining route.
-        targets = own_relays.to_vec();
-    }
+    let (hinted, encryption) = recipient_hints(client, &reply.payer, own_relays).await;
     let version = wrap::choose_version(encryption.as_deref());
     let event = match wrap::gift_wrap(&reply.from, &reply.payer, reply.rumor.clone(), version) {
         Ok(event) => event,
@@ -401,8 +473,13 @@ async fn deliver_reply(client: &Client, reply: &PendingReply, own_relays: &[Stri
         }
     };
     // Dial any target relays we don't already hold (the payer's relays may
-    // differ from ours), then publish to exactly that set.
-    connect_relays(client, &targets).await;
+    // differ from ours), then publish to exactly what the pool holds.
+    let mut targets = connect_relays(client, &hinted, own_relays).await;
+    if targets.is_empty() {
+        // NIP-17 pragmatic fallback: the wrap reached us through a shared
+        // relay, so our own set is the best remaining route.
+        targets = own_relays.to_vec();
+    }
     match tokio::time::timeout(SEND_TIMEOUT, client.send_event_to(&targets, &event)).await {
         Ok(Ok(output)) => {
             info!(
@@ -437,10 +514,7 @@ async fn send_dm(
     let rumor = EventBuilder::new(Kind::PrivateDirectMessage, content)
         .tags([Tag::public_key(*to)])
         .build(from.public_key());
-    let (mut targets, encryption) = recipient_hints(client, to, own_relays).await;
-    if targets.is_empty() {
-        targets = own_relays.to_vec();
-    }
+    let (hinted, encryption) = recipient_hints(client, to, own_relays).await;
     let version = wrap::choose_version(encryption.as_deref());
     let event = match wrap::gift_wrap(from, to, rumor, version) {
         Ok(event) => event,
@@ -449,7 +523,10 @@ async fn send_dm(
             return;
         }
     };
-    connect_relays(client, &targets).await;
+    let mut targets = connect_relays(client, &hinted, own_relays).await;
+    if targets.is_empty() {
+        targets = own_relays.to_vec();
+    }
     match tokio::time::timeout(SEND_TIMEOUT, client.send_event_to(&targets, &event)).await {
         Ok(Ok(_)) => info!("nostr: notify DM sent to {}…", &to.to_hex()[..8]),
         Ok(Err(e)) => warn!("nostr: notify DM send failed: {e}"),
@@ -480,7 +557,26 @@ async fn recipient_hints(
             return (vec![], None);
         }
     };
-    let Some(event) = events.first() else {
+    hints_from(events.iter(), payer)
+}
+
+/// The relay hints and encryption capability a payer advertises, read from a
+/// kind 10050 THEY authored.
+///
+/// A relay answers a REQ with whatever it likes, so the author check is what
+/// makes this the payer's own advice rather than any event the relay chose to
+/// return: without it a relay could redirect a reply (still end-to-end
+/// encrypted to the payer, but delivered where the relay says) and downgrade
+/// its encryption to v2 by supplying its own capability tag. Non-WebSocket
+/// URLs are dropped: they cannot be a relay.
+fn hints_from<'a>(
+    events: impl IntoIterator<Item = &'a Event>,
+    payer: &PublicKey,
+) -> (Vec<String>, Option<String>) {
+    let Some(event) = events
+        .into_iter()
+        .find(|e| e.pubkey == *payer && e.kind == Kind::InboxRelays)
+    else {
         return (vec![], None);
     };
     let mut relays = vec![];
@@ -488,8 +584,9 @@ async fn recipient_hints(
         let parts = tag.as_slice();
         if parts.first().map(|s| s.as_str()) == Some("relay") {
             if let Some(url) = parts.get(1) {
-                if relays.len() < MAX_DM_RELAYS {
-                    relays.push(url.trim_end_matches('/').to_string());
+                let url = url.trim_end_matches('/').to_string();
+                if relays.len() < MAX_DM_RELAYS && gp_core::config::is_relay_url(&url) {
+                    relays.push(url);
                 }
             }
         }
@@ -565,11 +662,29 @@ async fn reconcile<R: SlatepackReceiver>(
     }
 }
 
-/// Add + dial every relay in `urls` so a targeted send reaches relays we
-/// don't already hold (Goblin's `connect_relays`: idempotent add, short
-/// bounded dial, concurrent so one dead relay doesn't stall the rest).
-async fn connect_relays(client: &Client, urls: &[String]) {
-    let dials = urls.iter().map(|url| {
+/// Add + dial the relays in `urls` so a targeted send reaches relays we don't
+/// already hold (Goblin's `connect_relays`: idempotent add, short bounded dial,
+/// concurrent so one dead relay doesn't stall the rest), and report which of
+/// them the pool actually ended up holding.
+///
+/// Two bounds beyond Goblin's version. A payer-advertised relay only enters the
+/// pool while there is room in a fixed budget of `own_relays + MAX_HINTED_RELAYS`
+/// (nothing ever removes a relay, so an unbounded add grew the pool and its live
+/// connections with every new payer), and our own configured relays are always
+/// dialed and never counted against that budget: a hint can add reach, never
+/// take it away.
+///
+/// Returning the in-pool subset is load bearing, not tidiness:
+/// `send_event_to` fails the WHOLE publish with `RelayNotFound` if any single
+/// target is missing from the pool (nostr-relay-pool 0.44.3 `pool/mod.rs:763`),
+/// so a hint that could not be added must not stay in the target list.
+async fn connect_relays(client: &Client, urls: &[String], own_relays: &[String]) -> Vec<String> {
+    let pool = client.relays().await;
+    let in_pool = |url: &str| RelayUrl::parse(url).is_ok_and(|parsed| pool.contains_key(&parsed));
+    let budget = (own_relays.len() + MAX_HINTED_RELAYS).saturating_sub(pool.len());
+    let wanted = plan_dials(urls, own_relays, in_pool, budget);
+
+    let dials = wanted.iter().map(|url| {
         let url = url.clone();
         async move {
             let _ = client.add_relay(&url).await;
@@ -579,6 +694,53 @@ async fn connect_relays(client: &Client, urls: &[String]) {
         }
     });
     async_wsocket::futures_util::future::join_all(dials).await;
+
+    let pool = client.relays().await;
+    wanted
+        .into_iter()
+        .filter(|url| RelayUrl::parse(url).is_ok_and(|parsed| pool.contains_key(&parsed)))
+        .collect()
+}
+
+/// Which of `urls` to dial, given how many NEW relays the pool may still take.
+/// Pure, so the bound is unit-testable without a relay pool.
+///
+/// Our own relays and anything the pool already holds are always kept and cost
+/// nothing: the budget exists to stop payer hints accumulating, never to drop
+/// the set the till listens on. A hint that is not a WebSocket URL is skipped,
+/// and once the budget is spent further NEW hints are skipped individually
+/// (not `break`, which would also discard our own relays listed after them).
+fn plan_dials(
+    urls: &[String],
+    own_relays: &[String],
+    in_pool: impl Fn(&str) -> bool,
+    mut budget: usize,
+) -> Vec<String> {
+    let mut wanted: Vec<String> = Vec::with_capacity(urls.len());
+    let mut refused = 0usize;
+    for url in urls {
+        if own_relays.iter().any(|own| own == url) || in_pool(url) {
+            wanted.push(url.clone());
+            continue;
+        }
+        if !gp_core::config::is_relay_url(url) {
+            warn!("nostr: ignoring a relay hint that is not a WebSocket URL");
+            continue;
+        }
+        if budget == 0 {
+            refused += 1;
+            continue;
+        }
+        budget -= 1;
+        wanted.push(url.clone());
+    }
+    if refused > 0 {
+        warn!(
+            "nostr: relay pool budget reached, ignored {refused} payer relay hint(s) \
+             (own relays are unaffected)"
+        );
+    }
+    wanted
 }
 
 #[cfg(test)]
@@ -597,6 +759,167 @@ mod tests {
             payer_receipt_text(1_000_000_000),
             "[GoblinPay] Payment of 1 GRIN received. Thank you."
         );
+    }
+
+    /// The premise the in-process retry queue rests on: the SDK's relay pool
+    /// does NOT re-deliver an event it has already stored, so a wrap whose
+    /// receive failed transiently is never offered again.
+    ///
+    /// `relay/inner.rs:1211` matches on `database().check_id(&event.id)` and
+    /// the `DatabaseEventStatus::Saved` arm is empty: it falls straight through
+    /// WITHOUT calling `send_notification`, so no `RelayPoolNotification::Event`
+    /// is emitted on re-receipt. This test pins the other half, that the default
+    /// client database really does report `Saved` for an event it has seen (its
+    /// default `MemoryDatabase` is an id tracker, `nostr-database-0.44.0`
+    /// `memory.rs:110`, and stores no event bodies).
+    #[tokio::test]
+    async fn the_relay_pool_does_not_re_deliver_an_event_it_has_stored() {
+        let client = Client::builder().build();
+        let db = client.database();
+        let event = EventBuilder::new(Kind::TextNote, "once")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+
+        assert_eq!(
+            db.check_id(&event.id).await.unwrap(),
+            nostr_sdk::prelude::DatabaseEventStatus::NotExistent,
+            "unseen events are new, so the first delivery notifies"
+        );
+        db.save_event(&event).await.unwrap();
+        assert_eq!(
+            db.check_id(&event.id).await.unwrap(),
+            nostr_sdk::prelude::DatabaseEventStatus::Saved,
+            "a stored event reports Saved, the branch that skips the notification"
+        );
+        // Saving again is not an error and does not change the verdict.
+        db.save_event(&event).await.unwrap();
+        assert_eq!(
+            db.check_id(&event.id).await.unwrap(),
+            nostr_sdk::prelude::DatabaseEventStatus::Saved
+        );
+    }
+
+    /// Build a kind 10050 with the given relay tags, signed by `author`.
+    fn inbox(author: &Keys, relays: &[&str]) -> Event {
+        let mut tags: Vec<Tag> = relays
+            .iter()
+            .map(|r| Tag::custom(TagKind::custom("relay"), [r.to_string()]))
+            .collect();
+        tags.push(wrap::capability_tag());
+        EventBuilder::new(Kind::InboxRelays, "")
+            .tags(tags)
+            .sign_with_keys(author)
+            .unwrap()
+    }
+
+    #[test]
+    fn relay_hints_are_only_taken_from_the_payer_s_own_event() {
+        let payer = Keys::generate();
+        let stranger = Keys::generate();
+
+        // The payer's own list is used, capped at MAX_DM_RELAYS.
+        let mine = inbox(
+            &payer,
+            &[
+                "wss://a.example",
+                "wss://b.example/",
+                "wss://c.example",
+                "wss://d.example",
+            ],
+        );
+        let (relays, encryption) = hints_from([&mine], &payer.public_key());
+        assert_eq!(
+            relays,
+            vec![
+                "wss://a.example".to_string(),
+                "wss://b.example".to_string(),
+                "wss://c.example".to_string(),
+            ],
+            "capped at {MAX_DM_RELAYS} and trailing slashes trimmed"
+        );
+        assert_eq!(encryption.as_deref(), Some(wrap::ENCRYPTION_CAPABILITIES));
+
+        // A relay can answer a REQ with anything. An event by someone else is
+        // NOT the payer's advice: taking it would let a relay redirect the
+        // reply and downgrade its encryption with its own capability tag.
+        let theirs = inbox(&stranger, &["wss://attacker.example"]);
+        let (relays, encryption) = hints_from([&theirs], &payer.public_key());
+        assert!(relays.is_empty(), "a stranger's 10050 is ignored");
+        assert_eq!(encryption, None);
+        assert_eq!(
+            wrap::choose_version(encryption.as_deref()),
+            wrap::WrapVersion::V2,
+            "and the fallback is the mandatory baseline, not a downgrade"
+        );
+
+        // Non-WebSocket hints are dropped; they cannot be a relay.
+        let junk = inbox(
+            &payer,
+            &["https://not-a-relay.example", "wss://good.example"],
+        );
+        let (relays, _) = hints_from([&junk], &payer.public_key());
+        assert_eq!(relays, vec!["wss://good.example".to_string()]);
+    }
+
+    #[test]
+    fn payer_relay_hints_are_capped_and_never_displace_our_own() {
+        let own: Vec<String> = vec!["wss://ours-a.example".into(), "wss://ours-b.example".into()];
+        let none_in_pool = |_: &str| false;
+
+        // Room for MAX_HINTED_RELAYS new hints, and no more.
+        let hints: Vec<String> = (0..MAX_HINTED_RELAYS + 4)
+            .map(|i| format!("wss://payer-{i}.example"))
+            .collect();
+        let planned = plan_dials(&hints, &own, none_in_pool, MAX_HINTED_RELAYS);
+        assert_eq!(planned.len(), MAX_HINTED_RELAYS, "hints are capped");
+        assert_eq!(planned[0], "wss://payer-0.example");
+
+        // Budget spent: our own relays and anything already dialed still go
+        // through, and they are kept even when listed AFTER a refused hint.
+        let mixed: Vec<String> = vec![
+            "wss://payer-x.example".into(), // new, refused (budget 0)
+            "wss://ours-a.example".into(),  // ours, always kept
+            "wss://known.example".into(),   // already in the pool, free
+            "wss://payer-y.example".into(), // new, refused
+        ];
+        let in_pool = |url: &str| url == "wss://known.example";
+        assert_eq!(
+            plan_dials(&mixed, &own, in_pool, 0),
+            vec![
+                "wss://ours-a.example".to_string(),
+                "wss://known.example".to_string(),
+            ],
+            "a refused hint must not swallow the entries after it"
+        );
+
+        // Non-WebSocket hints never consume budget and are never dialed.
+        let junk: Vec<String> = vec![
+            "https://not-a-relay.example".into(),
+            "wss://payer-z.example".into(),
+        ];
+        assert_eq!(
+            plan_dials(&junk, &own, none_in_pool, 1),
+            vec!["wss://payer-z.example".to_string()]
+        );
+    }
+
+    #[test]
+    fn relay_health_reports_nothing_until_it_is_refreshed() {
+        // Before the first tick there is no reading, so `/health` stays silent
+        // rather than claiming "0 of 2 connected" during boot.
+        let health = RelayHealth::new();
+        assert_eq!(health.snapshot(), None);
+
+        health.set(2, 1);
+        assert_eq!(health.snapshot(), Some((2, 1)));
+        // An all-down till is a real reading, not an absent one.
+        health.set(2, 0);
+        assert_eq!(health.snapshot(), Some((2, 0)));
+        // Shared across threads: the service writes, the HTTP side reads.
+        let shared = Arc::new(health);
+        let writer = Arc::clone(&shared);
+        std::thread::spawn(move || writer.set(3, 3)).join().unwrap();
+        assert_eq!(shared.snapshot(), Some((3, 3)));
     }
 
     fn set(keys: &[&Keys]) -> HashSet<PublicKey> {

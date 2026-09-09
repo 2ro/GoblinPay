@@ -112,6 +112,65 @@ pub fn gen_webhook_secret() -> String {
     prefixed_secret("whsec_")
 }
 
+/// The three service secrets a setup run needs, plus which of them came from an
+/// existing configuration rather than the CSPRNG.
+#[derive(Debug, Clone)]
+pub struct ServiceSecrets {
+    /// Connector API bearer token (`GP_API_TOKEN`).
+    pub api_token: String,
+    /// Admin bearer token (`GP_ADMIN_TOKEN`).
+    pub admin_token: String,
+    /// Webhook HMAC secret (`GP_WEBHOOK_SECRET`).
+    pub webhook_secret: String,
+    /// Env var NAMES reused from the existing file, in a stable order. Names
+    /// only, on purpose: the wizard reports what it kept without reprinting a
+    /// live secret to a terminal (and its scrollback).
+    pub preserved: Vec<&'static str>,
+}
+
+/// Resolve the service secrets for a setup run: reuse whatever the existing
+/// configuration already sets, generate only what is missing.
+///
+/// `existing_env` is the current env file's contents on a `--reconfigure`, and
+/// `None` on a fresh box. Regenerating these on a reconfigure quietly breaks
+/// every integration the till already has: the shop's configured API token
+/// stops being accepted, its webhook secret stops verifying the HMAC (so
+/// deliveries are rejected until they dead-letter), and the operator's admin
+/// token stops working, all with nothing in the log to explain it. An operator
+/// re-running the wizard to change a node URL or a currency has no reason to
+/// expect that.
+///
+/// A key present but empty counts as missing, so a commented-out or blanked
+/// entry is filled in rather than reused as an empty secret.
+pub fn resolve_service_secrets(existing_env: Option<&str>) -> ServiceSecrets {
+    let existing: std::collections::HashMap<String, String> = existing_env
+        .map(|contents| parse_env_file(contents).into_iter().collect())
+        .unwrap_or_default();
+    let mut preserved: Vec<&'static str> = Vec::new();
+    let mut resolve = |key: &'static str, generate: fn() -> String| -> String {
+        match existing
+            .get(key)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            Some(value) => {
+                preserved.push(key);
+                value.to_string()
+            }
+            None => generate(),
+        }
+    };
+    let api_token = resolve("GP_API_TOKEN", gen_api_token);
+    let admin_token = resolve("GP_ADMIN_TOKEN", gen_admin_token);
+    let webhook_secret = resolve("GP_WEBHOOK_SECRET", gen_webhook_secret);
+    ServiceSecrets {
+        api_token,
+        admin_token,
+        webhook_secret,
+        preserved,
+    }
+}
+
 /// Validate an operator-chosen wallet password. grin-wallet-faithful: the
 /// operator picks their own password (it encrypts the seed at rest), so the
 /// only hard rule is that it must not be empty. Returns the reason on rejection.
@@ -572,6 +631,87 @@ mod tests {
         // CSPRNG: two draws must differ.
         assert_ne!(gen_api_token(), gen_api_token());
         assert_ne!(gen_entropy_32(), gen_entropy_32());
+    }
+
+    #[test]
+    fn reconfigure_preserves_existing_service_secrets() {
+        // A fresh box: nothing to preserve, all three generated.
+        let fresh = resolve_service_secrets(None);
+        assert!(fresh.preserved.is_empty());
+        assert!(fresh.api_token.starts_with("gp_live_"));
+        assert!(fresh.admin_token.starts_with("gpadm_"));
+        assert!(fresh.webhook_secret.starts_with("whsec_"));
+
+        // A reconfigure over the wizard's own output keeps all three verbatim.
+        // These are the values the shop plugin is already configured with.
+        let env = format!(
+            "# GoblinPay configuration\n\
+             GP_BIND=127.0.0.1:8088\n\
+             GP_API_TOKEN={}\n\
+             GP_ADMIN_TOKEN={}\n\
+             GP_WEBHOOK_SECRET={}\n",
+            fresh.api_token, fresh.admin_token, fresh.webhook_secret
+        );
+        let again = resolve_service_secrets(Some(&env));
+        assert_eq!(again.api_token, fresh.api_token);
+        assert_eq!(again.admin_token, fresh.admin_token);
+        assert_eq!(again.webhook_secret, fresh.webhook_secret);
+        assert_eq!(
+            again.preserved,
+            vec!["GP_API_TOKEN", "GP_ADMIN_TOKEN", "GP_WEBHOOK_SECRET"]
+        );
+
+        // Missing and blank entries are filled in; the ones present stay.
+        let partial = format!(
+            "GP_API_TOKEN={}\nGP_WEBHOOK_SECRET=\n#GP_ADMIN_TOKEN=commented-out\n",
+            fresh.api_token
+        );
+        let mixed = resolve_service_secrets(Some(&partial));
+        assert_eq!(mixed.api_token, fresh.api_token);
+        assert_eq!(mixed.preserved, vec!["GP_API_TOKEN"]);
+        assert!(mixed.admin_token.starts_with("gpadm_"));
+        assert_ne!(mixed.admin_token, fresh.admin_token);
+        assert!(mixed.webhook_secret.starts_with("whsec_"));
+        assert_ne!(mixed.webhook_secret, fresh.webhook_secret);
+    }
+
+    #[test]
+    fn secrets_survive_a_round_trip_through_a_real_env_file() {
+        // The path the wizard actually takes: render an env file, write it,
+        // read it back on the reconfigure. The rendered secrets must come back
+        // byte for byte (this is what the shop plugin is configured with).
+        let dir = std::env::temp_dir().join(format!("gp-secrets-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gp-server.env");
+
+        let first = resolve_service_secrets(None);
+        let params = SetupParams {
+            bind: DEFAULT_BIND.to_string(),
+            public_url: "https://pay.example".into(),
+            webhook_url: "https://shop.example/hook".into(),
+            node_url: "https://node.example".into(),
+            relays: vec!["wss://relay.example".into()],
+            currencies: vec!["usd".into()],
+            grin1_rail: false,
+            api_token: first.api_token.clone(),
+            admin_token: first.admin_token.clone(),
+            webhook_secret: first.webhook_secret.clone(),
+            data_dir: "/var/lib/goblinpay".into(),
+            db_path: "/var/lib/goblinpay/gp.db".into(),
+            wallet_password_file: "/run/goblinpay/wallet_password".into(),
+            restart_mode: RestartMode::Unattended,
+            unattended_encrypted: true,
+        };
+        std::fs::write(&path, params.render_env()).unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let second = resolve_service_secrets(Some(&contents));
+        assert_eq!(second.api_token, first.api_token);
+        assert_eq!(second.admin_token, first.admin_token);
+        assert_eq!(second.webhook_secret, first.webhook_secret);
+        assert_eq!(second.preserved.len(), 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

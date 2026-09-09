@@ -34,7 +34,15 @@ export interface GoblinPayInvoice {
   npub?: string
   qr_svg?: string
   amount?: string
-  /** GoblinPay invoice lifecycle: `open` | `paid` | `expired`. */
+  /** GoblinPay invoice lifecycle: `open` | `paid` | `confirmed` | `expired`. */
   status: string
+  /**
+   * The paying kernel's live on-chain depth (0 until it lands). Present on
+   * every invoice read, so a storefront or an operator can show a received
+   * payment maturing instead of an order that appears stuck.
+   */
+  confirmations?: number
+  /** The depth GoblinPay requires before it calls the invoice `confirmed`. */
+  confirmations_required?: number
   order_ref?: string
 }

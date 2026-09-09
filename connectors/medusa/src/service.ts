@@ -14,7 +14,11 @@
  * funds are in hand off-chain but the payer may never broadcast the finalized
  * transaction, so it is not settlement and is acknowledged without acting, the
  * same rule the WooCommerce connector follows. Status polling
- * (`authorizePayment`, `getPaymentStatus`) is the webhook-miss fallback.
+ * (`authorizePayment`, `getPaymentStatus`) is the webhook-miss fallback; it maps
+ * an `expired` invoice to a canceled session, and `capturePayment` refuses one,
+ * so an order that was never paid can never be marked captured. Every polled
+ * invoice carries `confirmations` / `confirmations_required`, which stay on the
+ * session data for the storefront to show a received payment maturing.
  *
  * Refunds are NOT automated: GoblinPay is receive-only (it never sends Grin), so
  * `refundPayment` throws. A refund is a manual, out-of-band Grin send by the
@@ -259,7 +263,42 @@ class GoblinPayProviderService extends AbstractPaymentProvider<GoblinPayOptions>
   ): Promise<CapturePaymentOutput> {
     // GoblinPay is receive-only: once the payment is received the funds are
     // already in the merchant wallet, so capture is a no-op acknowledgement.
-    return { data: input.data ?? {} }
+    //
+    // An EXPIRED invoice is the one case where that acknowledgement would be a
+    // lie: nothing was ever received, and GoblinPay closed the invoice so
+    // nothing can be. Refuse rather than mark an unpaid order captured. Only an
+    // `open` invoice ever expires (gp-core/src/invoice.rs:459-462), so this can
+    // never block a real payment.
+    const stored = (input.data?.goblinpay ?? {}) as GoblinPayInvoice
+    if (stored.status === "expired") {
+      throw new MedusaError(
+        MedusaError.Types.NOT_ALLOWED,
+        "GoblinPay invoice expired without payment; it cannot be captured"
+      )
+    }
+    // The stored copy can be stale, so confirm against the server. A GoblinPay
+    // that is unreachable must not fail a capture whose money is already in
+    // hand, so only a definite `expired` refuses.
+    try {
+      const invoice = await this.fetchInvoice(input.data)
+      if (invoice.status === "expired") {
+        throw new MedusaError(
+          MedusaError.Types.NOT_ALLOWED,
+          "GoblinPay invoice expired without payment; it cannot be captured"
+        )
+      }
+      return { data: { ...input.data, goblinpay: invoice } }
+    } catch (e) {
+      if (e instanceof MedusaError && e.type === MedusaError.Types.NOT_ALLOWED) {
+        throw e
+      }
+      this.logger_.warn(
+        `GoblinPay: could not re-read the invoice before capture (${
+          e instanceof Error ? e.message : String(e)
+        }); acknowledging with the stored session data`
+      )
+      return { data: input.data ?? {} }
+    }
   }
 
   async cancelPayment(

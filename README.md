@@ -78,9 +78,12 @@ sudo gp-server setup
 ```
 
 On a fresh box you can skip even that: running `gp-server` with no configuration
-in an interactive terminal starts this same wizard automatically and then boots
-from what it wrote. An already-configured install (or a non-interactive run) is
-unaffected and starts headless exactly as before.
+in an interactive terminal starts this same wizard automatically. In unattended
+restart mode it then boots in process from what it wrote; a manual-mode setup
+deliberately leaves no wallet password on disk, so there is nothing to open
+unattended and it prints how to start the service instead and exits. An
+already-configured install (or a non-interactive run) is unaffected and starts
+headless exactly as before.
 
 It asks a few questions, each with a default. It is grin-wallet-faithful about
 the two things that are yours to own — your wallet password and your seed:
@@ -158,11 +161,16 @@ default. Both are honest about their trade-off:
   hands-on restarts.
 
 Re-running is safe: the wizard refuses to overwrite an existing wallet or config
-unless you pass `--reconfigure` (which keeps the existing seed and password — the
-money — untouched and never re-prompts for them, only rewriting the config/tokens).
-A reconfigure keeps your current restart mode by default: the prompt shows it as
-the default so pressing Enter preserves it, and you pick the other option to
-switch.
+unless you pass `--reconfigure`. A reconfigure re-prompts the non-secret settings
+(URLs, bind address, node, currencies, restart mode) and preserves the money and
+the existing service secrets: the wallet seed and your wallet password are never
+regenerated, and the API token, admin token and webhook secret already in the env
+file are kept, so a reconfigure does not invalidate the values you pasted into
+your store. It asks for your existing wallet password only when the till keeps no
+readable copy of it (encrypted or manual mode), because it has to reopen the
+wallet to continue; see *Secrets and the wallet seed*. A reconfigure keeps your
+current restart mode by default: the prompt shows it as the default so pressing
+Enter preserves it, and you pick the other option to switch.
 Flags: `--reconfigure`, `--prefix DIR` (write under a prefix instead of `/`),
 `--node URL` (skip the node probe), `--batch` (read scripted answers from a
 non-terminal stdin).
@@ -186,7 +194,7 @@ Everything is environment variables, defaults are safe for local use.
 | `GP_CHAIN` | `mainnet` | Grin network: `mainnet` or `testnet` |
 | `GP_RELAY_MODE` | `bundled` | `bundled` (GoblinPay runs its own co-located relay) or `external` |
 | `GP_BUNDLED_RELAY_URL` | `ws://127.0.0.1:7777` | In `bundled` mode, the self-contained relay GoblinPay dials AND advertises in the checkout `nprofile`; set to the relay's public `wss://` URL in production |
-| `GP_RELAYS` | `relay.floonet.dev, offchain.pub` | Relay URLs (comma separated): redundancy in `bundled` mode, the whole set in `external` mode. The wizard writes this vetted pair; unset in the environment it defaults empty (fine in `bundled` mode, which uses the co-located relay) |
+| `GP_RELAYS` | unset (empty) | Relay URLs (comma separated): redundancy in `bundled` mode, the whole set in `external` mode. Empty is fine in `bundled` mode, which uses the co-located relay, and is refused in `external` mode. The wizard does not leave it empty: it writes the vetted pair `wss://relay.floonet.dev, wss://offchain.pub` |
 | `GP_INGEST` | `on` | Nostr ingest service (`off` = HTTP surface only, for debugging) |
 | `GP_CHECKOUT_METHODS` | `nostr,slatepack` | Which payment methods the hosted `/pay/<token>` page shows: comma list of `nostr` (Goblin Wallet) and `slatepack` (manual paste). Unset = both. Unknown tokens are ignored; an empty result falls back to both |
 | `GP_CONFIRMATIONS` | `10` | House standard: on-chain depth the paying kernel must reach before an invoice flips from `paid` to `confirmed` |
@@ -376,26 +384,17 @@ variant works for `GP_API_TOKEN`, `GP_ADMIN_TOKEN`, and `GP_WEBHOOK_SECRET` too.
 GoblinPay POSTs `application/json` to `GP_WEBHOOK_URL` twice over a payment's
 life: `payment.received` when the payment first lands (status `received`), then
 `payment.confirmed` once the paying kernel reaches `GP_CONFIRMATIONS` depth
-(status `confirmed`, with `confirmed_height` populated). Both share the same
-envelope:
+(status `confirmed`, with `confirmed_height` and `confirmations` populated).
+Both share one envelope. Headers:
+`X-GoblinPay-Signature: sha256=<hex(HMAC-SHA256(secret, raw_body))>` and
+`X-GoblinPay-Delivery: <event_id>`. Verify by recomputing the HMAC over the
+exact received bytes (constant-time), dedupe on the delivery id, settle on
+`payment.confirmed`, and ignore any field you do not recognise. Deliveries are
+persisted and retried with exponential backoff.
 
-```json
-{
-  "event_id": "5f3c...",              // 128-bit hex, the idempotency key
-  "event_type": "payment.received",
-  "created_at": "2026-07-01T12:00:00Z",
-  "payment": {
-    "slate_id": "...", "amount": 2000000000, "amount_grin": "2",
-    "status": "received", "payer": "...hex...", "confirmed_height": null
-  },
-  "invoice_id": "...", "order_ref": "order-42", "user_id": "..."
-}
-```
-
-Headers: `X-GoblinPay-Signature: sha256=<hex(HMAC-SHA256(secret, raw_body))>`
-and `X-GoblinPay-Delivery: <event_id>`. Verify by recomputing the HMAC over the
-exact received bytes (constant-time) and dedupe on the delivery id. Deliveries
-are persisted and retried with exponential backoff.
+The envelope is documented field by field, once, in
+[`docs/api-integration.md`](docs/api-integration.md#the-webhook-contract). That
+is the canonical copy; treat it as the contract.
 
 ## Run
 
@@ -421,9 +420,14 @@ create-invoice + signed-webhook contract:
 - `connectors/medusa` - a Medusa v2 payment-module provider.
 - The generic REST connector is built in: `POST /invoice` plus the webhook.
 
-Both the WooCommerce and Medusa connectors act on the `payment.confirmed`
-webhook idempotently: they complete the order if it is not already complete,
-and otherwise just note the confirmation.
+Both connectors settle on `payment.confirmed` only, and both dedupe on
+`event_id` so a retried delivery is a no-op. A `payment.received` delivery is
+acknowledged without settling, because the payer may never broadcast the
+finalized transaction. What "settle" means differs by platform: the WooCommerce
+gateway completes the WooCommerce order (or, if it is already complete, just
+adds an order note), while the Medusa provider is a payment-module provider and
+captures the payment session, which is what lets Medusa's own order workflow
+proceed.
 
 Quick starts and the integrator guide live in `docs/`:
 
@@ -447,6 +451,11 @@ Refunds are unsupported/manual everywhere (GoblinPay is receive-only).
 offering to run `gp-server setup`), and a `docker-compose.yml` that brings up
 the server, the bundled relay, and an auto-HTTPS Caddy proxy. CI (`.github` /
 `.gitea` workflows) runs fmt, clippy, and tests. See `deploy/` for details.
+
+[`docs/ops-reference-till.md`](docs/ops-reference-till.md) documents how the
+maintained reference till is actually laid out (unit name, paths, port, the
+encrypted-credential drop-in, its stripped build workspace, and the rollback
+pattern), for when an ops note and this repo's defaults disagree.
 
 `deploy/package-woocommerce.sh` builds `goblinpay-woocommerce.zip` (a single
 top-level `goblinpay-woocommerce/` folder) for a WooCommerce release, so the

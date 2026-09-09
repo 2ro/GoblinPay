@@ -123,37 +123,64 @@ open ──▶ paid ──▶ confirmed
 Polling `GET /invoice/{id}` server-to-server is a complete integration on its
 own if you would rather not run a webhook endpoint.
 
-## The `payment.confirmed` webhook
+## The webhook contract
+
+This is the canonical description of the webhook envelope. Everything else in
+the repo links here.
 
 If you set `GP_WEBHOOK_URL` (and `GP_WEBHOOK_SECRET`, which the wizard
 generates), GoblinPay POSTs a signed JSON event to your endpoint on each
-payment event so you do not have to poll.
-
-Body:
+payment event so you do not have to poll. It fires twice over a payment's life:
+`payment.received` when the payment first lands, then `payment.confirmed` once
+the paying kernel reaches `GP_CONFIRMATIONS` depth on chain. Both events use the
+same envelope, and every field below is always present (nullable ones are sent
+as `null`, never omitted):
 
 ```json
 {
   "event_id": "5f3c…",
   "event_type": "payment.confirmed",
+  "created_at": "2026-07-01T12:00:00Z",
   "payment": {
     "slate_id": "…",
     "amount": 2000000000,
     "amount_grin": "2",
     "status": "confirmed",
+    "payer": "…hex…",
+    "confirmed_height": 2451337,
     "confirmations": 10
   },
   "invoice_id": "…",
-  "order_ref": "order-1042"
+  "order_ref": "order-1042",
+  "user_id": null
 }
 ```
 
-- `event_type` is `payment.received` (first seen) or `payment.confirmed`
-  (reached `GP_CONFIRMATIONS`). **Grant on `payment.confirmed`.**
-- `payment.amount` is **base units (nanogrin)**; `payment.amount_grin` is the
-  human decimal string. `payment.confirmations` is present only on
-  `payment.confirmed`.
-- `invoice_id` / `order_ref` tie the event back to your order (`invoice_id`
-  may be null for an unmatched payment).
+| Field | Type | Notes |
+|---|---|---|
+| `event_id` | string | 128-bit hex. The idempotency key, repeated verbatim on every retry of this event, and also sent as the `X-GoblinPay-Delivery` header. |
+| `event_type` | string | `payment.received` or `payment.confirmed`. **Grant on `payment.confirmed`.** |
+| `created_at` | string | RFC 3339 / ISO 8601 UTC timestamp of when the event was built. |
+| `payment.slate_id` | string | The Grin slate id of the paying transaction. |
+| `payment.amount` | integer | **Base units (nanogrin).** Reconcile on this. |
+| `payment.amount_grin` | string | The same amount as a human decimal string. Display only. |
+| `payment.status` | string | `received` or `confirmed`, tracking `event_type`. |
+| `payment.payer` | string or null | The payer's Nostr pubkey (hex), null when unknown (a slatepack paste, for example). |
+| `payment.confirmed_height` | integer or null | The block the paying kernel landed at. Null on `payment.received`. |
+| `payment.confirmations` | integer or null | The kernel's on-chain depth at confirm time. Null on `payment.received`. |
+| `invoice_id` | string or null | Null when the payment matched no invoice. |
+| `order_ref` | string or null | Your order id, echoed from create-invoice. |
+| `user_id` | string or null | The per-user endpub the payment credited, when you use them. |
+
+`confirmations_required` (your `GP_CONFIRMATIONS` threshold) is **not** in the
+webhook envelope. Read it from `GET /invoice/{id}` or `GET /payment/{id}`, where
+it is returned next to the live `confirmations` count. A `payment.confirmed`
+event already means the threshold was reached, so a consumer that only settles
+on `payment.confirmed` does not need it.
+
+**Ignore fields you do not recognise.** New fields may be added to this envelope
+in future versions; that is not a breaking change. Parse the fields you use,
+leave the rest alone, and do not reject a delivery for carrying extra keys.
 
 ### Verifying the signature
 

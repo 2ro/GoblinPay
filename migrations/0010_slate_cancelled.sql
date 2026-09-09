@@ -1,0 +1,16 @@
+-- Stale-I1 bookkeeping for the grin1 rail.
+--
+-- A grin1 invoice hands the payer an I1 the till wallet has already built a
+-- context for. If that invoice is then paid some OTHER way (a plain-send S1 to
+-- the stable grin1 address, a Nostr payment, a manual paste), the issued I1 is
+-- stale: its wallet context is still live, so a late I2 could still be
+-- finalized against it, and the inputs it reserved stay locked.
+--
+-- Cancelling that context is a node call, so it can fail transiently. Recording
+-- WHEN it succeeded (rather than flipping a flag before the fact) lets the
+-- periodic sweep retry a failed cancel and stop once it lands, exactly as the
+-- expiry sweep already does for expired invoices.
+--
+--   slate_cancelled_at  ISO-8601 UTC instant the issued I1's wallet context was
+--                       cancelled, else NULL (never cancelled / not grin1).
+ALTER TABLE invoice ADD COLUMN slate_cancelled_at TEXT;

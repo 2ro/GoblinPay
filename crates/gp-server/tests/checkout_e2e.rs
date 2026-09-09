@@ -237,3 +237,102 @@ async fn manual_slatepack_post_round_trips_and_records_payment() {
     let paid = invoice::get(&pool, &inv.id).await.unwrap().unwrap();
     assert_eq!(paid.status(), invoice::InvoiceStatus::Paid);
 }
+
+#[actix_web::test]
+async fn paying_a_grin1_invoice_another_way_queues_its_i1_for_cancellation() {
+    // A grin1 invoice hands the payer an I1 the till wallet holds a context for.
+    // When the payer instead pays by plain send (a real S1 pasted on the page),
+    // that I1 is stale: it keeps inputs locked and stays finalizable. The
+    // post-match hook must try to cancel it, and a cancel that cannot run (no
+    // node reachable in this test) must leave the invoice queued for the sweep
+    // rather than silently dropping the obligation.
+    let pool = pool().await;
+    let cfg = cfg();
+    let keys = Keys::generate();
+
+    let wallet_dir = TempDir::new("wallet-stale");
+    let wallet = new_wallet(&wallet_dir.0);
+    let inv = make_invoice(&pool, &keys, AmountSpec::Grin(AMOUNT), "order-stale").await;
+    // Arm it on the grin1 rail with an issued I1 slate id (the till would have
+    // stored the real one at creation).
+    invoice::attach_grin1(
+        &pool,
+        &inv.id,
+        "0199a1b2-c3d4-4e5f-8a9b-0c1d2e3f4a5b",
+        "BEGINSLATEPACK.i1.ENDSLATEPACK.",
+    )
+    .await
+    .unwrap();
+    let token = inv.token.clone().unwrap();
+
+    let work = TempDir::new("s1-stale");
+    let workdir = work.0.to_str().unwrap();
+    sender(&["gen", workdir, &AMOUNT.to_string()]);
+    let s1_armor = fs::read_to_string(work.0.join("s1.armor")).unwrap();
+
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(pool.clone()))
+            .app_data(web::Data::new(cfg.clone()))
+            .app_data(web::Data::new(Some(wallet)))
+            .app_data(web::Data::new(ReceiptSigner(Some(keys.clone()))))
+            .configure(checkout::configure),
+    )
+    .await;
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/pay/{token}/slatepack"))
+        .set_form([("slatepack", s1_armor.as_str())])
+        .to_request();
+    let body = test::read_body(test::call_service(&app, req).await).await;
+    let html = std::str::from_utf8(&body).unwrap();
+    assert!(html.contains("Payment received"), "the plain send landed");
+
+    // The invoice settled by the OTHER route, so its I1 is now stale.
+    let paid = invoice::get(&pool, &inv.id).await.unwrap().unwrap();
+    assert_eq!(paid.status(), invoice::InvoiceStatus::Paid);
+    assert!(paid.paid_payment_id.is_some());
+    assert_ne!(
+        paid.paid_payment_id.as_deref(),
+        paid.slate_id.as_deref(),
+        "settled by a different slate than the issued I1"
+    );
+
+    // No node is reachable here, so `cancel_tx` fails and the invoice must stay
+    // on the sweep's queue. It is never stamped on a failed cancel.
+    assert!(
+        !invoice::slate_cancelled(&pool, &inv.id).await.unwrap(),
+        "a failed cancel must not be stamped"
+    );
+    assert_eq!(
+        invoice::due_grin1_cancels(&pool).await.unwrap(),
+        vec![(
+            inv.id.clone(),
+            "0199a1b2-c3d4-4e5f-8a9b-0c1d2e3f4a5b".to_string()
+        )],
+        "the stale I1 is queued for the sweep to retry"
+    );
+
+    // And the closed invoice now refuses further pastes cleanly, before any
+    // wallet call: the same S1 pasted again is rejected, with no S2 handed back.
+    let req = test::TestRequest::post()
+        .uri(&format!("/pay/{token}/slatepack"))
+        .set_form([("slatepack", s1_armor.as_str())])
+        .to_request();
+    let body = test::read_body(test::call_service(&app, req).await).await;
+    let html = std::str::from_utf8(&body).unwrap();
+    assert!(
+        html.contains("already been paid"),
+        "a paste on a closed invoice is rejected: {html}"
+    );
+    assert!(
+        !html.contains("BEGINSLATEPACK."),
+        "no second S2 is handed back"
+    );
+    // Still exactly one payment on the ledger.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}

@@ -289,3 +289,98 @@ async fn goblin_pays_over_v2_gift_wrap_and_finalizes_the_reply() {
 async fn goblin_pays_over_v3_gift_wrap_and_finalizes_the_reply() {
     leg("v3", WrapVersion::V3, Some("nip44_v3 nip44_v2")).await;
 }
+
+/// A payment the wallet received but the ledger failed to record must never be
+/// dropped as a duplicate on the retry.
+///
+/// Before this guard, a transient database fault on the first receive stranded
+/// the payer for good: the wallet had taken the S1, so the retry hit grin's
+/// `TransactionAlreadyReceived`, which was classified as a plain replay and the
+/// wrap was dropped. No payment row existed, so the unreplied sweep had nothing
+/// to re-send either. The payer was left with locked inputs and no S2, forever.
+#[tokio::test]
+async fn a_receive_that_failed_to_record_is_never_dropped_as_a_duplicate() {
+    let work = TempDir::new("norecord");
+    let wallet_dir = TempDir::new("norecord-wallet");
+    let workdir = work.0.to_str().unwrap();
+
+    let db_path = work.0.join("gp.db");
+    let pool = gp_core::db::init(db_path.to_str().unwrap()).await.unwrap();
+    let wallet = new_wallet(&wallet_dir.0);
+    let probe = wallet.clone(); // read-only handle for the slate id
+    let receiver = WalletReceiver::new(wallet, pool.clone());
+
+    sender(&["gen", workdir, &AMOUNT.to_string()]);
+    let s1_armor = fs::read_to_string(work.0.join("s1.armor")).unwrap();
+    let (slate_id, state) = probe.slatepack_kind(&s1_armor).unwrap();
+    assert_eq!(state, "S1");
+
+    let payer = Keys::generate();
+    let server = Keys::generate();
+    let payer_hex = payer.public_key().to_hex();
+    let recipient_hex = server.public_key().to_hex();
+    let ctx = gp_nostr::IncomingContext {
+        payer_hex: &payer_hex,
+        recipient_hex: &recipient_hex,
+        memo: None,
+    };
+
+    // Break the ledger for the first receive only: the wallet will take the S1,
+    // then the payment insert will fail.
+    sqlx::query("ALTER TABLE payment RENAME TO payment_offline")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let first = receiver.receive(&s1_armor, &ctx).await;
+    assert!(
+        matches!(first, Err(gp_nostr::ReceiveError::Failed(_))),
+        "an unrecordable payment is a transient failure, not a success: {first:?}"
+    );
+    sqlx::query("ALTER TABLE payment_offline RENAME TO payment")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "nothing was recorded, and no S2 was handed back");
+
+    // The retry. The wallet now refuses the S1 as already received, but the
+    // ledger has no row for it, so this must NOT be dropped. No node is
+    // reachable here, so releasing the orphan fails and the wrap is kept for a
+    // later retry; with a node it would be released and re-received.
+    let retry = receiver.receive(&s1_armor, &ctx).await;
+    assert!(
+        !matches!(retry, Err(gp_nostr::ReceiveError::Duplicate)),
+        "the payer must never be stranded by a dropped wrap: {retry:?}"
+    );
+    match &retry {
+        Err(gp_nostr::ReceiveError::Failed(m)) => assert!(
+            m.contains("release the orphaned receive"),
+            "the recovery path ran: {m}"
+        ),
+        // With a reachable node the redo succeeds outright.
+        Ok(_) => {}
+        other => panic!("expected a retryable outcome, got {other:?}"),
+    }
+
+    // And the other leg of the decision: once a payment row DOES exist for the
+    // slate, the same duplicate really is a replay and the wrap is dropped, so
+    // the wallet is not asked to redo a receive that already completed.
+    sqlx::query(
+        "INSERT INTO payment (id, amount, slate_id, s2_armor, status, created_at) \
+         VALUES (?1, ?2, ?1, 'BEGINSLATEPACK.s2.ENDSLATEPACK.', 'received', \
+                 strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+    )
+    .bind(&slate_id)
+    .bind(AMOUNT as i64)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let replay = receiver.receive(&s1_armor, &ctx).await;
+    assert!(
+        matches!(replay, Err(gp_nostr::ReceiveError::Duplicate)),
+        "a recorded payment replayed is still a duplicate: {replay:?}"
+    );
+}

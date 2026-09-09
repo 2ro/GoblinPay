@@ -50,38 +50,74 @@ const EXPIRY_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 /// `cancel_tx` their stored wallet contexts, so a late payer I2 for an expired
 /// invoice fails cleanly instead of settling. `cancel` contacts the node and
 /// blocks, so it runs off the async workers.
+///
+/// The same pass drains the STALE-I1 queue: invoices settled some other way (or
+/// expired lazily by a page load) still holding a live issued slate. The
+/// post-match hook cancels those the moment the payment lands, so this is the
+/// retry path for a cancel that hit a node hiccup.
 pub fn spawn_expiry_cancel(pool: SqlitePool, wallet: GpWallet) {
     actix_web::rt::spawn(async move {
         log::info!("grin1: expiry-cancel sweep every {EXPIRY_SWEEP_INTERVAL:?}");
         loop {
             actix_web::rt::time::sleep(EXPIRY_SWEEP_INTERVAL).await;
-            let due = match invoice::due_grin1_slates(&pool).await {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("grin1 expiry sweep: {e}");
-                    continue;
-                }
-            };
-            for (inv_id, slate_id) in due {
-                let w = wallet.clone();
-                let sid = slate_id.clone();
-                // Cancel first; only expire the invoice once its context is gone,
-                // so a node hiccup leaves it open and the next pass retries.
-                let res = actix_web::rt::task::spawn_blocking(move || w.cancel(&sid)).await;
-                match res {
-                    Ok(Ok(())) => {
-                        if let Err(e) = invoice::mark_expired(&pool, &inv_id).await {
-                            warn!("grin1: mark_expired {inv_id} failed: {e}");
-                        } else {
-                            log::info!("grin1: cancelled expired invoice slate {slate_id}");
-                        }
-                    }
-                    Ok(Err(e)) => warn!("grin1: cancel {slate_id} failed (retries next pass): {e}"),
-                    Err(e) => warn!("grin1: cancel task panicked for {slate_id}: {e}"),
-                }
-            }
+            expire_and_cancel_once(&pool, &wallet).await;
+            drain_stale_i1s(&pool, &wallet).await;
         }
     });
+}
+
+/// One expiry pass: cancel the context of every due open grin1 invoice, then
+/// expire it. Cancel first; only expire once the context is gone, so a node
+/// hiccup leaves the invoice open and the next pass retries.
+async fn expire_and_cancel_once(pool: &SqlitePool, wallet: &GpWallet) {
+    let due = match invoice::due_grin1_slates(pool).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("grin1 expiry sweep: {e}");
+            return;
+        }
+    };
+    for (inv_id, slate_id) in due {
+        match crate::record::wallet_cancel(wallet.clone(), slate_id.clone()).await {
+            Ok(()) => {
+                if let Err(e) = invoice::mark_expired(pool, &inv_id).await {
+                    warn!("grin1: mark_expired {inv_id} failed: {e}");
+                    continue;
+                }
+                // Stamp it so the stale-I1 drain does not chase it again.
+                if let Err(e) = invoice::mark_slate_cancelled(pool, &inv_id).await {
+                    warn!("grin1: stamping the cancelled I1 of {inv_id} failed: {e}");
+                }
+                log::info!("grin1: cancelled expired invoice slate {slate_id}");
+            }
+            Err(e) => warn!("grin1: cancel {slate_id} failed (retries next pass): {e}"),
+        }
+    }
+}
+
+/// One stale-I1 pass: cancel the issued slate of every closed grin1 invoice that
+/// still holds one, never the slate that paid it (see
+/// [`invoice::due_grin1_cancels`]).
+async fn drain_stale_i1s(pool: &SqlitePool, wallet: &GpWallet) {
+    let due = match invoice::due_grin1_cancels(pool).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("grin1 stale-I1 sweep: {e}");
+            return;
+        }
+    };
+    for (inv_id, slate_id) in due {
+        match crate::record::wallet_cancel(wallet.clone(), slate_id.clone()).await {
+            Ok(()) => {
+                if let Err(e) = invoice::mark_slate_cancelled(pool, &inv_id).await {
+                    warn!("grin1: stamping the cancelled I1 of {inv_id} failed: {e}");
+                } else {
+                    log::info!("grin1: cancelled the stale I1 {slate_id} of {inv_id}");
+                }
+            }
+            Err(e) => warn!("grin1: stale-I1 cancel {slate_id} failed (retries): {e}"),
+        }
+    }
 }
 
 /// A JSON-RPC success envelope.
@@ -133,6 +169,38 @@ fn slate_param(params: &Value) -> Result<VersionedSlate, String> {
     serde_json::from_value(slate.clone()).map_err(|e| format!("bad slate: {e}"))
 }
 
+/// The slate id of the positional slate param. Re-parses rather than borrowing
+/// from the caller's slate: `VersionedSlate` is not `Clone` and `finalize_slate`
+/// consumes it. `None` when the param is missing or unparseable (the finalize
+/// call then reports it).
+fn slate_param_id(params: &Value) -> Option<String> {
+    slate_param(params)
+        .ok()
+        .map(|vs| gp_wallet::Slate::from(vs).id.to_string())
+}
+
+/// What a payer is told when the invoice slate they are finalizing is gone.
+/// Deliberately says nothing was charged: no transaction is posted on this path.
+pub(crate) const CANCELLED_SLATE_MESSAGE: &str =
+    "This Grin invoice is no longer awaiting payment: it expired, or the invoice was \
+     already paid another way, so the invoice slate was cancelled. Nothing was charged.";
+
+/// Whether a failed finalize means the issued invoice slate is simply gone,
+/// rather than something the operator must act on.
+///
+/// gp-wallet flattens grin-wallet errors to strings by design, so this matches
+/// text. After `cancel_tx` the tx-log entry becomes `TxReceivedCancelled`, which
+/// no longer satisfies the invoice-flow lookup in
+/// `libwallet/src/internal/tx.rs:415`, so the finalize surfaces
+/// `TransactionDoesntExist` ("Transaction <uuid> doesn't exist"); a missing
+/// private context surfaces as a backend "not found". Both are a clean
+/// payer-facing reject, never a 500. Pinned by
+/// `cancelled_slate_detection_is_pinned_to_grin_wallet`.
+pub(crate) fn is_cancelled_slate(err: &str) -> bool {
+    let err = err.to_ascii_lowercase();
+    err.contains("doesn't exist") || err.contains("cancelled") || err.contains("not found")
+}
+
 /// receive_tx: offline receive + record + amount-match, returning the S2 slate.
 async fn receive_tx(
     id: Value,
@@ -157,7 +225,7 @@ async fn receive_tx(
     // hand back the S2. The money is already in hand, so a persist/match error
     // never fails the reply.
     let webhook = webhook_pair(cfg);
-    crate::record::persist_and_match(
+    let outcome = crate::record::persist_and_match(
         pool,
         &received,
         None,
@@ -167,6 +235,25 @@ async fn receive_tx(
         webhook.as_ref(),
     )
     .await;
+    match &outcome {
+        // The payment could not be recorded at all: withhold the S2 rather than
+        // let the payer broadcast a transaction this till has no ledger entry
+        // for. The wallet keeps its own tx-log entry either way.
+        Err(e) => {
+            error!(
+                "foreign receive could not record {}: {e}",
+                received.slate_id
+            );
+            return err(id, -32603, "payment could not be recorded");
+        }
+        Ok(crate::record::PersistOutcome::Matched(matched)) => {
+            // A plain send settled a grin1 invoice: the I1 it issued is now stale.
+            crate::record::cancel_stale_grin1(pool, matched, &received.slate_id, wallet).await;
+        }
+        // An amount mismatch is left as it was before this lane: the reply still
+        // goes back, unlike the Nostr and paste paths. Reported, not changed.
+        Ok(crate::record::PersistOutcome::Rejected(_)) => {}
+    }
 
     ok(id, serde_json::to_value(out_slate).unwrap())
 }
@@ -184,11 +271,39 @@ async fn finalize_tx(
         Ok(s) => s,
         Err(e) => return err(id, -32602, e),
     };
+
+    // Race guard: settle only while the invoice is still open. Between the payer
+    // building this I2 and posting it, the invoice can settle another way (a
+    // plain send, a Nostr payment, a paste) or expire, and either cancels the
+    // issued slate's wallet context. Finalizing anyway would post a second
+    // transaction for one order, or fail with a raw wallet error. An unknown
+    // slate is left alone: `settle_finalized` already reports it.
+    if let Some(slate_id) = slate_param_id(&params) {
+        match invoice::get_by_slate_id(pool, &slate_id).await {
+            Ok(Some(inv)) if inv.status() != invoice::InvoiceStatus::Open => {
+                warn!(
+                    "foreign finalize: refusing {slate_id}, invoice {} is {}",
+                    inv.id, inv.status
+                );
+                return err(id, -32602, CANCELLED_SLATE_MESSAGE);
+            }
+            Ok(_) => {}
+            Err(e) => return err(id, -32603, format!("invoice lookup failed: {e}")),
+        }
+    }
+
     let w = wallet.clone();
     let finalized = actix_web::rt::task::spawn_blocking(move || w.finalize_slate(in_slate)).await;
     let (out_slate, finalized) = match finalized {
         Ok(Ok(pair)) => pair,
-        Ok(Err(e)) => return err(id, -32603, format!("finalize failed: {e}")),
+        Ok(Err(e)) => {
+            let message = e.to_string();
+            if is_cancelled_slate(&message) {
+                error!("foreign finalize: cancelled slate: {message}");
+                return err(id, -32602, CANCELLED_SLATE_MESSAGE);
+            }
+            return err(id, -32603, format!("finalize failed: {message}"));
+        }
         Err(e) => return err(id, -32603, format!("finalize task panicked: {e}")),
     };
 
@@ -423,6 +538,38 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("wallet not loaded"));
+    }
+
+    #[test]
+    fn cancelled_slate_detection_is_pinned_to_grin_wallet() {
+        // gp-wallet flattens grin-wallet errors to strings, so this guard reads
+        // TEXT. Construct the REAL upstream variants a cancelled invoice slate
+        // produces, so a grin-wallet bump that reworded one fails here instead
+        // of silently turning a clean reject into a raw error in a payer's face.
+        use grin_wallet_libwallet::Error;
+        let slate = "0199a1b2-c3d4-4e5f-8a9b-0c1d2e3f4a5b";
+        for e in [
+            // cancel_tx rewrites the tx-log entry, so the invoice-flow lookup in
+            // internal/tx.rs:415 no longer finds it.
+            Error::TransactionDoesntExist(slate.into()),
+            Error::TransactionWasCancelled(slate.into()),
+            Error::TransactionNotCancellable(slate.into()),
+            // A missing private context arrives through From<grin_store::Error>.
+            Error::Backend("Not found Error".into()),
+        ] {
+            let message = format!("wallet error: {e}");
+            assert!(
+                is_cancelled_slate(&message),
+                "grin-wallet reworded this: {message}"
+            );
+        }
+        // A real operational failure still surfaces as itself.
+        assert!(!is_cancelled_slate(
+            "wallet error: Client Callback Error: Posting transaction to node"
+        ));
+        assert!(!is_cancelled_slate(
+            "slatepack error: cannot read slatepack"
+        ));
     }
 
     #[tokio::test]

@@ -454,6 +454,67 @@ pub async fn due_grin1_slates(pool: &SqlitePool) -> Result<Vec<(String, String)>
     .await
 }
 
+/// The grin1-rail invoices holding a STALE issued I1: one the till wallet still
+/// has a live context for, on an invoice that is no longer awaiting it. Returned
+/// as `(invoice_id, slate_id)` for the caller to `cancel_tx`.
+///
+/// Two ways an invoice gets here:
+///
+/// * it was paid some OTHER way (a plain-send S1, a Nostr payment, a manual
+///   paste), so the I1 we issued was never used;
+/// * its expiry passed while a page load, listing, or sweep flipped it
+///   `expired` lazily (see [`get`], [`get_by_token`], [`expire_due`]), which
+///   bypasses [`due_grin1_slates`] and leaves the context orphaned.
+///
+/// The slate that actually paid is never listed: `paid_payment_id` is the
+/// settlement key, so an invoice paid through its own I1 (the grin1 happy path,
+/// where the two are equal) is excluded — cancelling that would unlock the
+/// outputs of a transaction we already posted.
+///
+/// Like [`due_grin1_slates`] this flips nothing: the caller cancels, then calls
+/// [`mark_slate_cancelled`], so a cancel that fails (a node hiccup) is simply
+/// retried on the next pass.
+pub async fn due_grin1_cancels(pool: &SqlitePool) -> Result<Vec<(String, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT id, slate_id FROM invoice \
+         WHERE rail = ?1 AND status IN ('paid', 'confirmed', 'expired') \
+           AND slate_id IS NOT NULL AND slate_cancelled_at IS NULL \
+           AND COALESCE(paid_payment_id, '') <> slate_id",
+    )
+    .bind(RAIL_GRIN1)
+    .fetch_all(pool)
+    .await
+}
+
+/// Stamp an invoice's issued I1 as cancelled in the wallet, so the sweep stops
+/// retrying it. Idempotent: a row already stamped does not transition and
+/// returns `false`. Only ever called after a `cancel_tx` actually succeeded.
+pub async fn mark_slate_cancelled(
+    pool: &SqlitePool,
+    invoice_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE invoice SET slate_cancelled_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') \
+         WHERE id = ?1 AND slate_cancelled_at IS NULL",
+    )
+    .bind(invoice_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Whether an invoice's issued I1 has already been cancelled in the wallet.
+/// Read straight from the column so the flag stays off the [`Invoice`] row (and
+/// therefore out of the connector-facing JSON).
+pub async fn slate_cancelled(pool: &SqlitePool, invoice_id: &str) -> Result<bool, sqlx::Error> {
+    let at: Option<Option<String>> =
+        sqlx::query_scalar("SELECT slate_cancelled_at FROM invoice WHERE id = ?1")
+            .bind(invoice_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(at.flatten().is_some())
+}
+
 /// Flip a still-open invoice to `expired` (used by the grin1 sweep after its
 /// context is cancelled). Idempotent: only an `open` invoice transitions.
 pub async fn mark_expired(pool: &SqlitePool, invoice_id: &str) -> Result<bool, sqlx::Error> {
@@ -730,6 +791,83 @@ mod tests {
         assert!(mark_expired(&pool, &inv.id).await.unwrap());
         assert!(due_grin1_slates(&pool).await.unwrap().is_empty());
         assert!(!mark_expired(&pool, &inv.id).await.unwrap(), "idempotent");
+    }
+
+    #[tokio::test]
+    async fn due_grin1_cancels_lists_stale_i1s_but_never_the_paying_slate() {
+        let pool = pool().await;
+
+        // Paid some OTHER way (a plain-send S1 / Nostr payment): the issued I1
+        // is stale and must be cancelled.
+        let other = open_grin1(&pool, 1_000_000_000).await;
+        mark_paid(&pool, &other.id, "slate-from-somewhere-else")
+            .await
+            .unwrap();
+
+        // Paid through its OWN I1 (the grin1 happy path): paid_payment_id is
+        // the issued slate, so cancelling would unlock a posted transaction.
+        // It must never be listed.
+        let own = open_grin1(&pool, 2_000_000_000).await;
+        let own_slate = own.slate_id.clone().unwrap();
+        mark_paid(&pool, &own.id, &own_slate).await.unwrap();
+
+        // Still open: the expiry sweep owns this one, not the stale-I1 drain.
+        let still_open = open_grin1(&pool, 3_000_000_000).await;
+
+        let due = due_grin1_cancels(&pool).await.unwrap();
+        assert_eq!(
+            due,
+            vec![(other.id.clone(), other.slate_id.clone().unwrap())],
+            "only the invoice paid another way"
+        );
+        assert!(!due.iter().any(|(id, _)| id == &own.id), "never the payer");
+        assert!(!due.iter().any(|(id, _)| id == &still_open.id));
+
+        // Confirmed carries the same obligation as paid.
+        assert!(mark_confirmed(&pool, &other.id).await.unwrap());
+        assert_eq!(due_grin1_cancels(&pool).await.unwrap().len(), 1);
+
+        // Stamping it drains the queue, exactly once.
+        assert!(!slate_cancelled(&pool, &other.id).await.unwrap());
+        assert!(mark_slate_cancelled(&pool, &other.id).await.unwrap());
+        assert!(slate_cancelled(&pool, &other.id).await.unwrap());
+        assert!(
+            !mark_slate_cancelled(&pool, &other.id).await.unwrap(),
+            "idempotent"
+        );
+        assert!(due_grin1_cancels(&pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn due_grin1_cancels_catches_a_lazily_expired_invoice() {
+        // get()/get_by_token()/expire_due() flip open -> expired directly,
+        // which bypasses due_grin1_slates (it filters status = 'open') and
+        // orphans the issued I1's wallet context. The stale-I1 drain is the
+        // backstop that catches those.
+        let pool = pool().await;
+        let inv = open_grin1(&pool, 4_000_000_000).await;
+        sqlx::query(
+            "UPDATE invoice SET expiry = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-10 seconds') \
+             WHERE id = ?1",
+        )
+        .bind(&inv.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // A plain page load expires it lazily, and the expiry sweep now sees
+        // nothing to do.
+        assert_eq!(
+            get(&pool, &inv.id).await.unwrap().unwrap().status(),
+            InvoiceStatus::Expired
+        );
+        assert!(due_grin1_slates(&pool).await.unwrap().is_empty());
+
+        // The stale-I1 drain still lists it, so the context is cancelled.
+        assert_eq!(
+            due_grin1_cancels(&pool).await.unwrap(),
+            vec![(inv.id.clone(), inv.slate_id.clone().unwrap())]
+        );
     }
 
     #[tokio::test]

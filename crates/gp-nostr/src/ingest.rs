@@ -636,6 +636,127 @@ mod tests {
         assert_eq!(ingest.receiver().calls(), RATE_PER_SENDER_PER_HOUR);
     }
 
+    /// The conversation key the Goblin wallet derives for a v3 layer, copied
+    /// from `goblin/src/nostr/wrapv3.rs:60` (`conversation_key`).
+    fn wallet_conversation_key(secret: &nostr_sdk::SecretKey, public: &PublicKey) -> [u8; 32] {
+        let sk = secp256k1::SecretKey::from_byte_array(secret.to_secret_bytes())
+            .expect("wallet secret key");
+        let pk = secp256k1::XOnlyPublicKey::from_byte_array(public.to_bytes())
+            .expect("wallet public key");
+        nip44::get_conversation_key_v3(sk, pk)
+    }
+
+    /// The wallet's NIP-44 v3 gift wrap, rebuilt here straight from the `nip44`
+    /// crate as `goblin/src/nostr/wrapv3.rs:100` (`wrap_kind`) builds it, so this
+    /// pin does NOT go through gp-nostr's own `wrap::gift_wrap` and therefore
+    /// keeps testing the on-the-wire shape even if that builder changes.
+    fn wallet_v3_wrap(
+        sender: &Keys,
+        receiver: &PublicKey,
+        content: String,
+        extra_tags: Vec<Tag>,
+    ) -> Event {
+        use nostr_sdk::nips::nip59::RANGE_RANDOM_TIMESTAMP_TWEAK;
+        use nostr_sdk::{JsonUtil, Timestamp};
+
+        // Rumor: receiver p-tag FIRST, then the extra tags (the wallet's shape,
+        // matching `EventBuilder::private_msg_rumor`). Never signed (NIP-59).
+        let mut rumor: UnsignedEvent = EventBuilder::new(Kind::PrivateDirectMessage, content)
+            .tag(Tag::public_key(*receiver))
+            .tags(extra_tags)
+            .build(sender.public_key());
+        rumor.ensure_id();
+
+        // Seal (kind 13), context kind=13 / empty scope, signed by the sender.
+        let ck = wallet_conversation_key(sender.secret_key(), receiver);
+        let sealed = nip44::encrypt_v3(&ck, rumor.as_json().as_bytes(), 13, b"").expect("v3 seal");
+        let seal = EventBuilder::new(Kind::Seal, sealed)
+            .custom_created_at(Timestamp::tweaked(RANGE_RANDOM_TIMESTAMP_TWEAK))
+            .sign_with_keys(sender)
+            .expect("sign seal");
+
+        // Gift wrap (kind 1059), context kind=1059 / empty scope, ephemeral key.
+        let ephemeral = Keys::generate();
+        let ck = wallet_conversation_key(ephemeral.secret_key(), receiver);
+        let wrapped = nip44::encrypt_v3(&ck, seal.as_json().as_bytes(), 1059, b"").expect("v3 wrap");
+        EventBuilder::new(Kind::GiftWrap, wrapped)
+            .tag(Tag::public_key(*receiver))
+            .custom_created_at(Timestamp::tweaked(RANGE_RANDOM_TIMESTAMP_TWEAK))
+            .sign_with_keys(&ephemeral)
+            .expect("sign wrap")
+    }
+
+    /// Wallet-compatibility pin. The shipped Goblin wallet puts payments on the
+    /// wire two ways (`goblin/src/nostr/client/send.rs:216`): stock nostr-sdk
+    /// NIP-59 (NIP-44 v2) for a peer that advertises no v3, and its own v3
+    /// layering otherwise. Both are rebuilt here from nostr-sdk 0.44 and nip44
+    /// 0.3.2 directly, so any change to this crate that stops accepting what the
+    /// wallet actually sends fails HERE rather than in production.
+    #[tokio::test]
+    async fn wallet_gift_wraps_are_accepted_in_both_v2_and_v3() {
+        let payer = Keys::generate();
+        let till = Keys::generate();
+        let content = protocol::build_payment_content(PACK);
+
+        // v2: exactly what `Client::send_private_msg_to` builds.
+        let v2_rumor = EventBuilder::private_msg_rumor(till.public_key(), content.clone())
+            .tags(protocol::build_rumor_tags(Some("order-v2")))
+            .build(payer.public_key());
+        let v2 = EventBuilder::gift_wrap(&payer, &till.public_key(), v2_rumor, [])
+            .await
+            .expect("sdk v2 gift wrap");
+        // v3: the wallet's own layering. A distinct note keeps the two rumors
+        // distinct (same content + same second would collide on the rumor id).
+        let v3 = wallet_v3_wrap(
+            &payer,
+            &till.public_key(),
+            content,
+            protocol::build_rumor_tags(Some("order-v3")),
+        );
+
+        let ingest = Ingest::new(
+            till.clone(),
+            StubReceiver::new(vec![
+                Ok(ReceivedPayment {
+                    slate_id: "wallet-v2".into(),
+                    amount: 1,
+                    s2_armor: "BEGINSLATEPACK. r. ENDSLATEPACK.".into(),
+                }),
+                Ok(ReceivedPayment {
+                    slate_id: "wallet-v3".into(),
+                    amount: 2,
+                    s2_armor: "BEGINSLATEPACK. r. ENDSLATEPACK.".into(),
+                }),
+            ]),
+        );
+
+        for (label, wrap, expect_slate, expect_memo) in [
+            ("v2", v2, "wallet-v2", "order-v2"),
+            ("v3", v3, "wallet-v3", "order-v3"),
+        ] {
+            match ingest.handle_wrap(&wrap).await {
+                IngestOutcome::Received {
+                    slate_id, reply, ..
+                } => {
+                    assert_eq!(slate_id, expect_slate, "{label} wrap");
+                    assert_eq!(reply.payer, payer.public_key(), "{label} reply payer");
+                    assert_eq!(
+                        reply.from.public_key(),
+                        till.public_key(),
+                        "{label} reply identity"
+                    );
+                }
+                other => panic!("{label} wallet wrap rejected: {other:?}"),
+            }
+            assert_eq!(
+                ingest.receiver().last_memo.lock().unwrap().as_deref(),
+                Some(expect_memo),
+                "{label} memo must reach the wallet handoff"
+            );
+        }
+        assert_eq!(ingest.receiver().calls(), 2);
+    }
+
     #[tokio::test]
     async fn derived_identity_is_resolved_and_reply_signed_from_it() {
         // A payment addressed to a derived child (not the master) unwraps via

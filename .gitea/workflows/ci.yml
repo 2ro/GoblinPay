@@ -1,14 +1,26 @@
-# CI gate for GoblinPay. Mirror of .github/workflows/ci.yml.
+# CI gate for GoblinPay on the self-hosted Gitea runner.
+#
+# NOT a mirror of .github/workflows/ci.yml. That workflow targets a hosted
+# runner that cannot check out the private goblin tree, so it trims
+# gp-goblin-sender out of the workspace and then tests four crates. This one
+# has no trim step and runs a narrower gate: fmt over the whole workspace, then
+# clippy and tests for gp-core only. Everything else is left to ./ci.sh.
 #
 # What runs where:
-#   - fmt + the gp-core clippy/test gate run on ANY runner: gp-core is
-#     self-contained (no out-of-repo deps), and it holds the domain logic
-#     (config, invoices, matching, webhooks, rates, the connector seam).
+#   - fmt + the gp-core clippy/test gate. gp-core is self-contained and holds
+#     the domain logic (config, invoices, matching, webhooks, rates, the
+#     connector seam).
 #   - The FULL gate (gp-wallet + gp-nostr + gp-server, via ./ci.sh) needs the
-#     goblin/ checkout next to the repo (the gp-goblin-sender round-trip gate).
-#     Where the workspace is laid out like the deploy host, it runs too;
-#     otherwise it is skipped with a note. `-p` scoping always keeps the
-#     goblin-tree dev crate off the money path build.
+#     goblin/ checkout next to the repo, because gp-goblin-sender path-depends
+#     on it. Where the workspace is laid out like the development tree it runs
+#     too; otherwise it is skipped with a note.
+#
+# PREREQUISITE, and it is not optional: because there is no trim step, EVERY
+# cargo command here needs ../goblin present. `cargo metadata` resolves the
+# whole members list before any `-p` scoping takes effect, so without that
+# sibling even the fmt step dies with "failed to load manifest for dependency
+# grin_core". This runner is expected to have it. A runner that does not should
+# use the .github workflow's trim step instead.
 name: ci
 on:
   push:
@@ -38,12 +50,21 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Format check (whole workspace)
+        # `--all` also formats members' local path-based dependencies, and
+        # gp-goblin-sender path-depends on ../goblin, so this hands rustfmt the
+        # Goblin wallet and node trees as well (110 crate roots, not 11). It
+        # passes because that tree is clean under its own rustfmt.toml, but it
+        # is judging another repo. ci.sh names the five crates instead; if this
+        # ever goes red on a file outside GoblinPay, that is why.
         run: cargo fmt --all -- --check
 
       - name: Clippy (gp-core, deny warnings)
         run: cargo clippy -p gp-core --all-targets -- -D warnings
 
       - name: Test (gp-core)
+        # --locked is meaningful HERE (unlike the .github workflow, whose trim
+        # step edits the members list and so forces a lock update): the
+        # manifest is untouched, so Cargo.lock must already be up to date.
         run: cargo test -p gp-core --locked
 
       - name: Full gate (when the goblin checkout is present)
